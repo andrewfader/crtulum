@@ -1,0 +1,4 @@
+[preset] trinitron
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+[surface] offered formats: [Bgra8UnormSrgb, Rgba8UnormSrgb, Bgra8Unorm, Rgba8Unorm]
+[surface] using Bgra8UnormSrgb — HDR output unavailable → SDR tonemap

@@ -1,0 +1,34 @@
+[package]
+name = "crtulum"
+version = "0.1.0"
+edition = "2021"
+description = "A manipulable 3D CRT tube renderer (M1: static test-pattern source)"
+
+[dependencies]
+winit = "0.29"
+wgpu = "0.20"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.27"
+env_logger = "0.11"
+log = "0.4"
+
+# Offscreen PNG capture for headless verification (`--shot out.png`).
+image = { version = "0.24", default-features = false, features = ["png"] }
+
+# M2: live source capture via the ScreenCast portal + PipeWire (the OBS path).
+# async-io (not the default tokio) so a plain pollster::block_on drives the portal.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "screencast"] }
+pipewire = "0.10"
+anyhow = "1"
+
+# crtulum patch: vendored wgpu-hal with HDR colorspace mapping for Wayland/mutter
+# (maps BT.2020-linear surfaces to Rgba16Float so an HDR swapchain is reachable).
+[patch.crates-io]
+wgpu-hal = { path = "vendor/wgpu-hal" }
+
+[profile.dev]
+opt-level = 1        # keep the render loop smooth even in debug
+
+[profile.dev.package."*"]
+opt-level = 3        # dependencies (wgpu/naga) always optimized
