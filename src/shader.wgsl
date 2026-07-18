@@ -475,10 +475,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // misalignment grows radially toward the corners (a well-set PVM is tight, a
     // tired consumer set fringes red/blue at the edges). Push red out, blue in.
     let cvec = ruv - vec2<f32>(0.5);
-    let conv = cvec * dot(cvec, cvec) * u.look.x * 4.0;
-    let uv_r = refract_uv(ruv, n, v, thick, 1.0 / 1.510) + conv;
+    let conv = cvec * dot(cvec, cvec) * u.look.x * 0.9;
+    let uv_r = refract_uv(ruv, n, v, thick, 1.0 / 1.518) + conv;
     let uv_g = refract_uv(ruv, n, v, thick, 1.0 / 1.520);
-    let uv_b = refract_uv(ruv, n, v, thick, 1.0 / 1.530) - conv;
+    let uv_b = refract_uv(ruv, n, v, thick, 1.0 / 1.522) - conv;
     let uv = uv_g; // base uv for halation / vignette
     var col = vec3<f32>(
         scan_reconstruct(uv_r, res).r,

@@ -1282,7 +1282,7 @@ fn write_uniforms(
         env: res.avg,
         // convergence + corner rounding come from the preset; grain (analog noise
         // floor) and ghost (secondary internal glass reflection) are global.
-        look: [preset.convergence, preset.corner_radius, 0.015, 0.05],
+        look: [preset.convergence, preset.corner_radius, 0.015, 0.012],
         // CRT gamma (deepens blacks), per-tube warm/cool phosphor white point,
         // screen→tube glow bounce strength, and highlight bloom gain.
         phys: [1.12, preset.warmth, 0.6, 0.5],
