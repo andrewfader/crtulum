@@ -1598,6 +1598,25 @@ struct State {
     refresh_hz: f32,  // detected panel refresh (for the BFI safety gate / message)
 }
 
+// Best-effort panel refresh detection. On Wayland current_monitor() is often None
+// at startup (the surface hasn't entered an output yet via wl_surface.enter), so
+// this also falls back to the fastest available monitor rather than assuming 60 Hz.
+fn detect_refresh_hz(window: &Window) -> f32 {
+    let from_mhz = |mhz: u32| mhz as f32 / 1000.0;
+    window
+        .current_monitor()
+        .and_then(|m| m.refresh_rate_millihertz())
+        .map(from_mhz)
+        .or_else(|| {
+            window
+                .available_monitors()
+                .filter_map(|m| m.refresh_rate_millihertz())
+                .max()
+                .map(from_mhz)
+        })
+        .unwrap_or(60.0)
+}
+
 impl State {
     async fn new(
         window: Arc<Window>,
@@ -1696,12 +1715,9 @@ impl State {
             subpixel: false,
             bfi: false,
             // Panel refresh, for the BFI gate: strobing only helps at ≥100 Hz (at 60 Hz
-            // it just flickers at 30). current_monitor()/refresh_rate is a best effort.
-            refresh_hz: window
-                .current_monitor()
-                .and_then(|m| m.refresh_rate_millihertz())
-                .map(|mhz| mhz as f32 / 1000.0)
-                .unwrap_or(60.0),
+            // it just flickers at 30). Best effort — re-detected on the first BFI toggle
+            // once the Wayland surface has entered an output.
+            refresh_hz: detect_refresh_hz(&window),
             dragging: false,
             last_cursor: (0.0, 0.0),
             window,
@@ -2360,6 +2376,10 @@ fn main() {
                                     // Needs a ≥100 Hz panel to help instead of just flickering.
                                     PhysicalKey::Code(KeyCode::KeyB) => {
                                         state.bfi = !state.bfi;
+                                        // Re-detect: at startup on Wayland current_monitor()
+                                        // is usually None, so refresh_hz may still be the
+                                        // 60 Hz fallback. By now the surface is mapped.
+                                        state.refresh_hz = detect_refresh_hz(&state.window);
                                         if state.bfi && state.refresh_hz < 100.0 {
                                             eprintln!("[bfi] on — WARNING: {:.0} Hz panel; BFI needs ≥100 Hz to reduce blur (will flicker)", state.refresh_hz);
                                         } else {
