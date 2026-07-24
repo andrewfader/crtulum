@@ -25,7 +25,8 @@ struct Uniforms {
     cmat1: vec4<f32>,
     cmat2: vec4<f32>,
     pwr: vec4<f32>,     // power: x=warmup(0..1), y=collapse(0..1), z=degauss(0..1), w unused
-    focus: vec4<f32>,   // x=edge defocus (deflection spot growth), y=overscan(per side), z/w unused
+    focus: vec4<f32>,   // x=edge defocus (deflection spot growth), y=overscan(per side), z=roll rate, w=roll amp
+    fx: vec4<f32>,      // x=svm (scan-velocity crispening), y=diffusion (wide glass glow), z=subpixel-mask flag, w=bfi screen multiplier
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -113,6 +114,19 @@ fn mask(px: vec2<f32>, kind: f32, pitch: f32) -> vec3<f32> {
         let slot = smoothstep(0.0, 0.12, ty) * smoothstep(1.0, 0.88, ty);
         return stripes * mix(0.45, 1.0, slot);
     }
+}
+
+// Subpixel-accurate mask (the Sony-Megatron trick): instead of a resolution-
+// independent phosphor pattern, light each REAL panel subpixel directly. On an
+// RGB-stripe LCD every output pixel is one R, G or B subpixel, so a triad of the
+// tube's phosphors maps onto three physical subpixels — the mask resolves as true
+// per-subpixel light density at native resolution instead of averaging to a tint.
+// Only meaningful at render_scale 1 on an RGB-stripe panel (a shot SSAAs it away).
+fn mask_subpixel(px: vec2<f32>) -> vec3<f32> {
+    let sp = i32(floor(px.x)) - (i32(floor(px.x)) / 3) * 3; // 0,1,2 across the LCD triad
+    var w = vec3<f32>(0.06);        // tiny floor so black subpixels aren't dead
+    if (sp == 0) { w.r = 1.0; } else if (sp == 1) { w.g = 1.0; } else { w.b = 1.0; }
+    return w;
 }
 
 // Extended Reinhard tonemap: identity-ish below 1.0, rolls HDR highlights up to
@@ -577,6 +591,23 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         col = mix(col, hb, hamt);
     }
 
+    // Scan-velocity modulation (SVM / "VM"): a consumer-set circuit that briefly changed
+    // the beam's HORIZONTAL velocity at luminance transitions — slowing it (more energy,
+    // brighter) on the bright side of an edge and speeding it (less energy) on the dark
+    // side — which crispens vertical edges with the signature bright overshoot / dark
+    // undershoot "VM halo." Modeled as a horizontal unsharp (Laplacian of luma) on the
+    // scanned image. Per-tube: composite consumer sets strong, S-video milder, RGB /
+    // PC / mono off (broadcast PVMs and PC monitors ran without it). See IEEE 4042821.
+    if (u.fx.x > 0.0) {
+        let dx = vec2<f32>(1.4 / res.x, 0.0);
+        let lw = vec3<f32>(0.299, 0.587, 0.114);
+        let cC = dot(textureSampleLevel(t_screen, s_screen, uv, 0.0).rgb, lw);
+        let cL = dot(textureSampleLevel(t_screen, s_screen, uv - dx, 0.0).rgb, lw);
+        let cR = dot(textureSampleLevel(t_screen, s_screen, uv + dx, 0.0).rgb, lw);
+        let lap = clamp(2.0 * cC - cL - cR, -0.6, 0.6); // + on ridges, − in troughs
+        col = max(col * (1.0 + u.fx.x * lap * 2.0), vec3<f32>(0.0));
+    }
+
     // CRT transfer + phosphor colour. A real tube's response deepens the blacks
     // (extra gamma) and its P22 phosphors give a characteristically warm-white
     // point rather than a neutral D65.
@@ -637,12 +668,53 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
+    // Diffusion — a SECOND, wider bloom scale, physically distinct from halation.
+    // Halation (above) is light reflecting off the phosphor back through the glass:
+    // tight and warm/red. Diffusion is light SCATTERING inside the thick imperfect
+    // faceplate — a broad, soft, near-neutral haze that lifts the whole lit region and
+    // gives bright CRT content its dense, "wet" glow. Two rings (~5px + ~10px) so the
+    // falloff is smooth rather than a single hard radius.
+    let diff_amt = u.fx.y;
+    if (diff_amt > 0.0) {
+        let r1 = vec2<f32>(5.0, 5.0) / res;
+        let r2 = vec2<f32>(10.0, 10.0) / res;
+        var d = textureSample(t_screen, s_screen, uv + vec2<f32>(r1.x, 0.0)).rgb
+              + textureSample(t_screen, s_screen, uv - vec2<f32>(r1.x, 0.0)).rgb
+              + textureSample(t_screen, s_screen, uv + vec2<f32>(0.0, r1.y)).rgb
+              + textureSample(t_screen, s_screen, uv - vec2<f32>(0.0, r1.y)).rgb
+              + textureSample(t_screen, s_screen, uv + r1).rgb
+              + textureSample(t_screen, s_screen, uv - r1).rgb
+              + textureSample(t_screen, s_screen, uv + vec2<f32>(r1.x, -r1.y)).rgb
+              + textureSample(t_screen, s_screen, uv + vec2<f32>(-r1.x, r1.y)).rgb;
+        var d2 = textureSample(t_screen, s_screen, uv + vec2<f32>(r2.x, 0.0)).rgb
+               + textureSample(t_screen, s_screen, uv - vec2<f32>(r2.x, 0.0)).rgb
+               + textureSample(t_screen, s_screen, uv + vec2<f32>(0.0, r2.y)).rgb
+               + textureSample(t_screen, s_screen, uv - vec2<f32>(0.0, r2.y)).rgb
+               + textureSample(t_screen, s_screen, uv + r2).rgb
+               + textureSample(t_screen, s_screen, uv - r2).rgb
+               + textureSample(t_screen, s_screen, uv + vec2<f32>(r2.x, -r2.y)).rgb
+               + textureSample(t_screen, s_screen, uv + vec2<f32>(-r2.x, r2.y)).rgb;
+        let diff = (d + d2 * 0.5) / 12.0; // wide normalized glow
+        if (u.mono.w > 0.5) {
+            col = col + dot(diff, vec3<f32>(0.299, 0.587, 0.114)) * u.mono.rgb * diff_amt;
+        } else {
+            col = col + diff * vec3<f32>(1.0, 0.95, 0.9) * diff_amt; // near-neutral, faintly warm
+        }
+    }
+
     // Phosphor mask. Pitch is in *final* output pixels, scaled up by the render
     // scale so supersampling anti-aliases the mask instead of erasing it.
     let mask_pitch = max(u.glass.w, 1.0) * max(u.params.w, 1.0);
-    let m = mask(in.clip.xy, u.optics.x, mask_pitch);
-    col = col * mix(vec3<f32>(1.0), m, u.optics.y);
-    col = col * (1.0 + u.optics.y * 0.7); // compensate mask darkening
+    if (u.fx.z > 0.5 && u.mono.w < 0.5) {
+        // Subpixel-accurate mask: each real LCD subpixel driven by the matching phosphor
+        // (~3x compensation for the 1/3 duty — bright content still lights all three).
+        let m = mask_subpixel(in.clip.xy);
+        col = col * mix(vec3<f32>(1.0), m, u.optics.y) * (1.0 + u.optics.y * 2.0);
+    } else {
+        let m = mask(in.clip.xy, u.optics.x, mask_pitch);
+        col = col * mix(vec3<f32>(1.0), m, u.optics.y);
+        col = col * (1.0 + u.optics.y * 0.7); // compensate mask darkening
+    }
 
     // Damper wires: the signature of an aperture-grille (Trinitron) tube. The
     // vertical phosphor strips are steadied by 1-2 fine horizontal tension wires
@@ -716,6 +788,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let rainbow = vec3<f32>(sin(p), sin(p + 2.094), sin(p + 4.188));
         col = col * (vec3<f32>(1.0) + rainbow * u.pwr.z * 0.55);
     }
+
+    // Black-frame insertion (motion): a real CRT flashes each pixel for well under a
+    // millisecond and is dark the rest of the field, so motion is impulse-sharp — where
+    // an LCD holds every frame for its whole refresh and smears. On a high-refresh panel
+    // we strobe the emitted phosphor light dark on alternate refreshes to imitate that
+    // impulse. Only the EMISSION strobes (fx.w→0 on a dark frame); the glass still
+    // mirrors the lit room below, exactly as a switched-off-but-lit tube does.
+    col = col * u.fx.w;
 
     // Faceplate glass = a dark, slightly-reflective mirror. This is THE defining CRT
     // cue (see any photo of a real set): even head-on the glass bounces ~4% of the room

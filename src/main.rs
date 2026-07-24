@@ -456,7 +456,8 @@ struct Uniforms {
     cmat1: [f32; 4],  // row 1
     cmat2: [f32; 4],  // row 2
     pwr: [f32; 4],    // power state: warmup(0..1), collapse(0..1), degauss(0..1), _
-    focus: [f32; 4],  // x=edge defocus (deflection spot growth), y=overscan (per side), z/w _
+    focus: [f32; 4],  // x=edge defocus (deflection spot growth), y=overscan (per side), z=roll rate, w=roll amp
+    fx: [f32; 4],     // x=svm (scan-velocity crispen), y=diffusion (wide glass glow), z=subpixel mask flag, w=bfi screen mult
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,6 +1342,8 @@ fn write_uniforms(
     interlace: f32,
     field: f32,
     exposure: f32,
+    subpixel: bool,
+    bfi_mul: f32,
 ) {
     let (view_proj, eye) = orbit.view_proj(aspect);
     let cmat = preset_color_matrix(preset);
@@ -1444,6 +1447,29 @@ fn write_uniforms(
             // 480i doubles the beat feel via field twitter (handled in the accum pass).
             let roll_rate = if preset.mono[3] > 0.5 { 0.30 } else { 0.45 };
             [defocus, overscan, roll_rate, 0.05]
+        },
+        // fx: SVM + diffusion (both derived from the tube's character), subpixel-mask
+        // toggle, and the per-frame BFI screen multiplier.
+        fx: {
+            // Scan-velocity modulation was a CONSUMER-set feature tied to the analog
+            // signal chain: strongest on composite RF sets, milder on the S-video-fed
+            // Trinitron, and absent on RGB/component broadcast PVMs, PC monitors, and
+            // single-gun mono terminals (which had no VM circuit). Derive from signal.
+            let svm = if preset.mono[3] > 0.5 {
+                0.0
+            } else {
+                match preset.signal {
+                    2 => 0.55, // composite consumer TV — pronounced VM haloing
+                    1 => 0.35, // S-video Trinitron — milder
+                    _ => 0.0,  // RGB/component: none
+                }
+            };
+            // Diffusion (wide scatter haze in the faceplate glass) tracks the same glass
+            // that drives halation — a thick, fuzzy consumer tube scatters more, a sharp
+            // AR-coated PVM/PC monitor less. Scale off halation so it stays per-tube.
+            let diffusion = preset.halation * 0.55;
+            let subpix = if subpixel { 1.0 } else { 0.0 };
+            [svm, diffusion, subpix, bfi_mul]
         },
     };
     queue.write_buffer(&res.ubuf, 0, bytemuck::bytes_of(&uniforms));
@@ -1565,6 +1591,9 @@ struct State {
     frame: u64,       // field counter for 480i interlace
     interlace: bool,  // 480i (alternating fields) vs 240p progressive
     exposure: f32,    // live HDR/SDR exposure trim ([ and ] keys) for tuning on the panel
+    subpixel: bool,   // subpixel-accurate (Megatron) mask vs the resolution-independent one (M key)
+    bfi: bool,        // black-frame insertion for CRT-impulse motion clarity (B key; needs a high-refresh panel)
+    refresh_hz: f32,  // detected panel refresh (for the BFI safety gate / message)
 }
 
 impl State {
@@ -1662,6 +1691,15 @@ impl State {
             frame: 0,
             interlace: false,
             exposure: 1.0,
+            subpixel: false,
+            bfi: false,
+            // Panel refresh, for the BFI gate: strobing only helps at ≥100 Hz (at 60 Hz
+            // it just flickers at 30). current_monitor()/refresh_rate is a best effort.
+            refresh_hz: window
+                .current_monitor()
+                .and_then(|m| m.refresh_rate_millihertz())
+                .map(|mhz| mhz as f32 / 1000.0)
+                .unwrap_or(60.0),
             dragging: false,
             last_cursor: (0.0, 0.0),
             window,
@@ -1795,6 +1833,10 @@ impl State {
         } else {
             (0.0, 0.0)
         };
+        // BFI: strobe the emitted phosphor light dark on alternate refreshes so motion
+        // reads as CRT-impulse rather than LCD sample-and-hold. Only the emission is
+        // blanked (the glass keeps mirroring the room). 1.0 = lit frame, 0.0 = dark.
+        let bfi_mul = if self.bfi && (self.frame & 1) == 1 { 0.0 } else { 1.0 };
         let aspect = self.config.width as f32 / self.config.height as f32;
         write_uniforms(
             &self.queue,
@@ -1810,6 +1852,8 @@ impl State {
             interlace,
             field,
             self.exposure,
+            self.subpixel,
+            bfi_mul,
         );
 
         let frame = self.surface.get_current_texture()?;
@@ -1902,7 +1946,11 @@ fn save_shot(path: &str, width: u32, height: u32, preset: Preset) {
     let interlace = envf("CRTULUM_INTERLACE", 0.0);
     let field = envf("CRTULUM_FIELD", 0.0);
     let exposure = std::env::var("CRTULUM_EXPOSURE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
-    write_uniforms(&queue, &res, &orbit, width as f32 / height as f32, shot_t, &preset, SS as f32, false, dt, pwr, interlace, field, exposure);
+    // Subpixel mask only resolves at native res, so it SSAAs away in a shot — off by
+    // default; CRTULUM_SUBPIXEL=1 forces it for structural checks. BFI is a live-only
+    // motion effect (a still can't show a strobe), so the shot always renders lit.
+    let subpixel = envf("CRTULUM_SUBPIXEL", 0.0) > 0.5;
+    write_uniforms(&queue, &res, &orbit, width as f32 / height as f32, shot_t, &preset, SS as f32, false, dt, pwr, interlace, field, exposure, subpixel, 1.0);
 
     // Warm up the phosphor plane. A single headless frame has no history, so run
     // the accumulation a few fields to reach steady state. CRTULUM_MOTION=1 instead
@@ -2104,6 +2152,23 @@ fn main() {
                                     PhysicalKey::Code(KeyCode::KeyI) => {
                                         state.interlace = !state.interlace;
                                         eprintln!("[interlace] {}", if state.interlace { "480i" } else { "240p" });
+                                    }
+                                    // M = subpixel-accurate (Megatron) mask vs the resolution-
+                                    // independent gaussian mask. Only looks right at native
+                                    // resolution on an RGB-stripe panel.
+                                    PhysicalKey::Code(KeyCode::KeyM) => {
+                                        state.subpixel = !state.subpixel;
+                                        eprintln!("[mask] {}", if state.subpixel { "subpixel (Megatron)" } else { "gaussian" });
+                                    }
+                                    // B = black-frame insertion (CRT-impulse motion clarity).
+                                    // Needs a ≥100 Hz panel to help instead of just flickering.
+                                    PhysicalKey::Code(KeyCode::KeyB) => {
+                                        state.bfi = !state.bfi;
+                                        if state.bfi && state.refresh_hz < 100.0 {
+                                            eprintln!("[bfi] on — WARNING: {:.0} Hz panel; BFI needs ≥100 Hz to reduce blur (will flicker)", state.refresh_hz);
+                                        } else {
+                                            eprintln!("[bfi] {} ({:.0} Hz)", if state.bfi { "on" } else { "off" }, state.refresh_hz);
+                                        }
                                     }
                                     PhysicalKey::Code(KeyCode::Tab) => {
                                         let i = ALL_PRESETS
