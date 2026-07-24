@@ -265,15 +265,23 @@ fn build_mesh(bulge: f32, cx: f32, cy: f32) -> (Vec<Vertex>, Vec<u32>) {
     let z_front = bulge * 0.6 + 0.05; // front face plane, just behind the glass apex
     let z_rear = -1.46; //  main box back (depth ≈ width → the real near-cube)
     let z_rear2 = -1.94; // rear hump back (encloses the funnel/neck)
+    // Edge chamfer: real injection-molded cabinets are never razor-edged — every outer
+    // edge has a few-mm bevel that catches a bright highlight line. The front face is
+    // inset by `cf`, then a 45° bevel (+ mitred corner facets) runs out to the full
+    // cabinet extent where the side walls begin (at z = zc).
+    let cf = 0.05;
+    let (fl, fr, fb, ft) = (cab_l + cf, cab_r - cf, cab_b + cf, cab_t - cf);
+    let zc = z_front - cf;
     let quad = |v: &mut Vec<Vertex>, ix: &mut Vec<u32>, p: [[f32; 3]; 4], m: f32| push_quad(v, ix, p, m);
 
-    // 6a. Front bezel around the screen opening: top strip, two side strips.
+    // 6a. Front bezel around the screen opening: top strip, two side strips (to the
+    // chamfered front-face extents fl/fr/ft, not the full cabinet edge).
     quad(&mut verts, &mut indices,
-        [[cab_l, oy, z_front], [cab_r, oy, z_front], [cab_r, cab_t, z_front], [cab_l, cab_t, z_front]], 3.0); // top
+        [[fl, oy, z_front], [fr, oy, z_front], [fr, ft, z_front], [fl, ft, z_front]], 3.0); // top
     quad(&mut verts, &mut indices,
-        [[cab_l, -oy, z_front], [-ox, -oy, z_front], [-ox, oy, z_front], [cab_l, oy, z_front]], 3.0); // left
+        [[fl, -oy, z_front], [-ox, -oy, z_front], [-ox, oy, z_front], [fl, oy, z_front]], 3.0); // left
     quad(&mut verts, &mut indices,
-        [[ox, -oy, z_front], [cab_r, -oy, z_front], [cab_r, oy, z_front], [ox, oy, z_front]], 3.0); // right
+        [[ox, -oy, z_front], [fr, -oy, z_front], [fr, oy, z_front], [ox, oy, z_front]], 3.0); // right
     // inner lip: recess the opening edge back to the glass block so the tube sits inset.
     let zl = -GLASS_T - 0.02;
     quad(&mut verts, &mut indices, [[-ox, oy, z_front], [ox, oy, z_front], [ox, oy, zl], [-ox, oy, zl]], 3.0);
@@ -281,17 +289,28 @@ fn build_mesh(bulge: f32, cx: f32, cy: f32) -> (Vec<Vertex>, Vec<u32>) {
     quad(&mut verts, &mut indices, [[-ox, -oy, z_front], [-ox, oy, z_front], [-ox, oy, zl], [-ox, -oy, zl]], 3.0);
     quad(&mut verts, &mut indices, [[ox, -oy, z_front], [ox, oy, z_front], [ox, oy, zl], [ox, -oy, zl]], 3.0);
 
+    // 6a-bevel. 45° chamfer ring: the front face plane (z_front) out to the full cabinet
+    // rectangle (zc), with four edge bevels + four mitred corner facets.
+    quad(&mut verts, &mut indices, [[fl, ft, z_front], [fr, ft, z_front], [fr, cab_t, zc], [fl, cab_t, zc]], 3.0); // top
+    quad(&mut verts, &mut indices, [[fl, fb, z_front], [fr, fb, z_front], [fr, cab_b, zc], [fl, cab_b, zc]], 3.0); // bottom
+    quad(&mut verts, &mut indices, [[fl, fb, z_front], [fl, ft, z_front], [cab_l, ft, zc], [cab_l, fb, zc]], 3.0); // left
+    quad(&mut verts, &mut indices, [[fr, fb, z_front], [fr, ft, z_front], [cab_r, ft, zc], [cab_r, fb, zc]], 3.0); // right
+    quad(&mut verts, &mut indices, [[fr, ft, z_front], [fr, cab_t, zc], [cab_r, cab_t, zc], [cab_r, ft, zc]], 3.0); // TR corner
+    quad(&mut verts, &mut indices, [[fl, ft, z_front], [fl, cab_t, zc], [cab_l, cab_t, zc], [cab_l, ft, zc]], 3.0); // TL corner
+    quad(&mut verts, &mut indices, [[fr, fb, z_front], [fr, cab_b, zc], [cab_r, cab_b, zc], [cab_r, fb, zc]], 3.0); // BR corner
+    quad(&mut verts, &mut indices, [[fl, fb, z_front], [fl, cab_b, zc], [cab_l, cab_b, zc], [cab_l, fb, zc]], 3.0); // BL corner
+
     // 6b. Chin: a plastic frame around a recessed panel that carries the speaker
     // grille (left ~66%) and the control cluster (right ~34%).
     let chin_top = -oy;
-    let (rx0, rx1) = (cab_l + 0.07, cab_r - 0.07); // recess extents
-    let (ry0, ry1) = (cab_b + 0.075, chin_top - 0.06);
+    let (rx0, rx1) = (fl + 0.05, fr - 0.05); // recess extents
+    let (ry0, ry1) = (fb + 0.075, chin_top - 0.06);
     let z_rec = z_front - 0.05; // recess depth
     // chin frame strips (plastic, at z_front)
-    quad(&mut verts, &mut indices, [[cab_l, cab_b, z_front], [cab_r, cab_b, z_front], [cab_r, ry0, z_front], [cab_l, ry0, z_front]], 3.0); // below recess
-    quad(&mut verts, &mut indices, [[cab_l, ry1, z_front], [cab_r, ry1, z_front], [cab_r, chin_top, z_front], [cab_l, chin_top, z_front]], 3.0); // above recess
-    quad(&mut verts, &mut indices, [[cab_l, ry0, z_front], [rx0, ry0, z_front], [rx0, ry1, z_front], [cab_l, ry1, z_front]], 3.0); // left of recess
-    quad(&mut verts, &mut indices, [[rx1, ry0, z_front], [cab_r, ry0, z_front], [cab_r, ry1, z_front], [rx1, ry1, z_front]], 3.0); // right of recess
+    quad(&mut verts, &mut indices, [[fl, fb, z_front], [fr, fb, z_front], [fr, ry0, z_front], [fl, ry0, z_front]], 3.0); // below recess
+    quad(&mut verts, &mut indices, [[fl, ry1, z_front], [fr, ry1, z_front], [fr, chin_top, z_front], [fl, chin_top, z_front]], 3.0); // above recess
+    quad(&mut verts, &mut indices, [[fl, ry0, z_front], [rx0, ry0, z_front], [rx0, ry1, z_front], [fl, ry1, z_front]], 3.0); // left of recess
+    quad(&mut verts, &mut indices, [[rx1, ry0, z_front], [fr, ry0, z_front], [fr, ry1, z_front], [rx1, ry1, z_front]], 3.0); // right of recess
     // recess side walls (front → back)
     quad(&mut verts, &mut indices, [[rx0, ry0, z_front], [rx1, ry0, z_front], [rx1, ry0, z_rec], [rx0, ry0, z_rec]], 3.0);
     quad(&mut verts, &mut indices, [[rx0, ry1, z_front], [rx1, ry1, z_front], [rx1, ry1, z_rec], [rx0, ry1, z_rec]], 3.0);
@@ -324,11 +343,11 @@ fn build_mesh(bulge: f32, cx: f32, cy: f32) -> (Vec<Vertex>, Vec<u32>) {
         let _ = i;
     }
 
-    // 6c. Side walls: extrude the front outer rectangle straight back to the main box.
-    quad(&mut verts, &mut indices, [[cab_l, cab_t, z_front], [cab_r, cab_t, z_front], [cab_r, cab_t, z_rear], [cab_l, cab_t, z_rear]], 3.0); // top
-    quad(&mut verts, &mut indices, [[cab_l, cab_b, z_front], [cab_r, cab_b, z_front], [cab_r, cab_b, z_rear], [cab_l, cab_b, z_rear]], 3.0); // bottom
-    quad(&mut verts, &mut indices, [[cab_l, cab_b, z_front], [cab_l, cab_t, z_front], [cab_l, cab_t, z_rear], [cab_l, cab_b, z_rear]], 3.0); // left
-    quad(&mut verts, &mut indices, [[cab_r, cab_b, z_front], [cab_r, cab_t, z_front], [cab_r, cab_t, z_rear], [cab_r, cab_b, z_rear]], 3.0); // right
+    // 6c. Side walls: from the chamfer edge (zc) straight back to the main box.
+    quad(&mut verts, &mut indices, [[cab_l, cab_t, zc], [cab_r, cab_t, zc], [cab_r, cab_t, z_rear], [cab_l, cab_t, z_rear]], 3.0); // top
+    quad(&mut verts, &mut indices, [[cab_l, cab_b, zc], [cab_r, cab_b, zc], [cab_r, cab_b, z_rear], [cab_l, cab_b, z_rear]], 3.0); // bottom
+    quad(&mut verts, &mut indices, [[cab_l, cab_b, zc], [cab_l, cab_t, zc], [cab_l, cab_t, z_rear], [cab_l, cab_b, z_rear]], 3.0); // left
+    quad(&mut verts, &mut indices, [[cab_r, cab_b, zc], [cab_r, cab_t, zc], [cab_r, cab_t, z_rear], [cab_r, cab_b, z_rear]], 3.0); // right
 
     // 6d. Rear hump: taper the box in toward the tube axis and cap it (with a neck
     // hole). This is the classic bulging back of a CRT set enclosing the deflection bell.
@@ -1321,6 +1340,7 @@ fn write_uniforms(
     pwr: [f32; 4],
     interlace: f32,
     field: f32,
+    exposure: f32,
 ) {
     let (view_proj, eye) = orbit.view_proj(aspect);
     let cmat = preset_color_matrix(preset);
@@ -1350,10 +1370,13 @@ fn write_uniforms(
         // (peak/drive push the beam above white). On SDR, tonemap to `peak` white
         // point. `beam_drive` is the extra gain applied to scanline-beam cores.
         // tone.w = input signal path (0=RGB/component clean, 1=S-video, 2=composite).
+        // tone.y carries the exposure trim on the HDR path (scales SDR-white → panel
+        // reference white) and the tonemap white-point × exposure on the SDR path, so
+        // the [ and ] keys tune brightness identically in both.
         tone: if hdr {
-            [1.0, 1.0, 1.9, preset.signal as f32]
+            [1.0, exposure, 1.9, preset.signal as f32]
         } else {
-            [0.0, 2.6, 1.7, preset.signal as f32]
+            [0.0, 1.08 * exposure, 1.7, preset.signal as f32] // ACES exposure (was Reinhard white pt)
         },
         // Guest/Megatron beam math (per-tube focus/TVL): per-channel beam half-width
         // runs from beam_min (dark → tight) to beam_max (bright → wide); beam_shape
@@ -1413,7 +1436,14 @@ fn write_uniforms(
                     _ => 0.02,
                 }
             };
-            [defocus, overscan, 0.0, 0.0]
+            // Rolling refresh band (focus.z = roll rate Hz, focus.w = amplitude): the
+            // vertical "hum bar" you see on a CRT is the BEAT between the viewing/capture
+            // rate and the tube's 59.94 Hz field sweep — a soft freshly-scanned bright
+            // band rolling down the picture. Dead-on by eye it's invisible; here (a
+            // "captured" CRT on an LCD) a gentle ~0.45 Hz beat reads as a living tube.
+            // 480i doubles the beat feel via field twitter (handled in the accum pass).
+            let roll_rate = if preset.mono[3] > 0.5 { 0.30 } else { 0.45 };
+            [defocus, overscan, roll_rate, 0.05]
         },
     };
     queue.write_buffer(&res.ubuf, 0, bytemuck::bytes_of(&uniforms));
@@ -1534,6 +1564,7 @@ struct State {
     degauss_start: Option<std::time::Instant>,
     frame: u64,       // field counter for 480i interlace
     interlace: bool,  // 480i (alternating fields) vs 240p progressive
+    exposure: f32,    // live HDR/SDR exposure trim ([ and ] keys) for tuning on the panel
 }
 
 impl State {
@@ -1630,6 +1661,7 @@ impl State {
             degauss_start: Some(std::time::Instant::now()),
             frame: 0,
             interlace: false,
+            exposure: 1.0,
             dragging: false,
             last_cursor: (0.0, 0.0),
             window,
@@ -1777,6 +1809,7 @@ impl State {
             pwr,
             interlace,
             field,
+            self.exposure,
         );
 
         let frame = self.surface.get_current_texture()?;
@@ -1868,7 +1901,8 @@ fn save_shot(path: &str, width: u32, height: u32, preset: Preset) {
     ];
     let interlace = envf("CRTULUM_INTERLACE", 0.0);
     let field = envf("CRTULUM_FIELD", 0.0);
-    write_uniforms(&queue, &res, &orbit, width as f32 / height as f32, shot_t, &preset, SS as f32, false, dt, pwr, interlace, field);
+    let exposure = std::env::var("CRTULUM_EXPOSURE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    write_uniforms(&queue, &res, &orbit, width as f32 / height as f32, shot_t, &preset, SS as f32, false, dt, pwr, interlace, field, exposure);
 
     // Warm up the phosphor plane. A single headless frame has no history, so run
     // the accumulation a few fields to reach steady state. CRTULUM_MOTION=1 instead
@@ -2056,6 +2090,15 @@ fn main() {
                                     PhysicalKey::Code(KeyCode::KeyP) => state.toggle_power(),
                                     PhysicalKey::Code(KeyCode::KeyG) => {
                                         state.degauss_start = Some(std::time::Instant::now())
+                                    }
+                                    // [ / ] = trim exposure down/up (tune HDR on the panel).
+                                    PhysicalKey::Code(KeyCode::BracketLeft) => {
+                                        state.exposure = (state.exposure * 0.92).clamp(0.2, 5.0);
+                                        eprintln!("[exposure] {:.2}", state.exposure);
+                                    }
+                                    PhysicalKey::Code(KeyCode::BracketRight) => {
+                                        state.exposure = (state.exposure * 1.08).clamp(0.2, 5.0);
+                                        eprintln!("[exposure] {:.2}", state.exposure);
                                     }
                                     // I = toggle 480i interlace vs 240p progressive.
                                     PhysicalKey::Code(KeyCode::KeyI) => {

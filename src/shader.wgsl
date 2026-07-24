@@ -77,7 +77,7 @@ fn hash21(p: vec2<f32>) -> f32 {
 // Three phosphor stripes (R,G,B) across a triad, evaluated periodically so the
 // pattern wraps cleanly. `t` in [0,1) is the position within one triad.
 fn phosphor3(t: f32) -> vec3<f32> {
-    let w = 0.13;
+    let w = 0.105; // tighter stripes → clearer black grille gaps (per Trinitron macro refs)
     var r = 0.0;
     var g = 0.0;
     var b = 0.0;
@@ -139,25 +139,28 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
 // ceiling area-light, a warm lamp to the right, and a faint cool fill to the left.
 fn room(r: vec3<f32>) -> vec3<f32> {
     let up = clamp(r.y * 0.5 + 0.5, 0.0, 1.0);
-    // Walls: a dark room graded cool at the ceiling, warmer toward the floor line.
-    var c = mix(vec3<f32>(0.018, 0.017, 0.020), vec3<f32>(0.060, 0.070, 0.090), up);
-    // Soft rectangular ceiling softbox (the dominant key — a broad area light so the
-    // gloss picks up a large, believable highlight rather than a point star).
-    let win = smoothstep(0.35, 0.95, r.y) * smoothstep(0.75, 0.05, abs(r.x + 0.1));
-    c = c + vec3<f32>(1.25, 1.32, 1.5) * win * 3.4;
-    // A second, tighter ceiling strip for a crisp secondary highlight.
-    let win2 = smoothstep(0.72, 0.99, r.y) * smoothstep(0.35, 0.02, abs(r.x - 0.45));
-    c = c + vec3<f32>(1.3, 1.3, 1.35) * win2 * 2.2;
+    // A NORMALLY-LIT interior — not a black void. Every photo of a real CRT shows the
+    // dark glass mirroring a whole room (walls, ceiling, a window), so the environment
+    // has to read as a lit room: warm mid walls, brighter cool ceiling, darker floor.
+    var c = mix(vec3<f32>(0.085, 0.080, 0.072), vec3<f32>(0.30, 0.32, 0.37), up);
+    // Daylight window with mullion bars — the single most recognisable reflection in a
+    // CRT photo. Projected to the left of the room; a bright bluish rectangle crossed by
+    // a dark 2×2 mullion grid. Moves across the glass as the camera orbits.
+    let wx = r.x * 1.7 + 0.55;
+    let wy = r.y * 1.9 - 0.10;
+    let inwin = smoothstep(0.52, 0.42, abs(wx)) * smoothstep(0.52, 0.42, abs(wy));
+    let barx = smoothstep(0.05, 0.11, abs(fract(wx * 1.6) - 0.5));
+    let bary = smoothstep(0.05, 0.11, abs(fract(wy * 1.6) - 0.5));
+    c = c + vec3<f32>(1.6, 1.78, 2.15) * inwin * mix(0.18, 1.0, min(barx, bary)) * 0.9;
+    // Soft rectangular ceiling softbox (broad area highlight on the gloss).
+    let win = smoothstep(0.45, 0.97, r.y) * smoothstep(0.66, 0.06, abs(r.x - 0.35));
+    c = c + vec3<f32>(1.2, 1.25, 1.42) * win * 1.7;
     // Warm practical lamp off to the right.
-    let lamp = pow(max(dot(r, normalize(vec3<f32>(0.75, 0.05, 0.55))), 0.0), 26.0);
-    c = c + vec3<f32>(1.0, 0.70, 0.42) * lamp * 4.5;
-    // Faint cool fill from the left.
-    let fill = pow(max(dot(r, normalize(vec3<f32>(-0.7, 0.2, 0.4))), 0.0), 6.0);
-    c = c + vec3<f32>(0.30, 0.35, 0.45) * fill * 0.7;
-    // Floor bounce: downward rays pick up a dim warm reflection of the lit floor,
-    // filling shadowed undersides so nothing reads as pure black (real rooms don't).
+    let lamp = pow(max(dot(r, normalize(vec3<f32>(0.78, 0.02, 0.55))), 0.0), 28.0);
+    c = c + vec3<f32>(1.0, 0.68, 0.40) * lamp * 4.0;
+    // Floor: darker, warm — downward rays pick it up (fills shadowed undersides).
     let down = clamp(-r.y, 0.0, 1.0);
-    c = c + vec3<f32>(0.10, 0.10, 0.11) * down * down;
+    c = c + vec3<f32>(0.11, 0.095, 0.078) * down;
     return c;
 }
 
@@ -447,6 +450,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                                 (hash21(in.world_pos.zx * 95.0) - 0.5) * 0.4) * 0.05;
             nn = normalize(nn + jit);
             metal = 0.0;
+            // Ventilation slots: real sets vent heat through fine louvres across the TOP
+            // toward the rear. Thin dark grooves (darker albedo + a normal tilt so they
+            // self-shade) where the face points up and we're behind the front box.
+            if (nn.y > 0.6 && in.world_pos.z < -0.35) {
+                let g = abs(fract(in.world_pos.z * 6.5) - 0.5) * 2.0; // 0 at each groove
+                let groove = smoothstep(0.10, 0.32, g);
+                base = base * mix(0.35, 1.0, groove);
+                nn = normalize(nn + vec3<f32>(0.0, 0.0, (fract(in.world_pos.z * 6.5) - 0.5) * 0.7));
+            }
+            // Cabinet seam: the moulded front bezel meets the rear cabinet along a fine
+            // parting line. A thin dark groove around the side/top/bottom faces at z≈-0.5.
+            if (abs(nn.z) < 0.6) {
+                let s = abs(in.world_pos.z + 0.5);
+                base = base * mix(0.5, 1.0, smoothstep(0.0, 0.014, s));
+            }
         } else {
             // Speaker grille (material 4): near-black woven cloth — matte, light-drinking,
             // with a fine weave mottle. Low, broken specular (fabric, not plastic).
@@ -555,6 +573,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     col = col * (1.0 - apl * 0.06);
     let bright = max(col - vec3<f32>(0.72), vec3<f32>(0.0));
     col = col + bright * u.phys.w * (0.6 + apl);
+
+    // Rolling refresh band ("hum bar"): the beam sweeps top→bottom at the field rate, so
+    // a just-scanned line glows a hair brighter and fades as it ages toward the next
+    // sweep. Viewed dead-on by eye this averages out, but a "captured" CRT rolls because
+    // the viewing rate beats against the tube's 59.94 Hz field — focus.z is that beat
+    // rate, focus.w the amplitude. A soft bright band drifting down = a living tube.
+    if (u.focus.w > 0.0) {
+        let beam_y = fract(u.params.z * u.focus.z);   // beam vertical position (rolls)
+        let age = fract(beam_y - in.uv.y);            // 0 = just scanned → 1 = most decayed
+        let refresh = u.focus.w * (exp(-age * 6.5) - 0.14);
+        col = col * (1.0 + refresh);
+    }
 
     // Monochrome tube: a single electron gun paints ONE phosphor colour scaled by the
     // signal's luminance — no colour triads, no convergence (a green/amber terminal).
@@ -670,15 +700,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         col = col * (vec3<f32>(1.0) + rainbow * u.pwr.z * 0.55);
     }
 
-    // Glass Fresnel reflection of the synthetic room, plus a tight specular glare
-    // from a room light. The glare is a hot spot that slides across the curved
-    // faceplate as you orbit — the single most CRT-reading reflection cue.
-    let fres = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+    // Faceplate glass = a dark, slightly-reflective mirror. This is THE defining CRT
+    // cue (see any photo of a real set): even head-on the glass bounces ~4% of the room
+    // (Schlick F0≈0.043 for glass↔air), rising to a full mirror at grazing — so a dark
+    // screen clearly reflects the lit room, and the reflection warps over the curved
+    // faceplate and slides as you orbit. Additive, so a bright picture washes it out
+    // (just like a real tube) while dark content mirrors the room.
+    let ndotv = max(dot(n, v), 0.0);
+    let fres = 0.043 + 0.957 * pow(1.0 - ndotv, 5.0);
     let refl = reflect(-v, n);
-    col = col + room(refl) * fres * u.glass.y;
+    col = col + room(refl) * fres * (0.35 + 1.1 * u.glass.y);
+    // Tight specular glare from the ceiling softbox — a hot spot sliding across the
+    // curved glass as you move; the single most CRT-reading highlight.
     let light_dir = normalize(vec3<f32>(-0.35, 0.55, 0.95));
     let glare = pow(max(dot(refl, light_dir), 0.0), 130.0);
-    col = col + vec3<f32>(1.0, 0.98, 0.92) * glare * u.glass.y * 1.6;
+    col = col + vec3<f32>(1.0, 0.98, 0.92) * glare * (0.3 + u.glass.y) * 2.0;
 
     // Output. col is HDR (linear light, BT.709/sRGB primaries, highlights >1.0).
     if (u.tone.x > 0.5) {
@@ -697,7 +733,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // SDR display: filmic-tonemap HDR highlights back into range (ACES). Target is
     // sRGB, so return linear — the swapchain encodes the transfer function. The small
     // exposure lift keeps midtones from darkening under the ACES toe.
-    let toned = aces(col * 1.08);
+    let toned = aces(col * u.tone.y);
     // ACES desaturates bright colours; the CRT phosphors should stay vivid, so nudge
     // saturation back ~14% around luminance (cheap, keeps the picture punchy).
     let l = dot(toned, vec3<f32>(0.2126, 0.7152, 0.0722));
