@@ -25,6 +25,7 @@ struct Uniforms {
     cmat1: vec4<f32>,
     cmat2: vec4<f32>,
     pwr: vec4<f32>,     // power: x=warmup(0..1), y=collapse(0..1), z=degauss(0..1), w unused
+    focus: vec4<f32>,   // x=edge defocus (deflection spot growth), y=overscan(per side), z/w unused
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -121,21 +122,42 @@ fn tonemap(c: vec3<f32>, peak: f32) -> vec3<f32> {
     return (c * (1.0 + c / w2)) / (1.0 + c);
 }
 
+// ACES filmic tonemap (Narkowicz 2015 fit): a filmic S-curve with a graceful highlight
+// shoulder and a slight toe — far more photographic HDR→SDR rolloff than Reinhard, and
+// it keeps saturated bright colours from clipping to flat white. Input linear HDR.
+fn aces(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 // Synthetic HDR room reflected in the glass and the plastic. Values run well above
 // 1.0 so the light sources bloom in the reflections — a dark room with a soft
 // ceiling area-light, a warm lamp to the right, and a faint cool fill to the left.
 fn room(r: vec3<f32>) -> vec3<f32> {
     let up = clamp(r.y * 0.5 + 0.5, 0.0, 1.0);
-    var c = mix(vec3<f32>(0.014, 0.013, 0.016), vec3<f32>(0.055, 0.065, 0.085), up);
-    // soft rectangular ceiling light (area window)
-    let win = smoothstep(0.45, 0.98, r.y) * smoothstep(0.6, 0.05, abs(r.x + 0.1));
-    c = c + vec3<f32>(1.3, 1.35, 1.5) * win * 3.0;
-    // warm lamp off to the right
-    let lamp = pow(max(dot(r, normalize(vec3<f32>(0.75, 0.05, 0.55))), 0.0), 24.0);
-    c = c + vec3<f32>(1.0, 0.72, 0.45) * lamp * 4.0;
-    // faint cool fill from the left
+    // Walls: a dark room graded cool at the ceiling, warmer toward the floor line.
+    var c = mix(vec3<f32>(0.018, 0.017, 0.020), vec3<f32>(0.060, 0.070, 0.090), up);
+    // Soft rectangular ceiling softbox (the dominant key — a broad area light so the
+    // gloss picks up a large, believable highlight rather than a point star).
+    let win = smoothstep(0.35, 0.95, r.y) * smoothstep(0.75, 0.05, abs(r.x + 0.1));
+    c = c + vec3<f32>(1.25, 1.32, 1.5) * win * 3.4;
+    // A second, tighter ceiling strip for a crisp secondary highlight.
+    let win2 = smoothstep(0.72, 0.99, r.y) * smoothstep(0.35, 0.02, abs(r.x - 0.45));
+    c = c + vec3<f32>(1.3, 1.3, 1.35) * win2 * 2.2;
+    // Warm practical lamp off to the right.
+    let lamp = pow(max(dot(r, normalize(vec3<f32>(0.75, 0.05, 0.55))), 0.0), 26.0);
+    c = c + vec3<f32>(1.0, 0.70, 0.42) * lamp * 4.5;
+    // Faint cool fill from the left.
     let fill = pow(max(dot(r, normalize(vec3<f32>(-0.7, 0.2, 0.4))), 0.0), 6.0);
-    c = c + vec3<f32>(0.30, 0.35, 0.45) * fill * 0.6;
+    c = c + vec3<f32>(0.30, 0.35, 0.45) * fill * 0.7;
+    // Floor bounce: downward rays pick up a dim warm reflection of the lit floor,
+    // filling shadowed undersides so nothing reads as pure black (real rooms don't).
+    let down = clamp(-r.y, 0.0, 1.0);
+    c = c + vec3<f32>(0.10, 0.10, 0.11) * down * down;
     return c;
 }
 
@@ -167,15 +189,18 @@ fn shade_body(base: vec3<f32>, rough: f32, metal: f32, n: vec3<f32>, v: vec3<f32
     let l1 = normalize(vec3<f32>(-0.60, 0.10, 0.50)); // warm fill
     let f0 = mix(vec3<f32>(0.04), base, metal);
     let kd = base * (1.0 - metal);
-    let amb = mix(vec3<f32>(0.03, 0.032, 0.04), vec3<f32>(0.11, 0.12, 0.15), n.y * 0.5 + 0.5);
+    // Very low hemispheric ambient so shadowed faces fall to a true charcoal, not grey.
+    let amb = mix(vec3<f32>(0.006, 0.007, 0.009), vec3<f32>(0.026, 0.029, 0.037), n.y * 0.5 + 0.5);
     var col = kd * (amb
-        + vec3<f32>(1.0, 1.0, 0.98) * max(dot(n, l0), 0.0) * 0.8
-        + vec3<f32>(1.0, 0.80, 0.60) * max(dot(n, l1), 0.0) * 0.35);
-    col = col + ggx_spec(n, v, l0, rough, f0) * 3.0 + ggx_spec(n, v, l1, rough, f0) * 1.5;
+        + vec3<f32>(1.0, 0.99, 0.96) * max(dot(n, l0), 0.0) * 1.05  // warm key → directional contrast
+        + vec3<f32>(1.0, 0.78, 0.55) * max(dot(n, l1), 0.0) * 0.28);
+    // Specular kept physical (no ×3 over-brightening that washed the plastic to grey).
+    col = col + ggx_spec(n, v, l0, rough, f0) * 0.8 + ggx_spec(n, v, l1, rough, f0) * 0.4;
     let refl = reflect(-v, n);
     let env = mix(room(refl), amb * 2.0, rough); // rougher → duller reflection
     let fres = f_schlick(max(dot(n, v), 0.0), f0);
-    col = col + env * fres * (1.0 - rough * 0.7);
+    // Env reflection mostly an edge-sheen on matte plastic (halved so it doesn't grey the faces).
+    col = col + env * fres * (1.0 - rough * 0.7) * 0.30;
     return col;
 }
 
@@ -304,7 +329,7 @@ fn beam_width(c: vec3<f32>) -> vec3<f32> {
 // a per-channel gaussian beam; summing the overlapping profiles gives bright cores
 // that bloom and dark gaps that stay open — resolution-correct, in linear light.
 // (Explicit-LOD sampling so it stays callable once per primary for dispersion.)
-fn scan_reconstruct(uv: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
+fn scan_reconstruct(uv: vec2<f32>, res: vec2<f32>, wscale: f32) -> vec3<f32> {
     let fy = uv.y * res.y - 0.5;
     let row0 = floor(fy);
     var beam = vec3<f32>(0.0); // energy-weighted beam sum (blooms where lines overlap)
@@ -315,7 +340,8 @@ fn scan_reconstruct(uv: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
         let row = row0 + f32(k);
         let ly = (row + 0.5) / res.y;
         let c = textureSampleLevel(t_screen, s_screen, vec2<f32>(uv.x, ly), 0.0).rgb;
-        let w = beam_width(c);
+        // wscale > 1 near the edges: deflection defocus widens the vertical spot.
+        let w = beam_width(c) * wscale;
         let d = fy - row;
         let g = exp(-(d * d) / (w * w)); // per-channel gaussian beam profile
         beam = beam + c * g;
@@ -391,7 +417,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.world_normal);
     let v = normalize(u.cam_pos.xyz - in.world_pos);
 
-    // ---- Tube body: 1 = leaded funnel/neck glass, 2 = deflection yoke, 3 = plastic ----
+    // ---- Body: 1=leaded glass, 2=yoke, 3=cabinet plastic, 4=speaker cloth ----
     if (in.material > 0.5) {
         // Two-sided: cull is off so the viewer can see interior faces; flip the normal
         // toward the camera so lighting is correct regardless of triangle winding.
@@ -402,24 +428,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         var rough: f32;
         var metal: f32;
         if (in.material < 1.5) {
-            base = vec3<f32>(0.018, 0.019, 0.024); // near-black leaded glass, glossy
-            rough = 0.22;
+            base = vec3<f32>(0.016, 0.017, 0.021); // near-black leaded glass, glossy
+            rough = 0.20;
             metal = 0.0;
         } else if (in.material < 2.5) {
             base = vec3<f32>(0.42, 0.26, 0.15);    // deflection yoke: dull copper
             rough = 0.55;
             metal = 1.0;
-        } else {
-            base = vec3<f32>(0.060, 0.054, 0.045); // aged warm-gray molded plastic
+        } else if (in.material < 3.5) {
+            base = vec3<f32>(0.030, 0.027, 0.024); // warm charcoal molded TV plastic (Trinitron)
             // Injection-molded pebble finish: mottle the albedo, perturb roughness and
-            // the normal so the specular breaks into a matte sparkle, not a mirror.
+            // the normal so the specular breaks into a fine matte sparkle, not a mirror.
             let tx = hash21(floor(in.world_pos.xy * 140.0)) + hash21(floor(in.world_pos.yz * 130.0));
-            rough = clamp(0.50 + (tx - 1.0) * 0.14, 0.30, 0.76);
-            base = base * (0.82 + 0.34 * hash21(floor(in.world_pos.xy * 70.0)));
+            rough = clamp(0.62 + (tx - 1.0) * 0.12, 0.46, 0.82); // matte molded plastic
+            base = base * (0.78 + 0.40 * hash21(floor(in.world_pos.xy * 70.0))); // stronger mottle
             let jit = vec3<f32>(hash21(in.world_pos.xy * 95.0) - 0.5,
                                 hash21(in.world_pos.yz * 95.0) - 0.5,
-                                (hash21(in.world_pos.zx * 95.0) - 0.5) * 0.4) * 0.07;
+                                (hash21(in.world_pos.zx * 95.0) - 0.5) * 0.4) * 0.05;
             nn = normalize(nn + jit);
+            metal = 0.0;
+        } else {
+            // Speaker grille (material 4): near-black woven cloth — matte, light-drinking,
+            // with a fine weave mottle. Low, broken specular (fabric, not plastic).
+            let weave = hash21(floor(in.world_pos.xy * 90.0)) * hash21(floor(in.world_pos.yx * 80.0));
+            base = vec3<f32>(0.010, 0.010, 0.012) * (0.55 + 0.7 * weave);
+            rough = 0.93;
             metal = 0.0;
         }
 
@@ -452,7 +485,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // horizontal line (vertical deflection dies), then to a fading phosphor dot
     // (horizontal dies). Warmup runs the same in reverse.
     let open = min(u.pwr.x, 1.0 - u.pwr.y);
-    var base_uv = in.uv;
+    // Overscan: a consumer set scans the raster larger than the visible faceplate, so
+    // the picture's outer edges fall off the tube. Sample the centre (1 - 2*os) of the
+    // image across the full screen; PC monitors / mono terminals run os≈0 (full raster).
+    var base_uv = vec2<f32>(0.5) + (in.uv - vec2<f32>(0.5)) * (1.0 - 2.0 * u.focus.y);
     if (u.pwr.z > 0.001) {
         // Degauss: a decaying AC wobble as the coil demagnetises the shadow mask.
         let tt = u.params.z;
@@ -480,11 +516,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let uv_g = refract_uv(ruv, n, v, thick, 1.0 / 1.520);
     let uv_b = refract_uv(ruv, n, v, thick, 1.0 / 1.522) - conv;
     let uv = uv_g; // base uv for halation / vignette
+
+    // Deflection defocus: off-axis the electron beam travels farther and the deflection
+    // field grows, so the spot widens (astigmatic — elongates horizontally at the sides,
+    // worst in the corners) and the picture softens toward the edges. r2 grows to the
+    // corners; a 4th-order term makes the corners bloom hardest. u.focus.x = the tube's
+    // edge-focus quality (a PVM ~0, a fuzzy RCA/arcade blooms). Physical faceplate
+    // effects keep the true in.uv; this only shapes the sampled image.
+    let dfv = ruv - vec2<f32>(0.5);
+    let r2 = dot(dfv, dfv);
+    let vscale = 1.0 + u.focus.x * (2.0 * r2 + 3.5 * r2 * r2);
     var col = vec3<f32>(
-        scan_reconstruct(uv_r, res).r,
-        scan_reconstruct(uv_g, res).g,
-        scan_reconstruct(uv_b, res).b,
+        scan_reconstruct(uv_r, res, vscale).r,
+        scan_reconstruct(uv_g, res, vscale).g,
+        scan_reconstruct(uv_b, res, vscale).b,
     );
+    // Horizontal astigmatism: the spot elongates most horizontally along the side
+    // edges (|dfv.x|), so blur the sampled colour laterally there. Two taps, ~0 in the
+    // centre, so it only softens the edges/corners like a real over-deflected beam.
+    if (u.focus.x > 0.0) {
+        let hamt = clamp(u.focus.x * (0.7 * abs(dfv.x) + 1.6 * r2), 0.0, 0.5);
+        let hoff = vec2<f32>((0.5 + 2.0 * hamt) / res.x, 0.0);
+        let hb = 0.5 * (textureSampleLevel(t_screen, s_screen, uv + hoff, 0.0).rgb
+                      + textureSampleLevel(t_screen, s_screen, uv - hoff, 0.0).rgb);
+        col = mix(col, hb, hamt);
+    }
 
     // CRT transfer + phosphor colour. A real tube's response deepens the blacks
     // (extra gamma) and its P22 phosphors give a characteristically warm-white
@@ -638,7 +694,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // white; bump if the picture looks dim, drop if it's blinding).
         return vec4<f32>(bt2020 * u.tone.y, 1.0);
     }
-    // SDR display: tonemap HDR highlights back into range. Target is sRGB, so
-    // return linear — the swapchain encodes the transfer function.
-    return vec4<f32>(tonemap(col, u.tone.y), 1.0);
+    // SDR display: filmic-tonemap HDR highlights back into range (ACES). Target is
+    // sRGB, so return linear — the swapchain encodes the transfer function. The small
+    // exposure lift keeps midtones from darkening under the ACES toe.
+    let toned = aces(col * 1.08);
+    // ACES desaturates bright colours; the CRT phosphors should stay vivid, so nudge
+    // saturation back ~14% around luminance (cheap, keeps the picture punchy).
+    let l = dot(toned, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return vec4<f32>(clamp(toned + (toned - vec3<f32>(l)) * 0.14, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

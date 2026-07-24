@@ -248,20 +248,101 @@ fn build_mesh(bulge: f32, cx: f32, cy: f32) -> (Vec<Vertex>, Vec<u32>) {
             [ring_at(NECK_R, zy0, k), ring_at(NECK_R, zy0, k2), ring_at(yr, zy0, k2), ring_at(yr, zy0, k)], 2.0);
     }
 
-    // --- 6. Front bezel / cabinet frame (material 3 = molded plastic) ---
-    // A rounded picture-frame box around the faceplate: flat front face, an outer
-    // side wall back to the cabinet, a back face, and an inner lip around the screen.
-    // The curved glass bulges out through the opening; the funnel exits the back.
-    let z_front = bulge * 0.6 + 0.035; // front plastic plane (just behind the glass apex)
-    let z_back = -GLASS_T - 0.02;
-    let ai = rrect(HALF_W * 1.010, HALF_H * 1.014, 0.050, z_front); // inner opening, front
-    let bo = rrect(HALF_W * 1.205, HALF_H * 1.255, 0.135, z_front); // outer, front
-    let bb = rrect(HALF_W * 1.205, HALF_H * 1.255, 0.135, z_back);  // outer, back
-    let ab = rrect(HALF_W * 1.010, HALF_H * 1.014, 0.050, z_back);  // inner opening, back
-    ring_strip(&mut verts, &mut indices, &ai, &bo, 3.0); // front face (flat frame)
-    ring_strip(&mut verts, &mut indices, &bo, &bb, 3.0); // outer cabinet wall
-    ring_strip(&mut verts, &mut indices, &bb, &ab, 3.0); // back face
-    ring_strip(&mut verts, &mut indices, &ab, &ai, 3.0); // inner lip around the screen
+    // --- 6. TV cabinet (material 3 = charcoal plastic, material 4 = speaker cloth) ---
+    // A deep, near-cubic consumer set grounded in the Sony Trinitron KV-20TS
+    // proportions (513 × 487 × 481 mm — a real CRT TV is almost as DEEP as it is wide,
+    // NOT a thin picture frame): the 4:3 screen recessed in the upper-centre, a speaker
+    // grille + control cluster across the tall chin below, a side/top bezel, then a
+    // tapered rear hump that encloses the glass funnel and electron-gun neck.
+    let sb = 0.150; // side bezel
+    let tb = 0.130; // top bezel
+    let bc = 0.450; // bottom chin (speakers + controls) — the tall part below the tube
+    let hw_cab = HALF_W + sb; // outer half-width  ≈ 0.817
+    let cab_t = HALF_H + tb; //  top edge          ≈ 0.630
+    let cab_b = -(HALF_H + bc); // bottom edge     ≈ -0.950  (cabinet ratio ≈ 1.04:1, real 1.05:1)
+    let (cab_l, cab_r) = (-hw_cab, hw_cab);
+    let (ox, oy) = (HALF_W * 1.018, HALF_H * 1.024); // screen opening (a touch over the glass)
+    let z_front = bulge * 0.6 + 0.05; // front face plane, just behind the glass apex
+    let z_rear = -1.46; //  main box back (depth ≈ width → the real near-cube)
+    let z_rear2 = -1.94; // rear hump back (encloses the funnel/neck)
+    let quad = |v: &mut Vec<Vertex>, ix: &mut Vec<u32>, p: [[f32; 3]; 4], m: f32| push_quad(v, ix, p, m);
+
+    // 6a. Front bezel around the screen opening: top strip, two side strips.
+    quad(&mut verts, &mut indices,
+        [[cab_l, oy, z_front], [cab_r, oy, z_front], [cab_r, cab_t, z_front], [cab_l, cab_t, z_front]], 3.0); // top
+    quad(&mut verts, &mut indices,
+        [[cab_l, -oy, z_front], [-ox, -oy, z_front], [-ox, oy, z_front], [cab_l, oy, z_front]], 3.0); // left
+    quad(&mut verts, &mut indices,
+        [[ox, -oy, z_front], [cab_r, -oy, z_front], [cab_r, oy, z_front], [ox, oy, z_front]], 3.0); // right
+    // inner lip: recess the opening edge back to the glass block so the tube sits inset.
+    let zl = -GLASS_T - 0.02;
+    quad(&mut verts, &mut indices, [[-ox, oy, z_front], [ox, oy, z_front], [ox, oy, zl], [-ox, oy, zl]], 3.0);
+    quad(&mut verts, &mut indices, [[-ox, -oy, z_front], [ox, -oy, z_front], [ox, -oy, zl], [-ox, -oy, zl]], 3.0);
+    quad(&mut verts, &mut indices, [[-ox, -oy, z_front], [-ox, oy, z_front], [-ox, oy, zl], [-ox, -oy, zl]], 3.0);
+    quad(&mut verts, &mut indices, [[ox, -oy, z_front], [ox, oy, z_front], [ox, oy, zl], [ox, -oy, zl]], 3.0);
+
+    // 6b. Chin: a plastic frame around a recessed panel that carries the speaker
+    // grille (left ~66%) and the control cluster (right ~34%).
+    let chin_top = -oy;
+    let (rx0, rx1) = (cab_l + 0.07, cab_r - 0.07); // recess extents
+    let (ry0, ry1) = (cab_b + 0.075, chin_top - 0.06);
+    let z_rec = z_front - 0.05; // recess depth
+    // chin frame strips (plastic, at z_front)
+    quad(&mut verts, &mut indices, [[cab_l, cab_b, z_front], [cab_r, cab_b, z_front], [cab_r, ry0, z_front], [cab_l, ry0, z_front]], 3.0); // below recess
+    quad(&mut verts, &mut indices, [[cab_l, ry1, z_front], [cab_r, ry1, z_front], [cab_r, chin_top, z_front], [cab_l, chin_top, z_front]], 3.0); // above recess
+    quad(&mut verts, &mut indices, [[cab_l, ry0, z_front], [rx0, ry0, z_front], [rx0, ry1, z_front], [cab_l, ry1, z_front]], 3.0); // left of recess
+    quad(&mut verts, &mut indices, [[rx1, ry0, z_front], [cab_r, ry0, z_front], [cab_r, ry1, z_front], [rx1, ry1, z_front]], 3.0); // right of recess
+    // recess side walls (front → back)
+    quad(&mut verts, &mut indices, [[rx0, ry0, z_front], [rx1, ry0, z_front], [rx1, ry0, z_rec], [rx0, ry0, z_rec]], 3.0);
+    quad(&mut verts, &mut indices, [[rx0, ry1, z_front], [rx1, ry1, z_front], [rx1, ry1, z_rec], [rx0, ry1, z_rec]], 3.0);
+    quad(&mut verts, &mut indices, [[rx0, ry0, z_front], [rx0, ry1, z_front], [rx0, ry1, z_rec], [rx0, ry0, z_rec]], 3.0);
+    quad(&mut verts, &mut indices, [[rx1, ry0, z_front], [rx1, ry1, z_front], [rx1, ry1, z_rec], [rx1, ry0, z_rec]], 3.0);
+    // recessed panels: grille (mat 4) on the left, control plate (mat 3) on the right,
+    // with a thin plastic divider between them.
+    let gx1 = rx0 + (rx1 - rx0) * 0.64; // grille / controls split
+    let div = 0.02;
+    quad(&mut verts, &mut indices, [[rx0, ry0, z_rec], [gx1, ry0, z_rec], [gx1, ry1, z_rec], [rx0, ry1, z_rec]], 4.0); // speaker grille
+    quad(&mut verts, &mut indices, [[gx1, ry0, z_rec], [gx1 + div, ry0, z_rec], [gx1 + div, ry1, z_rec], [gx1, ry1, z_rec], ], 3.0); // divider
+    quad(&mut verts, &mut indices, [[gx1 + div, ry0, z_rec], [rx1, ry0, z_rec], [rx1, ry1, z_rec], [gx1 + div, ry1, z_rec]], 3.0); // control plate
+    // two control knobs (short cylinders) on the control plate
+    let kc = 0.06;
+    for (i, &kx) in [gx1 + (rx1 - gx1) * 0.36, gx1 + (rx1 - gx1) * 0.70].iter().enumerate() {
+        let ky = ry0 + (ry1 - ry0) * 0.5;
+        let kn = 16usize;
+        let zk = z_rec + 0.035;
+        for k in 0..kn {
+            let k2 = (k + 1) % kn;
+            let a0 = std::f32::consts::TAU * k as f32 / kn as f32;
+            let a1 = std::f32::consts::TAU * k2 as f32 / kn as f32;
+            let p0 = [kx + kc * a0.cos(), ky + kc * a0.sin(), z_rec];
+            let p1 = [kx + kc * a1.cos(), ky + kc * a1.sin(), z_rec];
+            let q0 = [kx + kc * a0.cos(), ky + kc * a0.sin(), zk];
+            let q1 = [kx + kc * a1.cos(), ky + kc * a1.sin(), zk];
+            quad(&mut verts, &mut indices, [p0, p1, q1, q0], 3.0); // knob wall
+            quad(&mut verts, &mut indices, [q0, q1, [kx, ky, zk], [kx, ky, zk]], 3.0); // knob top
+        }
+        let _ = i;
+    }
+
+    // 6c. Side walls: extrude the front outer rectangle straight back to the main box.
+    quad(&mut verts, &mut indices, [[cab_l, cab_t, z_front], [cab_r, cab_t, z_front], [cab_r, cab_t, z_rear], [cab_l, cab_t, z_rear]], 3.0); // top
+    quad(&mut verts, &mut indices, [[cab_l, cab_b, z_front], [cab_r, cab_b, z_front], [cab_r, cab_b, z_rear], [cab_l, cab_b, z_rear]], 3.0); // bottom
+    quad(&mut verts, &mut indices, [[cab_l, cab_b, z_front], [cab_l, cab_t, z_front], [cab_l, cab_t, z_rear], [cab_l, cab_b, z_rear]], 3.0); // left
+    quad(&mut verts, &mut indices, [[cab_r, cab_b, z_front], [cab_r, cab_t, z_front], [cab_r, cab_t, z_rear], [cab_r, cab_b, z_rear]], 3.0); // right
+
+    // 6d. Rear hump: taper the box in toward the tube axis and cap it (with a neck
+    // hole). This is the classic bulging back of a CRT set enclosing the deflection bell.
+    let (rhw, rht, rhb) = (hw_cab * 0.60, cab_t * 0.60, cab_b * 0.60);
+    quad(&mut verts, &mut indices, [[cab_l, cab_t, z_rear], [cab_r, cab_t, z_rear], [rhw, rht, z_rear2], [-rhw, rht, z_rear2]], 3.0); // top taper
+    quad(&mut verts, &mut indices, [[cab_l, cab_b, z_rear], [cab_r, cab_b, z_rear], [rhw, rhb, z_rear2], [-rhw, rhb, z_rear2]], 3.0); // bottom taper
+    quad(&mut verts, &mut indices, [[cab_l, cab_b, z_rear], [cab_l, cab_t, z_rear], [-rhw, rht, z_rear2], [-rhw, rhb, z_rear2]], 3.0); // left taper
+    quad(&mut verts, &mut indices, [[cab_r, cab_b, z_rear], [cab_r, cab_t, z_rear], [rhw, rht, z_rear2], [rhw, rhb, z_rear2]], 3.0); // right taper
+    // rear face with a neck hole (ring of 4 strips around the hole)
+    let nh = NECK_R * 1.6;
+    quad(&mut verts, &mut indices, [[-rhw, rhb, z_rear2], [rhw, rhb, z_rear2], [nh, -nh, z_rear2], [-nh, -nh, z_rear2]], 3.0);
+    quad(&mut verts, &mut indices, [[-rhw, rht, z_rear2], [rhw, rht, z_rear2], [nh, nh, z_rear2], [-nh, nh, z_rear2]], 3.0);
+    quad(&mut verts, &mut indices, [[-rhw, rhb, z_rear2], [-rhw, rht, z_rear2], [-nh, nh, z_rear2], [-nh, -nh, z_rear2]], 3.0);
+    quad(&mut verts, &mut indices, [[rhw, rhb, z_rear2], [rhw, rht, z_rear2], [nh, nh, z_rear2], [nh, -nh, z_rear2]], 3.0);
 
     (verts, indices)
 }
@@ -356,6 +437,7 @@ struct Uniforms {
     cmat1: [f32; 4],  // row 1
     cmat2: [f32; 4],  // row 2
     pwr: [f32; 4],    // power state: warmup(0..1), collapse(0..1), degauss(0..1), _
+    focus: [f32; 4],  // x=edge defocus (deflection spot growth), y=overscan (per side), z/w _
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,14 +1367,19 @@ fn write_uniforms(
         look: [preset.convergence, preset.corner_radius, 0.015, 0.012],
         // CRT gamma (deepens blacks), per-tube warm/cool phosphor white point,
         // screen→tube glow bounce strength, and highlight bloom gain.
-        phys: [1.12, preset.warmth, 0.6, 0.5],
+        phys: [1.12, preset.warmth, 0.42, 0.5],
         // Phosphor persistence + interlace: dt drives per-frame decay; temporal.y is
         // the per-tube persistence multiplier; temporal.z = interlace amount, .w =
         // field parity (alternate fields excite alternate lines → 480i twitter).
         temporal: [dt.max(0.0), preset.persist, interlace, field],
-        // Per-phosphor decay constants (seconds). Real P22: the red phosphor lingers
-        // longest and blue snaps off fastest, so bright motion trails warm/reddish.
-        ptau: [0.042, 0.026, 0.017, 0.0],
+        // Per-phosphor decay constants (seconds). Grounded in measured P22 decay-to-10%
+        // times (ePanorama/labguysworld phosphor data): red Y2O2S:Eu lingers a few
+        // hundred µs to ~1 ms, while green ZnS:Cu and blue ZnS:Ag both snap off in
+        // <100 µs (green a hair slower than blue) — so red ≈ 5× the blue/green tail.
+        // The absolute scale is exaggerated ~50× so the trail is visible at 60 Hz on an
+        // LCD, but the R:G:B ratio (≈5 : 1.3 : 1) now matches the real phosphors: bright
+        // motion trails warm/reddish, blue/green edges stay crisp together.
+        ptau: [0.055, 0.014, 0.011, 0.0],
         // Raster deflection geometry errors, per tube (see Preset.geom).
         geom: preset.geom,
         // Monochrome phosphor tint + flag (single-gun green/amber terminals).
@@ -1303,6 +1390,31 @@ fn write_uniforms(
         cmat2: cmat[2],
         // Power-on warmup / power-off collapse / degauss animation state.
         pwr,
+        // Deflection defocus + overscan, derived from the tube's character (below).
+        focus: {
+            // Edge/corner defocus (physics: off-axis the beam path lengthens and the
+            // deflection field grows, so the spot widens astigmatically toward the
+            // edges — worst in the corners; US6329746/US6525459). Scale it off the
+            // tube's beam-focus quality (preset.beam[1] = bright-beam half-width): a
+            // razor PVM/Diamondtron (~0.55) barely blooms, a fuzzy RCA/arcade (~0.9–1.0)
+            // softens hard at the edges. Applies to every tube, mono included.
+            let defocus = ((preset.beam[1] - 0.55) * 1.15).clamp(0.0, 0.7);
+            // Overscan (per side): consumer sets deliberately draw the raster larger
+            // than the visible faceplate so the picture edges fall off (BBC-safe-area
+            // convention ~3.5–5%); PC monitors and mono terminals run essentially full
+            // raster. Composite RF consumer ~4.5%, S-video ~3.5%, component/RGB
+            // broadcast ~2%; phos 2 (PC sRGB) / 3 (mono terminal) → 0.
+            let overscan = if preset.phos >= 2 {
+                0.0
+            } else {
+                match preset.signal {
+                    2 => 0.045,
+                    1 => 0.035,
+                    _ => 0.02,
+                }
+            };
+            [defocus, overscan, 0.0, 0.0]
+        },
     };
     queue.write_buffer(&res.ubuf, 0, bytemuck::bytes_of(&uniforms));
 }
@@ -1488,7 +1600,10 @@ impl State {
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // 1 (not 2): the compositor holds one fewer in-flight frame, cutting ~16 ms
+            // of input→display latency so orbiting the tube tracks the cursor tighter.
+            // We're nowhere near GPU-bound, so the shorter queue doesn't cost throughput.
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &config);
 
@@ -1528,11 +1643,17 @@ impl State {
     // Upload the latest captured frame, if any, before drawing.
     fn poll_capture(&mut self) {
         let Some(shared) = &self.capture else { return };
-        let Ok(guard) = shared.lock() else { return };
-        let Some(frame) = guard.as_ref() else { return };
-        if frame.seq == self.last_seq {
-            return;
-        }
+        // Move the latest frame OUT of the shared slot under a brief lock, then drop the
+        // lock before the (comparatively slow) GPU upload + stats. The PipeWire capture
+        // thread only ever blocks on this lock for the duration of an Option::take, so
+        // our per-frame GPU work can't stall capture and cause frame-drop / micro-stutter.
+        let frame = {
+            let Ok(mut guard) = shared.lock() else { return };
+            match guard.as_ref() {
+                Some(f) if f.seq != self.last_seq => guard.take().unwrap(),
+                _ => return,
+            }
+        };
         let format = if frame.is_bgra {
             wgpu::TextureFormat::Bgra8UnormSrgb
         } else {
