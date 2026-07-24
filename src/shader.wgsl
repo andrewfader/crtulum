@@ -236,7 +236,11 @@ fn geometry_warp(uv: vec2<f32>) -> vec2<f32> {
 
 const PI: f32 = 3.14159265;
 const TAU: f32 = 6.28318530;
-const NTSC_FSC: f32 = 0.25; // colour-subcarrier cycles per source texel (~4 texels/cycle)
+// Colour-subcarrier cycles per *content* pixel (on a virtual ~320-wide line — see the
+// `step` remap in ntsc()/svideo(), not per captured texel). 0.25 = 4 samples/cycle, which
+// gives clean quadrature I/Q recovery (cos:1,0,-1,0 / sin:0,1,0,-1 at integer pixels);
+// values near the pixel-Nyquist collapse the sin() channel and rotate hues, so keep it.
+const NTSC_FSC: f32 = 0.25;
 
 fn rgb2yiq(c: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(
@@ -259,27 +263,39 @@ fn subcarrier(px: f32, line: f32, t: f32) -> f32 {
     return TAU * NTSC_FSC * px + PI * line + t * 6.0;
 }
 
-// Encode RGB→composite along the scanline, then decode: band-limited luma low-pass +
-// quadrature chroma demod. Imperfect luma/subcarrier separation → dot crawl; luma
+// Encode RGB→composite along the scanline, then decode. Band-limited luma low-pass +
+// quadrature chroma demod: imperfect luma/subcarrier separation → dot crawl; luma
 // energy near the subcarrier leaking into chroma → cross-colour rainbow; the narrow
 // chroma passband → horizontal colour bleed. This is the analog-signal look.
+//
+// `step` remaps the whole decode onto a virtual ~320-wide content line, so the bandwidths
+// and subcarrier are fixed in cycles-per-*line* — they track the source pixel grid no
+// matter how upscaled the captured frame is. This is what makes Mega Drive / Sonic dither
+// read like a real console: the checkerboard sits at the content pixel-Nyquist and the
+// luma low-pass averages it into a flat translucent tone. Without the remap, an integer-
+// scaled capture (e.g. 1280-wide RetroArch) makes each content pixel several texels, the
+// fixed-texel low-pass can't reach across the checkerboard, and the dither survives as a
+// raw grid. At native capture step→1 and this is identical to the original decode.
 fn ntsc(uv: vec2<f32>, res: vec2<f32>, t: f32) -> vec3<f32> {
-    let px = uv.x * res.x;
+    let step = max(res.x / 320.0, 1.0); // texels per virtual-320 content pixel (1 at native capture)
+    let cx = uv.x * (res.x / step);     // column on the virtual content line
     let line = floor(uv.y * res.y);
     var y_acc = 0.0;
     var i_acc = 0.0;
     var q_acc = 0.0;
     var yw = 0.0;
     var cw = 0.0;
-    for (var k = -8; k <= 8; k = k + 1) {
-        let sx = px + f32(k);
-        let src = textureSampleLevel(t_screen, s_screen, vec2<f32>(sx / res.x, uv.y), 0.0).rgb;
+    // ±10 content pixels: wide enough to span the chroma kernel at native and, via `step`,
+    // at any upscale factor for constant cost.
+    for (var k = -10; k <= 10; k = k + 1) {
+        let scx = cx + f32(k);
+        let src = textureSampleLevel(t_screen, s_screen, vec2<f32>(scx * step / res.x, uv.y), 0.0).rgb;
         let yiq = rgb2yiq(src);
-        let ph = subcarrier(sx, line, t);
+        let ph = subcarrier(scx, line, t);
         let comp = yiq.x + yiq.y * cos(ph) + yiq.z * sin(ph); // composite sample
         let kk = f32(k * k);
-        // Grounded NTSC bandwidths: luma ~4.2 MHz (fairly sharp), chroma I/Q ~1.3/0.4
-        // MHz (≈1/3 of luma → ~3x wider kernel → the horizontal colour bleed).
+        // Grounded NTSC bandwidths in content-pixel units: luma ~4.2 MHz (fairly sharp),
+        // chroma I/Q ~1.3/0.4 MHz (≈1/3 of luma → ~3x wider kernel → horizontal bleed).
         let lw = exp(-kk / (2.0 * 1.3 * 1.3)); // luma low-pass (leaves some subcarrier)
         let bw = exp(-kk / (2.0 * 3.4 * 3.4)); // chroma band (narrow → bleed)
         y_acc = y_acc + comp * lw;
@@ -296,15 +312,16 @@ fn ntsc(uv: vec2<f32>, res: vec2<f32>, t: f32) -> vec3<f32> {
 // separation — no dot crawl, no cross-colour rainbow — but chroma is still
 // band-limited (the horizontal colour bleed remains). Sharp luma, soft colour.
 fn svideo(uv: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
-    let px = uv.x * res.x;
+    let step = max(res.x / 320.0, 1.0); // same content-line remap as ntsc(): bleed tracks the source grid
+    let cx = uv.x * (res.x / step);
     var y = 0.0;
     var yw = 0.0;
     var i = 0.0;
     var q = 0.0;
     var cw = 0.0;
-    for (var k = -6; k <= 6; k = k + 1) {
-        let sx = px + f32(k);
-        let yiq = rgb2yiq(textureSampleLevel(t_screen, s_screen, vec2<f32>(sx / res.x, uv.y), 0.0).rgb);
+    for (var k = -8; k <= 8; k = k + 1) {
+        let scx = cx + f32(k);
+        let yiq = rgb2yiq(textureSampleLevel(t_screen, s_screen, vec2<f32>(scx * step / res.x, uv.y), 0.0).rgb);
         let kk = f32(k * k);
         let lw = exp(-kk / (2.0 * 0.9 * 0.9)); // sharp luma (no subcarrier to reject)
         let bw = exp(-kk / (2.0 * 3.4 * 3.4)); // chroma bandwidth → colour bleed
