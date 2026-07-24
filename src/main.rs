@@ -3,6 +3,8 @@
 //   cargo run              : test-pattern source
 //   cargo run -- --capture : live source via the ScreenCast portal + PipeWire (M2)
 //   cargo run -- --shot out.png 1000x800 : headless PNG render
+//   cargo run -- --clip frames/ out/ 800x600 : run a frame sequence through the
+//                                              tube (phosphor melts across fields)
 //
 // Controls: left-drag orbit · scroll zoom · Esc quit
 
@@ -2065,6 +2067,186 @@ fn save_shot(path: &str, width: u32, height: u32, preset: Preset) {
 }
 
 // ---------------------------------------------------------------------------
+// Headless clip: run a real frame sequence through the tube (`--clip in/ out/`)
+// ---------------------------------------------------------------------------
+//
+// Unlike `--shot`, which warms the phosphor with one still, this feeds a whole
+// sequence of source frames through the SAME `Resources` (so the phosphor
+// history planes carry over field-to-field) and writes one rendered PNG per
+// input frame. That's the honest test that motion actually melts: fast water
+// from a real clip drags a fading persistence trail, because the tube is
+// genuinely remembering the last few fields — not a per-still fake.
+//
+//   crtulum --clip frames/ out/ [WxH] [--preset green]
+//   ffmpeg -framerate 30 -i out/f_%04d.png crt.mp4   # reassemble
+//
+// Env knobs: CRTULUM_DT (per-field decay dt, default 1/60 — smaller = longer
+// melt), CRTULUM_YAW/_PITCH/_DIST (camera, same as --shot).
+fn save_clip(in_dir: &str, out_dir: &str, width: u32, height: u32, preset: Preset) {
+    const SS: u32 = 3;
+    let rw = width * SS;
+    let rh = height * SS;
+
+    // Collect + sort the input PNGs so the timeline is in order.
+    let mut frames: Vec<std::path::PathBuf> = std::fs::read_dir(in_dir)
+        .unwrap_or_else(|e| panic!("cannot read --clip input dir {in_dir}: {e}"))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("png"))
+        .collect();
+    frames.sort();
+    assert!(!frames.is_empty(), "no .png frames found in {in_dir}");
+    std::fs::create_dir_all(out_dir).expect("create --clip output dir");
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..Default::default()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .expect("no GPU adapter");
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("clip-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+        },
+        None,
+    ))
+    .expect("device");
+
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut res = build_resources(&device, &queue, format, preset);
+
+    let color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("clip-color"),
+        size: wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth_view = create_depth(&device, rw, rh);
+
+    let envf = |k: &str, d: f32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let orbit = Orbit {
+        yaw: envf("CRTULUM_YAW", 0.82),
+        pitch: envf("CRTULUM_PITCH", 0.34),
+        distance: envf("CRTULUM_DIST", 3.7),
+    };
+    // Per-field decay step. Default 1/60: the phosphor decay constants are tuned
+    // for 60 Hz fields, so this keeps the melt looking period-correct even when the
+    // source cadence is lower. Shrink it (CRTULUM_DT=0.008) for a longer smear.
+    let dt = envf("CRTULUM_DT", 1.0 / 60.0);
+    let exposure = envf("CRTULUM_EXPOSURE", 1.0);
+    let pwr = [1.0, 0.0, 0.0, 0.0]; // fully warmed up for the whole clip
+
+    // padded copy: bytes_per_row must be a multiple of 256
+    let unpadded = rw * 4;
+    let padded = ((unpadded + 255) / 256) * 256;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("clip-readback"),
+        size: (padded * rh) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let srgb_to_lin = |c: u8| {
+        let s = c as f32 / 255.0;
+        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    };
+    let lin_to_srgb = |l: f32| {
+        let s = if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
+        (s.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+    };
+    let inv = 1.0 / (SS * SS) as f32;
+
+    let total = frames.len();
+    let mut t = 0.0f32; // beam-scan clock, advanced one field per source frame
+    let mut field = 0.0f32;
+    for (i, frame_path) in frames.iter().enumerate() {
+        // Load the source frame (RGBA8, linear-sRGB texture).
+        let img = image::open(frame_path)
+            .unwrap_or_else(|e| panic!("open {}: {e}", frame_path.display()))
+            .to_rgba8();
+        let (sw, sh) = img.dimensions();
+        res.set_source(&device, &queue, sw, sh, wgpu::TextureFormat::Rgba8UnormSrgb, &img);
+
+        // One field per new source frame: the phosphor plane retains the last few
+        // fields, so moving water leaves a decaying trail across output frames.
+        write_uniforms(
+            &queue, &res, &orbit, width as f32 / height as f32, t, &preset, SS as f32,
+            false, dt, pwr, 0.0, field, exposure, false, 1.0,
+        );
+        let mut enc = device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("clip-accum") });
+        accum_step(&mut enc, &mut res);
+        draw_tube(&mut enc, &res, &color_view, &depth_view);
+        enc.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &color,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(rh),
+                },
+            },
+            wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
+        );
+        queue.submit(std::iter::once(enc.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+        device.poll(wgpu::Maintain::Wait);
+        {
+            let data = slice.get_mapped_range();
+            let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+            for oy in 0..height {
+                for ox in 0..width {
+                    let mut acc = [0.0f32; 4];
+                    for sy in 0..SS {
+                        let row = ((oy * SS + sy) * padded) as usize;
+                        for sx in 0..SS {
+                            let p = row + ((ox * SS + sx) * 4) as usize;
+                            acc[0] += srgb_to_lin(data[p]);
+                            acc[1] += srgb_to_lin(data[p + 1]);
+                            acc[2] += srgb_to_lin(data[p + 2]);
+                            acc[3] += data[p + 3] as f32 / 255.0;
+                        }
+                    }
+                    pixels.push(lin_to_srgb(acc[0] * inv));
+                    pixels.push(lin_to_srgb(acc[1] * inv));
+                    pixels.push(lin_to_srgb(acc[2] * inv));
+                    pixels.push((acc[3] * inv * 255.0 + 0.5) as u8);
+                }
+            }
+            let img = image::RgbaImage::from_raw(width, height, pixels).expect("image");
+            let out = std::path::Path::new(out_dir).join(format!("f_{:04}.png", i + 1));
+            img.save(&out).expect("save png");
+        }
+        readback.unmap();
+
+        t += 1.0 / 60.0;
+        field = 1.0 - field; // alternate parity, same as the live loop
+        if i % 15 == 0 || i + 1 == total {
+            println!("clip {}/{}", i + 1, total);
+        }
+    }
+    println!("wrote {total} frames to {out_dir}/ ({width}x{height})");
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -2091,6 +2273,20 @@ fn main() {
             .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
             .unwrap_or((1000, 800));
         save_shot(path, w, h, preset);
+        return;
+    }
+
+    // Headless clip mode: `crtulum --clip in_frames/ out_frames/ [WxH]`.
+    // Feeds a real frame sequence through the tube so motion melts for real.
+    if let Some(i) = args.iter().position(|a| a == "--clip") {
+        let in_dir = args.get(i + 1).map(String::as_str).unwrap_or("frames");
+        let out_dir = args.get(i + 2).map(String::as_str).unwrap_or("out");
+        let (w, h) = args
+            .get(i + 3)
+            .and_then(|s| s.split_once('x'))
+            .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+            .unwrap_or((1000, 800));
+        save_clip(in_dir, out_dir, w, h, preset);
         return;
     }
 
@@ -2221,4 +2417,205 @@ fn main() {
             }
         })
         .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Headless device, or None on a machine with no usable GPU adapter (CI
+    // software-render runners): the caller skips rather than fails.
+    fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY | wgpu::Backends::SECONDARY,
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))?;
+        pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("test-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+            },
+            None,
+        ))
+        .ok()
+    }
+
+    // Feed a sequence of source frames through the tube (phosphor history carried
+    // across fields, exactly like `--clip`) and read back the final tube render as
+    // RGBA8 at native resolution. `frames` are RGBA8 buffers of size sw*sh.
+    fn render_sequence(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frames: &[Vec<u8>],
+        sw: u32,
+        sh: u32,
+        ow: u32,
+        oh: u32,
+        dt: f32,
+    ) -> Vec<u8> {
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut res = build_resources(device, queue, format, TRINITRON);
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test-color"),
+            size: wgpu::Extent3d { width: ow, height: oh, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_view = create_depth(device, ow, oh);
+        let orbit = Orbit { yaw: 0.82, pitch: 0.34, distance: 3.7 };
+        let pwr = [1.0, 0.0, 0.0, 0.0];
+
+        // One field per source frame — the phosphor plane retains the last few, so
+        // moving content trails.
+        let mut t = 0.0f32;
+        let mut field = 0.0f32;
+        for frame in frames {
+            res.set_source(device, queue, sw, sh, format, frame);
+            write_uniforms(
+                queue, &res, &orbit, ow as f32 / oh as f32, t, &TRINITRON, 1.0, false, dt, pwr,
+                0.0, field, 1.0, false, 1.0,
+            );
+            let mut enc = device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test-accum") });
+            accum_step(&mut enc, &mut res);
+            queue.submit(std::iter::once(enc.finish()));
+            device.poll(wgpu::Maintain::Wait);
+            t += 1.0 / 60.0;
+            field = 1.0 - field;
+        }
+
+        // Draw the final field and read it back (padded rows → 256 multiple).
+        let unpadded = ow * 4;
+        let padded = ((unpadded + 255) / 256) * 256;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test-readback"),
+            size: (padded * oh) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test-draw") });
+        draw_tube(&mut enc, &res, &color_view, &depth_view);
+        enc.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &color,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(oh),
+                },
+            },
+            wgpu::Extent3d { width: ow, height: oh, depth_or_array_layers: 1 },
+        );
+        queue.submit(std::iter::once(enc.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+        device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+        let mut px = Vec::with_capacity((ow * oh * 4) as usize);
+        for row in 0..oh {
+            let start = (row * padded) as usize;
+            px.extend_from_slice(&data[start..start + unpadded as usize]);
+        }
+        px
+    }
+
+    // A bright horizontal band on a dark field, at vertical position `y0`.
+    fn band(sw: u32, sh: u32, y0: i32) -> Vec<u8> {
+        let mut buf = vec![0u8; (sw * sh * 4) as usize];
+        for y in 0..sh {
+            let on = (y as i32 - y0).abs() < 7;
+            for x in 0..sw {
+                let idx = ((y * sw + x) * 4) as usize;
+                let v = if on { 235 } else { 6 };
+                buf[idx] = v;
+                buf[idx + 1] = v;
+                buf[idx + 2] = v;
+                buf[idx + 3] = 255;
+            }
+        }
+        buf
+    }
+
+    /// The waterfall melts: fast-moving bright content leaves a *decaying phosphor
+    /// trail* on the tube, and that trail is red-dominant — because red P22
+    /// phosphor lingers ~5× longer than green/blue (see the decay constants in
+    /// `write_uniforms`). We prove it by rendering the same final field two ways:
+    /// once fed as a moving band (real motion history) and once fed as a still at
+    /// the final position (phosphor converged, no history). The difference is the
+    /// melt, and it must lead in red.
+    #[test]
+    fn waterfall_melts() {
+        let Some((device, queue)) = headless_device() else {
+            // CI sets CRTULUM_REQUIRE_GPU (it ships a software Vulkan driver), so a
+            // missing adapter there is a real failure — not a silent skip that would
+            // let the melt regression slip through green.
+            if std::env::var_os("CRTULUM_REQUIRE_GPU").is_some() {
+                panic!("CRTULUM_REQUIRE_GPU set but no GPU adapter — the melt test could not run");
+            }
+            eprintln!("waterfall_melts: no GPU adapter — skipping");
+            return;
+        };
+
+        let (sw, sh) = (240u32, 180u32);
+        let (ow, oh) = (400u32, 320u32);
+        let dt = 1.0 / 60.0;
+        let n = 20;
+        let y_end = (sh as i32) - 30; // final band position (near the bottom)
+
+        // Motion: band scrolls top → bottom, ending at y_end.
+        let motion: Vec<Vec<u8>> = (0..n)
+            .map(|i| {
+                let y = 20 + (y_end - 20) * i / (n - 1);
+                band(sw, sh, y)
+            })
+            .collect();
+        // Static: the final position, held — phosphor converges, no trail.
+        let still: Vec<Vec<u8>> = (0..n).map(|_| band(sw, sh, y_end)).collect();
+
+        let m = render_sequence(&device, &queue, &motion, sw, sh, ow, oh, dt);
+        let s = render_sequence(&device, &queue, &still, sw, sh, ow, oh, dt);
+
+        // Per-channel mean absolute difference (the trail lives in the delta).
+        let (mut dr, mut dg, mut db) = (0.0f64, 0.0f64, 0.0f64);
+        let px = (ow * oh) as usize;
+        for i in 0..px {
+            dr += (m[i * 4] as f64 - s[i * 4] as f64).abs();
+            dg += (m[i * 4 + 1] as f64 - s[i * 4 + 1] as f64).abs();
+            db += (m[i * 4 + 2] as f64 - s[i * 4 + 2] as f64).abs();
+        }
+        dr /= px as f64;
+        dg /= px as f64;
+        db /= px as f64;
+        eprintln!("melt trail mean|Δ| per channel — R:{dr:.3} G:{dg:.3} B:{db:.3}");
+
+        // A trail exists at all (motion differs from the converged still).
+        assert!(dr > 0.05, "no persistence trail: moving content did not melt (ΔR={dr:.3})");
+        // And it's the red-lingering phosphor signature, not a symmetric spatial
+        // blur: red must clearly lead green and blue.
+        assert!(dr > 1.2 * dg, "trail not red-dominant (R={dr:.3} vs G={dg:.3})");
+        assert!(dr > 1.2 * db, "trail not red-dominant (R={dr:.3} vs B={db:.3})");
+    }
 }

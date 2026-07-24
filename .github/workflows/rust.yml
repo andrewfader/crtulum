@@ -16,7 +16,32 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Install system dependencies
+      # pipewire-sys probes libpipewire via pkg-config and generates bindings
+      # with bindgen (needs libclang); ashpd/winit pull in dbus/wayland at build.
+      # mesa-vulkan-drivers ships lavapipe, a software Vulkan device so the
+      # headless GPU test (waterfall_melts) can actually run on the runner.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          pkg-config \
+          clang \
+          libclang-dev \
+          libpipewire-0.3-dev \
+          libdbus-1-dev \
+          libwayland-dev \
+          mesa-vulkan-drivers \
+          libvulkan1 \
+          vulkan-tools
+    - name: Show Vulkan device
+      run: vulkaninfo --summary | grep -iE "deviceName|driverName" || true
     - name: Build
       run: cargo build --verbose
     - name: Run tests
+      # CRTULUM_REQUIRE_GPU makes the melt test fail (not skip) if no adapter is
+      # found — proving CI genuinely exercised the phosphor-persistence path.
+      # Force lavapipe so we don't depend on any runner GPU being present.
+      env:
+        CRTULUM_REQUIRE_GPU: "1"
+        VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
       run: cargo test --verbose
