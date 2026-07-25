@@ -469,18 +469,43 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             base = vec3<f32>(0.42, 0.26, 0.15);    // deflection yoke: dull copper
             rough = 0.55;
             metal = 1.0;
-        } else if (in.material < 3.5) {
-            base = vec3<f32>(0.030, 0.027, 0.024); // warm charcoal molded TV plastic (Trinitron)
+        } else if (in.material > 3.5 && in.material < 4.5) {
+            // Speaker grille (material 4): near-black woven cloth — matte, light-drinking,
+            // with a fine weave mottle. Low, broken specular (fabric, not plastic).
+            let weave = hash21(floor(in.world_pos.xy * 90.0)) * hash21(floor(in.world_pos.yx * 80.0));
+            base = vec3<f32>(0.010, 0.010, 0.012) * (0.55 + 0.7 * weave);
+            rough = 0.93;
+            metal = 0.0;
+        } else {
+            // Molded cabinet plastic. The base tone + finish are per-brand (the vertex
+            // material id selects the family): 3 = Sony charcoal, 5 = RCA warm walnut-
+            // brown, 6 = Panasonic cool silver-grey, 7 = beige computer-terminal case.
+            metal = 0.0;
+            var pbase: vec3<f32>;
+            var prough_lo = 0.46;
+            var prough_hi = 0.82;
+            if (in.material < 3.5) {
+                pbase = vec3<f32>(0.030, 0.027, 0.024); // charcoal (Trinitron / PVM / arcade)
+            } else if (in.material < 5.5) {
+                pbase = vec3<f32>(0.055, 0.032, 0.020); // warm dark walnut-brown (RCA console)
+            } else if (in.material < 6.5) {
+                pbase = vec3<f32>(0.145, 0.150, 0.160); // cool silver-grey (Panasonic / PC)
+                prough_lo = 0.34; prough_hi = 0.66;     // a touch glossier than TV charcoal
+                metal = 0.25;                           // faint metallic-silver sheen
+            } else {
+                pbase = vec3<f32>(0.235, 0.210, 0.165); // warm beige (terminal case)
+                prough_lo = 0.55; prough_hi = 0.88;     // chalky matte
+            }
+            base = pbase;
             // Injection-molded pebble finish: mottle the albedo, perturb roughness and
             // the normal so the specular breaks into a fine matte sparkle, not a mirror.
             let tx = hash21(floor(in.world_pos.xy * 140.0)) + hash21(floor(in.world_pos.yz * 130.0));
-            rough = clamp(0.62 + (tx - 1.0) * 0.12, 0.46, 0.82); // matte molded plastic
+            rough = clamp(0.62 + (tx - 1.0) * 0.12, prough_lo, prough_hi); // matte molded plastic
             base = base * (0.78 + 0.40 * hash21(floor(in.world_pos.xy * 70.0))); // stronger mottle
             let jit = vec3<f32>(hash21(in.world_pos.xy * 95.0) - 0.5,
                                 hash21(in.world_pos.yz * 95.0) - 0.5,
                                 (hash21(in.world_pos.zx * 95.0) - 0.5) * 0.4) * 0.05;
             nn = normalize(nn + jit);
-            metal = 0.0;
             // Ventilation slots: real sets vent heat through fine louvres across the TOP
             // toward the rear. Thin dark grooves (darker albedo + a normal tilt so they
             // self-shade) where the face points up and we're behind the front box.
@@ -496,13 +521,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 let s = abs(in.world_pos.z + 0.5);
                 base = base * mix(0.5, 1.0, smoothstep(0.0, 0.014, s));
             }
-        } else {
-            // Speaker grille (material 4): near-black woven cloth — matte, light-drinking,
-            // with a fine weave mottle. Low, broken specular (fabric, not plastic).
-            let weave = hash21(floor(in.world_pos.xy * 90.0)) * hash21(floor(in.world_pos.yx * 80.0));
-            base = vec3<f32>(0.010, 0.010, 0.012) * (0.55 + 0.7 * weave);
-            rough = 0.93;
-            metal = 0.0;
         }
 
         var col = shade_body(base, rough, metal, nn, v);

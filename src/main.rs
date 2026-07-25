@@ -144,7 +144,7 @@ fn ring_strip(verts: &mut Vec<Vertex>, indices: &mut Vec<u32>, a: &[[f32; 3]], b
     }
 }
 
-fn build_mesh(bulge: f32, cx: f32, cy: f32) -> (Vec<Vertex>, Vec<u32>) {
+fn build_mesh(bulge: f32, cx: f32, cy: f32, cab: Cabinet) -> (Vec<Vertex>, Vec<u32>) {
     let mut verts = Vec::new();
     let mut indices = Vec::new();
     let z = |x: f32, y: f32| screen_z(x, y, bulge, cx, cy);
@@ -250,120 +250,165 @@ fn build_mesh(bulge: f32, cx: f32, cy: f32) -> (Vec<Vertex>, Vec<u32>) {
             [ring_at(NECK_R, zy0, k), ring_at(NECK_R, zy0, k2), ring_at(yr, zy0, k2), ring_at(yr, zy0, k)], 2.0);
     }
 
-    // --- 6. TV cabinet (material 3 = charcoal plastic, material 4 = speaker cloth) ---
-    // A deep, near-cubic consumer set grounded in the Sony Trinitron KV-20TS
-    // proportions (513 × 487 × 481 mm — a real CRT TV is almost as DEEP as it is wide,
-    // NOT a thin picture frame): the 4:3 screen recessed in the upper-centre, a speaker
-    // grille + control cluster across the tall chin below, a side/top bezel, then a
-    // tapered rear hump that encloses the glass funnel and electron-gun neck.
-    let sb = 0.150; // side bezel
-    let tb = 0.130; // top bezel
-    let bc = 0.450; // bottom chin (speakers + controls) — the tall part below the tube
-    let hw_cab = HALF_W + sb; // outer half-width  ≈ 0.817
-    let cab_t = HALF_H + tb; //  top edge          ≈ 0.630
-    let cab_b = -(HALF_H + bc); // bottom edge     ≈ -0.950  (cabinet ratio ≈ 1.04:1, real 1.05:1)
+    // --- 6. TV cabinet (material 3/5/6/7 = molded plastic, material 4 = speaker cloth) ---
+    // The silhouette + finish are per-brand (see `Cabinet`), but every set shares the
+    // same skeleton: the 4:3 screen recessed in the upper-centre, a top/side bezel, a
+    // chin below the tube (speaker grille + controls on a consumer set; a thin uniform
+    // strip on a pro monitor / PC display), and a tapered rear hump enclosing the funnel.
+    // Proportions default to the deep, near-cubic Sony Trinitron KV-20TS (513 × 487 ×
+    // 481 mm — a real CRT TV is almost as DEEP as it is wide, NOT a thin picture frame).
+    let pl = cab.plastic; // body plastic material id
+    let sb = cab.side_bezel;
+    let tb = cab.top_bezel;
+    let bc = cab.chin;
+    let hw_cab = HALF_W + sb; //   outer half-width
+    let cab_t = HALF_H + tb; //    top edge
+    let cab_b = -(HALF_H + bc); // bottom edge
     let (cab_l, cab_r) = (-hw_cab, hw_cab);
     let (ox, oy) = (HALF_W * 1.018, HALF_H * 1.024); // screen opening (a touch over the glass)
     let z_front = bulge * 0.6 + 0.05; // front face plane, just behind the glass apex
-    let z_rear = -1.46; //  main box back (depth ≈ width → the real near-cube)
-    let z_rear2 = -1.94; // rear hump back (encloses the funnel/neck)
+    let z_rear = cab.rear_z; //   main box back (depth ≈ width → the real near-cube)
+    let z_rear2 = z_rear - 0.48; // rear hump back (encloses the funnel/neck)
     // Edge chamfer: real injection-molded cabinets are never razor-edged — every outer
     // edge has a few-mm bevel that catches a bright highlight line. The front face is
     // inset by `cf`, then a 45° bevel (+ mitred corner facets) runs out to the full
     // cabinet extent where the side walls begin (at z = zc).
-    let cf = 0.05;
+    let cf = cab.corner;
     let (fl, fr, fb, ft) = (cab_l + cf, cab_r - cf, cab_b + cf, cab_t - cf);
     let zc = z_front - cf;
     let quad = |v: &mut Vec<Vertex>, ix: &mut Vec<u32>, p: [[f32; 3]; 4], m: f32| push_quad(v, ix, p, m);
+    // A rectangular panel recessed back from `zf` to `zr`: four plastic side walls + a
+    // back face of material `mat` (mat 4 = speaker cloth, `pl` = a plain plastic recess).
+    let recess_panel = |v: &mut Vec<Vertex>, ix: &mut Vec<u32>,
+                        x0: f32, x1: f32, y0: f32, y1: f32, zf: f32, zr: f32, mat: f32| {
+        quad(v, ix, [[x0, y0, zf], [x1, y0, zf], [x1, y0, zr], [x0, y0, zr]], pl); // bottom wall
+        quad(v, ix, [[x0, y1, zf], [x1, y1, zf], [x1, y1, zr], [x0, y1, zr]], pl); // top wall
+        quad(v, ix, [[x0, y0, zf], [x0, y1, zf], [x0, y1, zr], [x0, y0, zr]], pl); // left wall
+        quad(v, ix, [[x1, y0, zf], [x1, y1, zf], [x1, y1, zr], [x1, y0, zr]], pl); // right wall
+        quad(v, ix, [[x0, y0, zr], [x1, y0, zr], [x1, y1, zr], [x0, y1, zr]], mat); // back panel
+    };
+    // A short control knob (cylinder) protruding forward from `base_z` at (kx, ky).
+    let knob = |v: &mut Vec<Vertex>, ix: &mut Vec<u32>, kx: f32, ky: f32, base_z: f32, kc: f32| {
+        let kn = 16usize;
+        let zk = base_z + 0.035;
+        for k in 0..kn {
+            let a0 = std::f32::consts::TAU * k as f32 / kn as f32;
+            let a1 = std::f32::consts::TAU * (k + 1) as f32 / kn as f32;
+            let p0 = [kx + kc * a0.cos(), ky + kc * a0.sin(), base_z];
+            let p1 = [kx + kc * a1.cos(), ky + kc * a1.sin(), base_z];
+            let q0 = [kx + kc * a0.cos(), ky + kc * a0.sin(), zk];
+            let q1 = [kx + kc * a1.cos(), ky + kc * a1.sin(), zk];
+            quad(v, ix, [p0, p1, q1, q0], pl); // knob wall
+            quad(v, ix, [q0, q1, [kx, ky, zk], [kx, ky, zk]], pl); // knob top
+        }
+    };
 
-    // 6a. Front bezel around the screen opening: top strip, two side strips (to the
-    // chamfered front-face extents fl/fr/ft, not the full cabinet edge).
+    // 6a. Top bezel strip (always present, above the tube).
     quad(&mut verts, &mut indices,
-        [[fl, oy, z_front], [fr, oy, z_front], [fr, ft, z_front], [fl, ft, z_front]], 3.0); // top
-    quad(&mut verts, &mut indices,
-        [[fl, -oy, z_front], [-ox, -oy, z_front], [-ox, oy, z_front], [fl, oy, z_front]], 3.0); // left
-    quad(&mut verts, &mut indices,
-        [[ox, -oy, z_front], [fr, -oy, z_front], [fr, oy, z_front], [ox, oy, z_front]], 3.0); // right
+        [[fl, oy, z_front], [fr, oy, z_front], [fr, ft, z_front], [fl, ft, z_front]], pl);
     // inner lip: recess the opening edge back to the glass block so the tube sits inset.
     let zl = -GLASS_T - 0.02;
-    quad(&mut verts, &mut indices, [[-ox, oy, z_front], [ox, oy, z_front], [ox, oy, zl], [-ox, oy, zl]], 3.0);
-    quad(&mut verts, &mut indices, [[-ox, -oy, z_front], [ox, -oy, z_front], [ox, -oy, zl], [-ox, -oy, zl]], 3.0);
-    quad(&mut verts, &mut indices, [[-ox, -oy, z_front], [-ox, oy, z_front], [-ox, oy, zl], [-ox, -oy, zl]], 3.0);
-    quad(&mut verts, &mut indices, [[ox, -oy, z_front], [ox, oy, z_front], [ox, oy, zl], [ox, -oy, zl]], 3.0);
+    quad(&mut verts, &mut indices, [[-ox, oy, z_front], [ox, oy, z_front], [ox, oy, zl], [-ox, oy, zl]], pl);
+    quad(&mut verts, &mut indices, [[-ox, -oy, z_front], [ox, -oy, z_front], [ox, -oy, zl], [-ox, -oy, zl]], pl);
+    quad(&mut verts, &mut indices, [[-ox, -oy, z_front], [-ox, oy, z_front], [-ox, oy, zl], [-ox, -oy, zl]], pl);
+    quad(&mut verts, &mut indices, [[ox, -oy, z_front], [ox, oy, z_front], [ox, oy, zl], [ox, -oy, zl]], pl);
 
     // 6a-bevel. 45° chamfer ring: the front face plane (z_front) out to the full cabinet
     // rectangle (zc), with four edge bevels + four mitred corner facets.
-    quad(&mut verts, &mut indices, [[fl, ft, z_front], [fr, ft, z_front], [fr, cab_t, zc], [fl, cab_t, zc]], 3.0); // top
-    quad(&mut verts, &mut indices, [[fl, fb, z_front], [fr, fb, z_front], [fr, cab_b, zc], [fl, cab_b, zc]], 3.0); // bottom
-    quad(&mut verts, &mut indices, [[fl, fb, z_front], [fl, ft, z_front], [cab_l, ft, zc], [cab_l, fb, zc]], 3.0); // left
-    quad(&mut verts, &mut indices, [[fr, fb, z_front], [fr, ft, z_front], [cab_r, ft, zc], [cab_r, fb, zc]], 3.0); // right
-    quad(&mut verts, &mut indices, [[fr, ft, z_front], [fr, cab_t, zc], [cab_r, cab_t, zc], [cab_r, ft, zc]], 3.0); // TR corner
-    quad(&mut verts, &mut indices, [[fl, ft, z_front], [fl, cab_t, zc], [cab_l, cab_t, zc], [cab_l, ft, zc]], 3.0); // TL corner
-    quad(&mut verts, &mut indices, [[fr, fb, z_front], [fr, cab_b, zc], [cab_r, cab_b, zc], [cab_r, fb, zc]], 3.0); // BR corner
-    quad(&mut verts, &mut indices, [[fl, fb, z_front], [fl, cab_b, zc], [cab_l, cab_b, zc], [cab_l, fb, zc]], 3.0); // BL corner
+    quad(&mut verts, &mut indices, [[fl, ft, z_front], [fr, ft, z_front], [fr, cab_t, zc], [fl, cab_t, zc]], pl); // top
+    quad(&mut verts, &mut indices, [[fl, fb, z_front], [fr, fb, z_front], [fr, cab_b, zc], [fl, cab_b, zc]], pl); // bottom
+    quad(&mut verts, &mut indices, [[fl, fb, z_front], [fl, ft, z_front], [cab_l, ft, zc], [cab_l, fb, zc]], pl); // left
+    quad(&mut verts, &mut indices, [[fr, fb, z_front], [fr, ft, z_front], [cab_r, ft, zc], [cab_r, fb, zc]], pl); // right
+    quad(&mut verts, &mut indices, [[fr, ft, z_front], [fr, cab_t, zc], [cab_r, cab_t, zc], [cab_r, ft, zc]], pl); // TR corner
+    quad(&mut verts, &mut indices, [[fl, ft, z_front], [fl, cab_t, zc], [cab_l, cab_t, zc], [cab_l, ft, zc]], pl); // TL corner
+    quad(&mut verts, &mut indices, [[fr, fb, z_front], [fr, cab_b, zc], [cab_r, cab_b, zc], [cab_r, fb, zc]], pl); // BR corner
+    quad(&mut verts, &mut indices, [[fl, fb, z_front], [fl, cab_b, zc], [cab_l, cab_b, zc], [cab_l, fb, zc]], pl); // BL corner
 
-    // 6b. Chin: a plastic frame around a recessed panel that carries the speaker
-    // grille (left ~66%) and the control cluster (right ~34%).
     let chin_top = -oy;
-    let (rx0, rx1) = (fl + 0.05, fr - 0.05); // recess extents
-    let (ry0, ry1) = (fb + 0.075, chin_top - 0.06);
-    let z_rec = z_front - 0.05; // recess depth
-    // chin frame strips (plastic, at z_front)
-    quad(&mut verts, &mut indices, [[fl, fb, z_front], [fr, fb, z_front], [fr, ry0, z_front], [fl, ry0, z_front]], 3.0); // below recess
-    quad(&mut verts, &mut indices, [[fl, ry1, z_front], [fr, ry1, z_front], [fr, chin_top, z_front], [fl, chin_top, z_front]], 3.0); // above recess
-    quad(&mut verts, &mut indices, [[fl, ry0, z_front], [rx0, ry0, z_front], [rx0, ry1, z_front], [fl, ry1, z_front]], 3.0); // left of recess
-    quad(&mut verts, &mut indices, [[rx1, ry0, z_front], [fr, ry0, z_front], [fr, ry1, z_front], [rx1, ry1, z_front]], 3.0); // right of recess
-    // recess side walls (front → back)
-    quad(&mut verts, &mut indices, [[rx0, ry0, z_front], [rx1, ry0, z_front], [rx1, ry0, z_rec], [rx0, ry0, z_rec]], 3.0);
-    quad(&mut verts, &mut indices, [[rx0, ry1, z_front], [rx1, ry1, z_front], [rx1, ry1, z_rec], [rx0, ry1, z_rec]], 3.0);
-    quad(&mut verts, &mut indices, [[rx0, ry0, z_front], [rx0, ry1, z_front], [rx0, ry1, z_rec], [rx0, ry0, z_rec]], 3.0);
-    quad(&mut verts, &mut indices, [[rx1, ry0, z_front], [rx1, ry1, z_front], [rx1, ry1, z_rec], [rx1, ry0, z_rec]], 3.0);
-    // recessed panels: grille (mat 4) on the left, control plate (mat 3) on the right,
-    // with a thin plastic divider between them.
-    let gx1 = rx0 + (rx1 - rx0) * 0.64; // grille / controls split
-    let div = 0.02;
-    quad(&mut verts, &mut indices, [[rx0, ry0, z_rec], [gx1, ry0, z_rec], [gx1, ry1, z_rec], [rx0, ry1, z_rec]], 4.0); // speaker grille
-    quad(&mut verts, &mut indices, [[gx1, ry0, z_rec], [gx1 + div, ry0, z_rec], [gx1 + div, ry1, z_rec], [gx1, ry1, z_rec], ], 3.0); // divider
-    quad(&mut verts, &mut indices, [[gx1 + div, ry0, z_rec], [rx1, ry0, z_rec], [rx1, ry1, z_rec], [gx1 + div, ry1, z_rec]], 3.0); // control plate
-    // two control knobs (short cylinders) on the control plate
-    let kc = 0.06;
-    for (i, &kx) in [gx1 + (rx1 - gx1) * 0.36, gx1 + (rx1 - gx1) * 0.70].iter().enumerate() {
-        let ky = ry0 + (ry1 - ry0) * 0.5;
-        let kn = 16usize;
-        let zk = z_rec + 0.035;
-        for k in 0..kn {
-            let k2 = (k + 1) % kn;
-            let a0 = std::f32::consts::TAU * k as f32 / kn as f32;
-            let a1 = std::f32::consts::TAU * k2 as f32 / kn as f32;
-            let p0 = [kx + kc * a0.cos(), ky + kc * a0.sin(), z_rec];
-            let p1 = [kx + kc * a1.cos(), ky + kc * a1.sin(), z_rec];
-            let q0 = [kx + kc * a0.cos(), ky + kc * a0.sin(), zk];
-            let q1 = [kx + kc * a1.cos(), ky + kc * a1.sin(), zk];
-            quad(&mut verts, &mut indices, [p0, p1, q1, q0], 3.0); // knob wall
-            quad(&mut verts, &mut indices, [q0, q1, [kx, ky, zk], [kx, ky, zk]], 3.0); // knob top
+
+    // 6b. Side regions (tube left/right, oy..-oy): plain plastic on a bottom-speaker or
+    // pro set; tall recessed speaker grilles flanking the tube on a Panasonic-style set.
+    if cab.speakers == Speakers::Sides {
+        for &sgn in &[-1.0f32, 1.0] {
+            let (outer, inner) = if sgn < 0.0 { (fl, -ox) } else { (fr, ox) };
+            let (xa, xb) = (outer.min(inner), outer.max(inner));
+            let m = 0.028; // plastic border margin around the grille
+            let (px0, px1, py0, py1) = (xa + m, xb - m, -oy + m, oy - m);
+            quad(&mut verts, &mut indices, [[xa, -oy, z_front], [xb, -oy, z_front], [xb, py0, z_front], [xa, py0, z_front]], pl); // below
+            quad(&mut verts, &mut indices, [[xa, py1, z_front], [xb, py1, z_front], [xb, oy, z_front], [xa, oy, z_front]], pl); // above
+            quad(&mut verts, &mut indices, [[xa, py0, z_front], [px0, py0, z_front], [px0, py1, z_front], [xa, py1, z_front]], pl); // outer edge
+            quad(&mut verts, &mut indices, [[px1, py0, z_front], [xb, py0, z_front], [xb, py1, z_front], [px1, py1, z_front]], pl); // inner edge
+            recess_panel(&mut verts, &mut indices, px0, px1, py0, py1, z_front, z_front - 0.045, 4.0);
         }
-        let _ = i;
+    } else {
+        quad(&mut verts, &mut indices, [[fl, -oy, z_front], [-ox, -oy, z_front], [-ox, oy, z_front], [fl, oy, z_front]], pl); // left
+        quad(&mut verts, &mut indices, [[ox, -oy, z_front], [fr, -oy, z_front], [fr, oy, z_front], [ox, oy, z_front]], pl); // right
     }
 
-    // 6c. Side walls: from the chamfer edge (zc) straight back to the main box.
-    quad(&mut verts, &mut indices, [[cab_l, cab_t, zc], [cab_r, cab_t, zc], [cab_r, cab_t, z_rear], [cab_l, cab_t, z_rear]], 3.0); // top
-    quad(&mut verts, &mut indices, [[cab_l, cab_b, zc], [cab_r, cab_b, zc], [cab_r, cab_b, z_rear], [cab_l, cab_b, z_rear]], 3.0); // bottom
-    quad(&mut verts, &mut indices, [[cab_l, cab_b, zc], [cab_l, cab_t, zc], [cab_l, cab_t, z_rear], [cab_l, cab_b, z_rear]], 3.0); // left
-    quad(&mut verts, &mut indices, [[cab_r, cab_b, zc], [cab_r, cab_t, zc], [cab_r, cab_t, z_rear], [cab_r, cab_b, z_rear]], 3.0); // right
+    // 6c. Chin (below the tube), by speaker layout.
+    match cab.speakers {
+        Speakers::Bottom => {
+            // A plastic frame around a recessed panel: speaker grille (left ~64%) + a
+            // control plate with two knobs (right ~36%).
+            let (rx0, rx1) = (fl + 0.05, fr - 0.05);
+            let (ry0, ry1) = (fb + 0.075, chin_top - 0.06);
+            let z_rec = z_front - 0.05;
+            quad(&mut verts, &mut indices, [[fl, fb, z_front], [fr, fb, z_front], [fr, ry0, z_front], [fl, ry0, z_front]], pl); // below recess
+            quad(&mut verts, &mut indices, [[fl, ry1, z_front], [fr, ry1, z_front], [fr, chin_top, z_front], [fl, chin_top, z_front]], pl); // above recess
+            quad(&mut verts, &mut indices, [[fl, ry0, z_front], [rx0, ry0, z_front], [rx0, ry1, z_front], [fl, ry1, z_front]], pl); // left of recess
+            quad(&mut verts, &mut indices, [[rx1, ry0, z_front], [fr, ry0, z_front], [fr, ry1, z_front], [rx1, ry1, z_front]], pl); // right of recess
+            let gx1 = rx0 + (rx1 - rx0) * 0.64; // grille / controls split
+            let div = 0.02;
+            recess_panel(&mut verts, &mut indices, rx0, gx1, ry0, ry1, z_front, z_rec, 4.0); // speaker grille
+            quad(&mut verts, &mut indices, [[gx1, ry0, z_rec], [gx1 + div, ry0, z_rec], [gx1 + div, ry1, z_rec], [gx1, ry1, z_rec]], pl); // divider
+            recess_panel(&mut verts, &mut indices, gx1 + div, rx1, ry0, ry1, z_front, z_rec, pl); // control plate
+            let ky = ry0 + (ry1 - ry0) * 0.5;
+            knob(&mut verts, &mut indices, gx1 + (rx1 - gx1) * 0.36, ky, z_rec, 0.06);
+            knob(&mut verts, &mut indices, gx1 + (rx1 - gx1) * 0.70, ky, z_rec, 0.06);
+        }
+        _ => {
+            // Slim chin: a plain plastic panel (uniform bezel look). Consumer side-speaker
+            // sets still carry a couple of control knobs on the lower right.
+            quad(&mut verts, &mut indices, [[fl, fb, z_front], [fr, fb, z_front], [fr, chin_top, z_front], [fl, chin_top, z_front]], pl);
+            if cab.speakers == Speakers::Sides {
+                let ky = (fb + chin_top) * 0.5;
+                knob(&mut verts, &mut indices, fr - 0.12, ky, z_front, 0.045);
+                knob(&mut verts, &mut indices, fr - 0.26, ky, z_front, 0.045);
+            }
+        }
+    }
 
-    // 6d. Rear hump: taper the box in toward the tube axis and cap it (with a neck
+    // 6b-badge. A molded brand plate proud of the bottom bezel, just under the tube.
+    if cab.badge {
+        let (bx, by, bhw, bhh) = (0.0, chin_top - 0.045, 0.145, 0.020);
+        let (x0, x1, y0, y1) = (bx - bhw, bx + bhw, by - bhh, by + bhh);
+        let zp = z_front + 0.012;
+        quad(&mut verts, &mut indices, [[x0, y0, zp], [x1, y0, zp], [x1, y1, zp], [x0, y1, zp]], pl); // face
+        quad(&mut verts, &mut indices, [[x0, y0, z_front], [x1, y0, z_front], [x1, y0, zp], [x0, y0, zp]], pl); // bottom
+        quad(&mut verts, &mut indices, [[x0, y1, z_front], [x1, y1, z_front], [x1, y1, zp], [x0, y1, zp]], pl); // top
+        quad(&mut verts, &mut indices, [[x0, y0, z_front], [x0, y1, z_front], [x0, y1, zp], [x0, y0, zp]], pl); // left
+        quad(&mut verts, &mut indices, [[x1, y0, z_front], [x1, y1, z_front], [x1, y1, zp], [x1, y0, zp]], pl); // right
+    }
+
+    // 6d. Side walls: from the chamfer edge (zc) straight back to the main box.
+    quad(&mut verts, &mut indices, [[cab_l, cab_t, zc], [cab_r, cab_t, zc], [cab_r, cab_t, z_rear], [cab_l, cab_t, z_rear]], pl); // top
+    quad(&mut verts, &mut indices, [[cab_l, cab_b, zc], [cab_r, cab_b, zc], [cab_r, cab_b, z_rear], [cab_l, cab_b, z_rear]], pl); // bottom
+    quad(&mut verts, &mut indices, [[cab_l, cab_b, zc], [cab_l, cab_t, zc], [cab_l, cab_t, z_rear], [cab_l, cab_b, z_rear]], pl); // left
+    quad(&mut verts, &mut indices, [[cab_r, cab_b, zc], [cab_r, cab_t, zc], [cab_r, cab_t, z_rear], [cab_r, cab_b, z_rear]], pl); // right
+
+    // 6e. Rear hump: taper the box in toward the tube axis and cap it (with a neck
     // hole). This is the classic bulging back of a CRT set enclosing the deflection bell.
     let (rhw, rht, rhb) = (hw_cab * 0.60, cab_t * 0.60, cab_b * 0.60);
-    quad(&mut verts, &mut indices, [[cab_l, cab_t, z_rear], [cab_r, cab_t, z_rear], [rhw, rht, z_rear2], [-rhw, rht, z_rear2]], 3.0); // top taper
-    quad(&mut verts, &mut indices, [[cab_l, cab_b, z_rear], [cab_r, cab_b, z_rear], [rhw, rhb, z_rear2], [-rhw, rhb, z_rear2]], 3.0); // bottom taper
-    quad(&mut verts, &mut indices, [[cab_l, cab_b, z_rear], [cab_l, cab_t, z_rear], [-rhw, rht, z_rear2], [-rhw, rhb, z_rear2]], 3.0); // left taper
-    quad(&mut verts, &mut indices, [[cab_r, cab_b, z_rear], [cab_r, cab_t, z_rear], [rhw, rht, z_rear2], [rhw, rhb, z_rear2]], 3.0); // right taper
+    quad(&mut verts, &mut indices, [[cab_l, cab_t, z_rear], [cab_r, cab_t, z_rear], [rhw, rht, z_rear2], [-rhw, rht, z_rear2]], pl); // top taper
+    quad(&mut verts, &mut indices, [[cab_l, cab_b, z_rear], [cab_r, cab_b, z_rear], [rhw, rhb, z_rear2], [-rhw, rhb, z_rear2]], pl); // bottom taper
+    quad(&mut verts, &mut indices, [[cab_l, cab_b, z_rear], [cab_l, cab_t, z_rear], [-rhw, rht, z_rear2], [-rhw, rhb, z_rear2]], pl); // left taper
+    quad(&mut verts, &mut indices, [[cab_r, cab_b, z_rear], [cab_r, cab_t, z_rear], [rhw, rht, z_rear2], [rhw, rhb, z_rear2]], pl); // right taper
     // rear face with a neck hole (ring of 4 strips around the hole)
     let nh = NECK_R * 1.6;
-    quad(&mut verts, &mut indices, [[-rhw, rhb, z_rear2], [rhw, rhb, z_rear2], [nh, -nh, z_rear2], [-nh, -nh, z_rear2]], 3.0);
-    quad(&mut verts, &mut indices, [[-rhw, rht, z_rear2], [rhw, rht, z_rear2], [nh, nh, z_rear2], [-nh, nh, z_rear2]], 3.0);
-    quad(&mut verts, &mut indices, [[-rhw, rhb, z_rear2], [-rhw, rht, z_rear2], [-nh, nh, z_rear2], [-nh, -nh, z_rear2]], 3.0);
-    quad(&mut verts, &mut indices, [[rhw, rhb, z_rear2], [rhw, rht, z_rear2], [nh, nh, z_rear2], [nh, -nh, z_rear2]], 3.0);
+    quad(&mut verts, &mut indices, [[-rhw, rhb, z_rear2], [rhw, rhb, z_rear2], [nh, -nh, z_rear2], [-nh, -nh, z_rear2]], pl);
+    quad(&mut verts, &mut indices, [[-rhw, rht, z_rear2], [rhw, rht, z_rear2], [nh, nh, z_rear2], [-nh, nh, z_rear2]], pl);
+    quad(&mut verts, &mut indices, [[-rhw, rhb, z_rear2], [-rhw, rht, z_rear2], [-nh, nh, z_rear2], [-nh, -nh, z_rear2]], pl);
+    quad(&mut verts, &mut indices, [[rhw, rhb, z_rear2], [rhw, rht, z_rear2], [nh, nh, z_rear2], [nh, -nh, z_rear2]], pl);
 
     (verts, indices)
 }
@@ -466,6 +511,34 @@ struct Uniforms {
 // CRT presets — observed geometry + phosphor of real monitor families.
 // ---------------------------------------------------------------------------
 
+// Where a set puts its loudspeakers — the single most brand-defining feature of the
+// front silhouette. Bottom = a grille across the chin (Sony/RCA console TVs); Sides =
+// vertical grilles flanking the tube (many Panasonic sets); None = a pro monitor / PC
+// display / terminal with a thin uniform bezel and no speaker chin.
+#[derive(Clone, Copy, PartialEq)]
+enum Speakers {
+    Bottom,
+    Sides,
+    None,
+}
+
+// Per-brand cabinet: the plastic finish + silhouette that wraps the bare tube. This is
+// what makes a Trinitron read as a deep charcoal near-cube, a Panasonic as a silver set
+// with side speakers, an RCA as a rounder warm-brown console, a PVM/PC monitor as a
+// slim uniform bezel. `plastic` is the vertex material id (3 charcoal / 5 warm walnut /
+// 6 silver / 7 beige); the rest are extents in screen-half-width units.
+#[derive(Clone, Copy)]
+struct Cabinet {
+    plastic: f32,
+    side_bezel: f32,
+    top_bezel: f32,
+    chin: f32,       // height of the space below the tube (speakers/controls)
+    corner: f32,     // outer edge chamfer size (rounder = softer console look)
+    rear_z: f32,     // z of the main box back (more negative = deeper set)
+    speakers: Speakers,
+    badge: bool,     // molded brand strip on the bottom bezel
+}
+
 #[derive(Clone, Copy)]
 struct Preset {
     name: &'static str,
@@ -473,6 +546,7 @@ struct Preset {
     bulge: f32,
     curv_x: f32,
     curv_y: f32,
+    cabinet: Cabinet,
     // optics
     mask_type: f32, // 0 aperture grille, 1 shadow (dot), 2 slot
     mask_strength: f32,
@@ -553,6 +627,19 @@ const TRINITRON: Preset = Preset {
     bulge: 0.10,
     curv_x: 0.34,
     curv_y: 0.16,
+    // Sony KV-20TS20 (1989): a deep charcoal near-cube; near-flat cylindrical face in a
+    // fairly thick matte bezel, a distinctly tall chin carrying the speaker grille +
+    // control door, and the SONY badge molded into the bottom bezel. (~photo refs)
+    cabinet: Cabinet {
+        plastic: 3.0,
+        side_bezel: 0.150,
+        top_bezel: 0.130,
+        chin: 0.450,
+        corner: 0.05,
+        rear_z: -1.46,
+        speakers: Speakers::Bottom,
+        badge: true,
+    },
     mask_type: 0.0,
     mask_strength: 0.90,
     scanline: 0.55,
@@ -581,6 +668,19 @@ const PANASONIC: Preset = Preset {
     bulge: 0.13,
     curv_x: 0.50,
     curv_y: 0.50,
+    // Panasonic consumer set: cool silver-grey plastic with tall vertical speaker
+    // grilles flanking the tube (wide side bezels), a slim controls-only chin, and
+    // softer edges than the Sony.
+    cabinet: Cabinet {
+        plastic: 6.0,
+        side_bezel: 0.240,
+        top_bezel: 0.110,
+        chin: 0.240,
+        corner: 0.045,
+        rear_z: -1.40,
+        speakers: Speakers::Sides,
+        badge: true,
+    },
     mask_type: 1.0,
     mask_strength: 0.85,
     scanline: 0.55,
@@ -609,6 +709,17 @@ const SLOTMASK: Preset = Preset {
     bulge: 0.10,
     curv_x: 0.42,
     curv_y: 0.38,
+    // Generic 90s consumer set: charcoal, bottom speaker grille, mid proportions.
+    cabinet: Cabinet {
+        plastic: 3.0,
+        side_bezel: 0.145,
+        top_bezel: 0.125,
+        chin: 0.400,
+        corner: 0.05,
+        rear_z: -1.44,
+        speakers: Speakers::Bottom,
+        badge: false,
+    },
     mask_type: 2.0,
     mask_strength: 0.85,
     scanline: 0.52,
@@ -636,6 +747,18 @@ const RCA: Preset = Preset {
     bulge: 0.13,
     curv_x: 0.52,
     curv_y: 0.48, // deeply curved old spherical tube
+    // RCA ColorTrak console: a bigger, rounder, warm walnut-brown box — a tall chin
+    // with the speaker grille, softly chamfered edges, and the deepest cabinet here.
+    cabinet: Cabinet {
+        plastic: 5.0,
+        side_bezel: 0.170,
+        top_bezel: 0.150,
+        chin: 0.500,
+        corner: 0.090,
+        rear_z: -1.52,
+        speakers: Speakers::Bottom,
+        badge: true,
+    },
     mask_type: 1.0, // shadow-mask dot triads
     mask_strength: 0.62, // soft, low-contrast mask
     scanline: 0.45,
@@ -663,6 +786,18 @@ const PVM: Preset = Preset {
     bulge: 0.07,
     curv_x: 0.26,
     curv_y: 0.09, // near-flat, cylindrical
+    // Sony PVM/BVM: a compact charcoal broadcast monitor — thin uniform bezel all
+    // around, no consumer speaker chin.
+    cabinet: Cabinet {
+        plastic: 3.0,
+        side_bezel: 0.095,
+        top_bezel: 0.095,
+        chin: 0.130,
+        corner: 0.035,
+        rear_z: -1.40,
+        speakers: Speakers::None,
+        badge: false,
+    },
     mask_type: 0.0, // aperture grille
     mask_strength: 0.95,
     scanline: 0.56, // crisp, clean 240p scanlines
@@ -690,6 +825,17 @@ const ARCADE: Preset = Preset {
     bulge: 0.12,
     curv_x: 0.42,
     curv_y: 0.40,
+    // Bare 15 kHz tube in a black metal chassis: charcoal, thin bezel, no speakers.
+    cabinet: Cabinet {
+        plastic: 3.0,
+        side_bezel: 0.130,
+        top_bezel: 0.120,
+        chin: 0.170,
+        corner: 0.04,
+        rear_z: -1.44,
+        speakers: Speakers::None,
+        badge: false,
+    },
     mask_type: 1.0, // shadow-mask triads
     mask_strength: 0.80,
     scanline: 0.62, // big, proud scanlines
@@ -717,6 +863,17 @@ const VGA: Preset = Preset {
     bulge: 0.05,
     curv_x: 0.22,
     curv_y: 0.20, // flatter
+    // NEC MultiSync PC monitor: cool silver-grey, slim uniform bezel, no speakers.
+    cabinet: Cabinet {
+        plastic: 6.0,
+        side_bezel: 0.075,
+        top_bezel: 0.075,
+        chin: 0.110,
+        corner: 0.04,
+        rear_z: -1.30,
+        speakers: Speakers::None,
+        badge: false,
+    },
     mask_type: 1.0, // fine shadow mask
     mask_strength: 0.85,
     scanline: 0.34, // 480+ lines → subtle scanlines
@@ -744,6 +901,17 @@ const DIAMONDTRON: Preset = Preset {
     bulge: 0.02,
     curv_x: 0.05,
     curv_y: 0.05, // dead flat
+    // NEC Diamondtron FE flat PC monitor: silver-grey, razor-thin uniform bezel.
+    cabinet: Cabinet {
+        plastic: 6.0,
+        side_bezel: 0.060,
+        top_bezel: 0.060,
+        chin: 0.090,
+        corner: 0.03,
+        rear_z: -1.25,
+        speakers: Speakers::None,
+        badge: false,
+    },
     mask_type: 0.0, // aperture grille (has damper wires)
     mask_strength: 0.92,
     scanline: 0.30, // high-res, minimal scanlines
@@ -772,6 +940,17 @@ const GREEN: Preset = Preset {
     bulge: 0.09,
     curv_x: 0.34,
     curv_y: 0.30,
+    // IBM 5151-style terminal: a beige/cream molded case, slim bezel, no speakers.
+    cabinet: Cabinet {
+        plastic: 7.0,
+        side_bezel: 0.120,
+        top_bezel: 0.110,
+        chin: 0.160,
+        corner: 0.06,
+        rear_z: -1.30,
+        speakers: Speakers::None,
+        badge: false,
+    },
     mask_type: 0.0,     // unused (mono skips the RGB triad mask)
     mask_strength: 0.0, // no colour mask on a single-phosphor tube
     scanline: 0.42,
@@ -799,6 +978,17 @@ const AMBER: Preset = Preset {
     bulge: 0.09,
     curv_x: 0.34,
     curv_y: 0.30,
+    // Same beige terminal case as the green phosphor sibling.
+    cabinet: Cabinet {
+        plastic: 7.0,
+        side_bezel: 0.120,
+        top_bezel: 0.110,
+        chin: 0.160,
+        corner: 0.06,
+        rear_z: -1.30,
+        speakers: Speakers::None,
+        badge: false,
+    },
     mask_type: 0.0,
     mask_strength: 0.0,
     scanline: 0.42,
@@ -1277,7 +1467,7 @@ fn build_resources(
         let accum_bind = [mk_accum(&phosphor_view[0]), mk_accum(&phosphor_view[1])];
 
     // --- geometry buffers ---
-    let (verts, indices) = build_mesh(preset.bulge, preset.curv_x, preset.curv_y);
+    let (verts, indices) = build_mesh(preset.bulge, preset.curv_x, preset.curv_y, preset.cabinet);
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("vbuf"),
         contents: bytemuck::cast_slice(&verts),
@@ -1772,7 +1962,7 @@ impl State {
     // Switch tube/mask preset live. Optics come from `self.preset` each frame, but
     // the curvature is baked into the mesh, so the geometry buffers are rebuilt.
     fn set_preset(&mut self, preset: Preset) {
-        let (verts, indices) = build_mesh(preset.bulge, preset.curv_x, preset.curv_y);
+        let (verts, indices) = build_mesh(preset.bulge, preset.curv_x, preset.curv_y, preset.cabinet);
         self.res.vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vbuf"),
             contents: bytemuck::cast_slice(&verts),
