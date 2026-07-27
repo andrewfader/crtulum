@@ -27,6 +27,37 @@ wlr-screencopy and `grim` gives up:
 cargo run -- --shot out.png 1000x800
 ```
 
+## Playing on it
+
+The other direction: put a game on the tube and pick up a controller.
+
+```sh
+cargo run --release -- --play game.sfc
+cargo run --release -- --play game.cue --core swanstation --option swanstation_GPU_Renderer=Vulkan
+```
+
+A libretro core runs in-process, one emulated frame per tick of the clock — not per
+monitor refresh, so a 59.727 Hz Game Boy and a 60.099 Hz SNES each run at their own
+speed whatever your display is doing. A gamepad is picked up automatically if one is
+plugged in; otherwise the keyboard stands in:
+
+| | |
+| --- | --- |
+| arrows | d-pad |
+| Z / X | B / A |
+| A / S | Y / X |
+| Q / W | L / R |
+| Enter · RShift | Start · Select |
+| F2 | pause the game (the television keeps running) |
+
+Every CRT control still works while you play — orbit the tube with the mouse, swap
+presets with the number keys, cut the power with **P**. The game's buttons take
+priority, so they can't also change the television.
+
+Sound comes from the core, resampled to whatever your audio device wanted.
+`CRTULUM_PLAY_STATS=1` prints the emulated rate and how much audio is buffered, which
+is what to look at if it ever feels off.
+
 ## Exporting video
 
 The other half of the app: hand it a source and it renders the whole thing through
@@ -294,6 +325,8 @@ colorspace mapping right. Use `[` / `]` to trim exposure to taste.
   a time with a scripted button mask, hands back RGBA frames and PCM.
 - `src/glctx.rs` — the headless EGL/OpenGL context that hardware-rendering cores draw
   into, plus the readback.
+- `src/play.rs` — live play: clock-paced emulation, gamepad and keyboard input, and
+  the audio output.
 - `src/vkctx.rs` — the Vulkan equivalent: instance, device, the negotiation handshake,
   the `retro_hw_render_interface_vulkan` callbacks, and the image copy back to RGBA.
 - `examples/demo.crts` — a commented script showing every action.
