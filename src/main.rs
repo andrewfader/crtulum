@@ -5,10 +5,20 @@
 //   cargo run -- --shot out.png 1000x800 : headless PNG render
 //   cargo run -- --clip frames/ out/ 800x600 : run a frame sequence through the
 //                                              tube (phosphor melts across fields)
+//   cargo run -- --render clip.mp4 out.mp4 --script run.crts : scripted video
+//                                              export (source → CRT → ffmpeg)
+//   cargo run -- --render out.mp4 --script tas.crts : ditto, but the script also
+//                                              drives a ROM frame-by-frame
+//   cargo run -- --play game.sfc : play it, on the tube, with a controller
 //
 // Controls: left-drag orbit · scroll zoom · Esc quit
 
 mod capture;
+mod glctx;
+mod vkctx;
+mod libretro;
+mod play;
+mod video;
 
 use std::sync::Arc;
 
@@ -1776,6 +1786,8 @@ struct State {
     window: Arc<Window>,
     capture: Option<capture::SharedFrame>,
     last_seq: u64,
+    /// Live play: a libretro core running a game, driven by the clock and a pad.
+    player: Option<play::Player>,
     preset: Preset,
     hdr: bool, // true = scRGB HDR swapchain, false = SDR (tonemap on output)
     power: PowerState,
@@ -1913,6 +1925,7 @@ impl State {
             window,
             capture,
             last_seq: 0,
+            player: None,
             preset,
             hdr,
         }
@@ -1946,6 +1959,34 @@ impl State {
             &frame.data,
         );
         self.last_seq = frame.seq;
+    }
+
+    /// Advance the game and hand its newest frame to the phosphor plane.
+    fn poll_player(&mut self) {
+        let Some(player) = &mut self.player else { return };
+        if let Err(e) = player.tick() {
+            eprintln!("[play] {e:#}");
+            self.player = None;
+            return;
+        }
+        if !player.fresh || player.size.0 == 0 {
+            return;
+        }
+        player.fresh = false;
+        let (w, h) = player.size;
+        // The borrow has to end before the upload, which needs &self.res.
+        let frame = std::mem::take(&mut player.frame);
+        self.res.set_source(
+            &self.device,
+            &self.queue,
+            w,
+            h,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            &frame,
+        );
+        if let Some(player) = &mut self.player {
+            player.frame = frame;
+        }
     }
 
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -2032,6 +2073,7 @@ impl State {
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         self.poll_capture();
+        self.poll_player();
         let dt = self.last_frame.elapsed().as_secs_f32().clamp(0.0, 0.1);
         self.last_frame = std::time::Instant::now();
         let pwr = self.power_params();
@@ -2496,6 +2538,55 @@ fn main() {
         return;
     }
 
+    // Scripted video export: `crtulum --render in.mp4 out.mp4 [--script run.crts]`.
+    // Runs a whole source (file / URL / stills / a TAS through RetroArch) through the
+    // tube and pipes the result into ffmpeg. See src/video.rs.
+    if args.iter().any(|a| a == "--render") {
+        if args.iter().any(|a| a == "--help" || a == "-h") {
+            print!("{}", video::USAGE);
+            return;
+        }
+        let result = video::opts_from_args(&args, preset).and_then(video::render);
+        if let Err(e) = result {
+            eprintln!("[render] error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Live play: `crtulum --play game.sfc [--core snes9x] [--option k=v]`. The game
+    // runs on the tube with a controller, rather than being rendered to a file.
+    let player = if let Some(i) = args.iter().position(|a| a == "--play") {
+        let rom = match args.get(i + 1) {
+            Some(r) if !r.starts_with('-') => std::path::PathBuf::from(r),
+            _ => {
+                eprintln!("--play needs a ROM: crtulum --play game.sfc [--core NAME]");
+                std::process::exit(1);
+            }
+        };
+        let core = args
+            .iter()
+            .position(|a| a == "--core")
+            .and_then(|i| args.get(i + 1))
+            .cloned();
+        let options: Vec<(String, String)> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--option")
+            .filter_map(|(i, _)| args.get(i + 1))
+            .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect();
+        match play::Player::new(&rom, core.as_deref(), &options) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("[play] error: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     let capture = if args.iter().any(|a| a == "--capture") {
         eprintln!("[capture] starting — pick a window or screen in the portal dialog…");
         Some(capture::spawn())
@@ -2513,6 +2604,7 @@ fn main() {
     );
 
     let mut state = pollster::block_on(State::new(window.clone(), capture, preset));
+    state.player = player;
 
     event_loop
         .run(move |event, elwt| {
@@ -2522,7 +2614,15 @@ fn main() {
                     match event {
                         WindowEvent::CloseRequested => elwt.exit(),
                         WindowEvent::KeyboardInput { event, .. } => {
-                            if event.state == ElementState::Pressed {
+                            // While a game is running its buttons come first, so the
+                            // controls it uses can't also flip the tube's settings.
+                            let consumed = match (&mut state.player, event.physical_key) {
+                                (Some(p), PhysicalKey::Code(code)) => {
+                                    p.set_key(code, event.state == ElementState::Pressed)
+                                }
+                                _ => false,
+                            };
+                            if !consumed && event.state == ElementState::Pressed {
                                 match event.physical_key {
                                     PhysicalKey::Code(KeyCode::Escape) => elwt.exit(),
                                     // 1..9,0 pick a preset directly; Tab cycles through all.
@@ -2538,6 +2638,12 @@ fn main() {
                                     PhysicalKey::Code(KeyCode::Digit0) => state.set_preset(ALL_PRESETS[9]),
                                     // P = power (warmup ↔ collapse); G = degauss.
                                     PhysicalKey::Code(KeyCode::KeyP) => state.toggle_power(),
+                                    // Pause the game (the tube keeps running).
+                                    PhysicalKey::Code(KeyCode::F2) => {
+                                        if let Some(p) = &mut state.player {
+                                            p.toggle_pause();
+                                        }
+                                    }
                                     PhysicalKey::Code(KeyCode::KeyG) => {
                                         state.degauss_start = Some(std::time::Instant::now())
                                     }

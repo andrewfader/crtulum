@@ -1,0 +1,30 @@
+# crtulum script — a scripted export.
+#
+#   crtulum --render clip.mp4 out.mp4 --script examples/demo.crts
+#
+# Everything above the timeline is setup; everything below is choreography. A CLI
+# flag always wins over the matching directive here, so one script can be reused
+# against different sources and sizes.
+
+# ---- setup ----------------------------------------------------------------
+# source   clip.mp4      # uncomment to bake the input into the script
+size       1280x960      # output resolution
+ssaa       3             # supersampling: 3 is the good-looking default, 1 is fast
+lines      240           # feed the tube a 240p signal (a real CRT never saw 1080p)
+preset     trinitron
+camera     yaw=0.55 pitch=0.22 dist=3.4
+exposure   1.0
+
+# ---- timeline -------------------------------------------------------------
+# Times are seconds (12, 12.5) or clock (1:03, 1:02:30.5).
+
+at 0:00   power on                              # cold start: the raster blooms open
+                                                # (power-on auto-degausses, as the set does)
+at 0:03   camera to yaw=-0.35 dist=3.0 over 6   # slow drift across the face
+at 0:12   preset pvm                            # swap tubes mid-shot: sharp studio monitor
+at 0:14   exposure to 1.25 over 2               # push the highlights a little
+at 0:24   preset rca                            # …and a fuzzy old console set
+at 0:26   degauss                               # rainbow purity burst
+at 0:30   spin 1 over 10 linear                 # one full orbit around the cabinet
+at 0:44   camera to yaw=0.0 pitch=0.15 dist=2.6 over 4
+at 0:52   power off                             # raster collapses to a white-hot line, then a dot

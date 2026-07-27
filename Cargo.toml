@@ -21,6 +21,12 @@ image = { version = "0.24", default-features = false, features = ["png"] }
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "screencast"] }
 pipewire = "0.10"
 anyhow = "1"
+libloading = "0.9.0"
+khronos-egl = { version = "6.0.0", features = ["dynamic"] }
+gl = "0.14.0"
+ash = "0.37"
+gilrs = "0.11.2"
+cpal = "0.18.1"
 
 # crtulum patch: vendored wgpu-hal with HDR colorspace mapping for Wayland/mutter
 # (maps BT.2020-linear surfaces to Rgba16Float so an HDR swapchain is reachable).

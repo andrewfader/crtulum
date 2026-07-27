@@ -1,0 +1,29 @@
+# A scripted run — the tool-assisted part.
+#
+#   python3 examples/make_test_rom.py          # builds the ROM this drives
+#   cargo run --release -- --render out.mp4 --script examples/tas.crts
+#
+# examples/inputtest.nes paints the screen a colour derived from the buttons held
+# that frame, so the output video is a direct readout of the input timeline:
+#   idle grey · A dark blue · B blue · Start olive · Left grey-blue · Right white
+
+# ---- what to run ----------------------------------------------------------
+rom      examples/inputtest.nes
+# core   nestopia          # guessed from the .nes extension if omitted
+frames   480               # 8 seconds at 60 fps
+
+# ---- how it looks ---------------------------------------------------------
+size     960x720
+ssaa     2
+preset   trinitron
+camera   yaw=0.30 pitch=0.18 dist=3.2
+
+# ---- the run --------------------------------------------------------------
+# `at <time>` is wall clock; `frame <n>` is exact — use frames where it matters.
+at 0:00     power on                 # 2s warm-up: the raster blooms open
+frame 150   press start              # a momentary press (4 frames by default)
+frame 180   hold right               # …and hold it…
+frame 240   press a for 20 frames    # a precisely-placed jump, mid-hold
+frame 300   release right
+frame 330   tap b                    # exactly one frame — the finest TAS input
+at 6.5      camera to yaw=-0.3 dist=2.9 over 1.2
