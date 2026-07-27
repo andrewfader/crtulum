@@ -262,20 +262,46 @@ blue the way a cheap TV did; D65 stays neutral. The greens desaturate exactly as
 much as SMPTE-C says they should.
 
 **The beam scans.** Two render passes: one integrates the picture into an HDR
-phosphor plane with real per-channel decay (red lingers, blue snaps off in under a
-millisecond — that's why fast motion trails warm), the other reconstructs the
-electron beam from the source scanlines. Bright spots bloom and merge; saturated
-colors stay thin with the gaps open. Leave a bright object moving and it drags a
-fading tail, because the tube is genuinely remembering the last few fields.
+phosphor plane with real per-channel decay, the other reconstructs the electron beam
+from the source scanlines. The decay is per-phosphor and the gap is bigger than you'd
+guess: EIA classes P22's red a whole persistence step above its green and blue, because
+red emits on a forbidden europium transition that takes about a millisecond while the
+two sulfides recombine in tens of microseconds. So a bright object in motion drags a
+distinctly *red* tail, and it doesn't fade as a clean exponential either — sulfide
+phosphors drop fast and then linger on a slow power-law tail, which is the part your eye
+actually reads as afterglow.
+
+The beam itself is energy-conserving, which is the whole game. Light out of a phosphor is
+linear in beam current — a CRT's ~2.4 gamma comes from the gun's grid, not the phosphor —
+so when a bright line blooms wider it *spreads* its light instead of making more. Turn the
+brightness up and the scanline gaps close rather than the picture gaining a fake extra
+gamma. And the spot isn't a bell curve: it's the gun's imaged crossover smeared by
+aberration, so a well-focused Trinitron or a broadcast PVM draws a line with a flat top
+and a steep wall down to black, while a soft old console set collapses to a plain gaussian.
+Sharper tubes therefore get *both* a flatter core and darker gaps, at identical energy.
 
 **The glass is glass.** Snell refraction bends the view ray through the faceplate
 to the phosphor behind it, traced separately per color channel, so you get real
 chromatic fringing toward the corners. It's a mirror, too — dark screen catches a
 daylight window and the room, and they slide across as you orbit. That last part
 came straight off studying photos of real sets; a CRT head-on isn't black, it's a
-4% mirror of whatever's lit in front of it. Bright content gets two separate glows:
-a tight warm halation off the phosphor and a wider, softer diffusion haze scattering
-through the thick glass — which is where CRT light gets its density.
+4% mirror of whatever's lit in front of it.
+
+There's a second, subtler half to that. The faceplate is *tinted* — entertainment tubes
+ran 40–60% transmission — and the reason is pure geometry: the picture crosses the glass
+once, but room light that gets in, scatters off the phosphor and comes back out crosses it
+twice. Halve the transmission and you lose half your brightness but quarter the ambient
+wash, so contrast doubles and you buy it back with beam current. That wash is modeled, and
+it's diffuse rather than mirrored, so it lifts blacks evenly however you're looking at the
+tube — which is why the presets land between about 40:1 and 90:1 in-room contrast, ordered
+exactly by how dark and how well-coated each tube's glass is, instead of the several
+hundred to one a datasheet quotes from a dark room.
+
+Bright content gets two separate glows: a tight warm halation off the phosphor and a
+wider, softer diffusion haze scattering through the thick glass — which is where CRT
+light gets its density. Both *redistribute* light rather than adding it, so a flat white
+field comes through untouched and only an isolated highlight actually blooms — added on
+top, as a glow usually is, it's just a brightness offset wearing a blur.
 
 **The consumer sets cheat, on purpose.** Composite and S-video tubes run scan
 velocity modulation — the old Sony trick of goosing the beam speed at edges to fake
@@ -289,13 +315,18 @@ like an actual CRT instead of smearing like an LCD (you'll want a 120 Hz panel).
 **The signal path is period-correct.** RGB and component stay clean (PVM, arcade,
 PC monitors). S-video keeps sharp luma but band-limits color. Composite gets the
 full indignity — dot crawl, cross-color, bleed — tuned to real NTSC Y/I/Q
-bandwidths. So the Panasonic smears its reds the way composite did and the PVM
-doesn't.
+bandwidths. Those bandwidths are deliberately lopsided, because NTSC's are: I gets about
+1.3 MHz and Q only 0.4, so green–magenta detail arrives mushier than orange–cyan no matter
+how good the receiver is. Real sets then narrowed I further to avoid paying for the
+asymmetric-sideband correction, which closes the gap without erasing it. So the Panasonic
+smears its reds the way composite did and the PVM doesn't.
 
 **Plus the small stuff nobody asked for.** Deflection geometry errors (pincushion,
 keystone, corner defocus that only the cheap tubes show), convergence drift toward
 the edges, purity blotches a degauss actually clears, overscan eating the picture
-edges, a rolling hum bar from beating against 59.94 Hz, analog grain, halation, and
+edges, a hum bar creeping down the picture once every eight seconds — mains ripple at
+120 Hz beating the field rate at 2×59.94, which is a 0.12 Hz drift and nothing faster —
+analog grain, halation, and
 a power switch that collapses the raster to a bright line, then a dot, then nothing
 — and runs it backward with a degauss burst on the way up.
 

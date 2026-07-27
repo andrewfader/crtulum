@@ -18,7 +18,7 @@ struct Uniforms {
     look: vec4<f32>,    // x=convergence, y=corner_radius, z=grain, w=ghost
     phys: vec4<f32>,    // x=crt_gamma, y=warmth, z=glow_bounce, w=bloom
     temporal: vec4<f32>,// x=dt(sec), y=persist_mult, z=interlace, w=field_parity
-    ptau: vec4<f32>,    // per-phosphor decay tau: xyz = R,G,B (sec); w unused
+    ptau: vec4<f32>,    // per-phosphor decay tau: xyz = R,G,B (sec); w = power-law tail exponent
     geom: vec4<f32>,    // raster geometry: x=pincushion, y=trapezoid, z=corner_pin, w=purity
     mono: vec4<f32>,    // monochrome phosphor tint (rgb) + flag (w>0.5 = single-gun)
     cmat0: vec4<f32>,   // CRT-phosphor → sRGB colour matrix rows (real gamut + white pt)
@@ -27,6 +27,8 @@ struct Uniforms {
     pwr: vec4<f32>,     // power: x=warmup(0..1), y=collapse(0..1), z=degauss(0..1), w unused
     focus: vec4<f32>,   // x=edge defocus (deflection spot growth), y=overscan(per side), z=roll rate, w=roll amp
     fx: vec4<f32>,      // x=svm (scan-velocity crispening), y=diffusion (wide glass glow), z=subpixel-mask flag, w=bfi screen multiplier
+    beam2: vec4<f32>,   // x=spot profile exponent p, y=1/(2*gamma(1+1/p)) area normaliser,
+                        // z=ambient diffuse wash through the tinted faceplate, w=scatter redistribution
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -299,6 +301,7 @@ fn ntsc(uv: vec2<f32>, res: vec2<f32>, t: f32) -> vec3<f32> {
     var q_acc = 0.0;
     var yw = 0.0;
     var cw = 0.0;
+    var qwsum = 0.0;
     // ±10 content pixels: wide enough to span the chroma kernel at native and, via `step`,
     // at any upscale factor for constant cost.
     for (var k = -10; k <= 10; k = k + 1) {
@@ -308,17 +311,27 @@ fn ntsc(uv: vec2<f32>, res: vec2<f32>, t: f32) -> vec3<f32> {
         let ph = subcarrier(scx, line, t);
         let comp = yiq.x + yiq.y * cos(ph) + yiq.z * sin(ph); // composite sample
         let kk = f32(k * k);
-        // Grounded NTSC bandwidths in content-pixel units: luma ~4.2 MHz (fairly sharp),
-        // chroma I/Q ~1.3/0.4 MHz (≈1/3 of luma → ~3x wider kernel → horizontal bleed).
+        // Grounded NTSC bandwidths in content-pixel units. Luma is a plain low-pass wide
+        // enough to stay reasonably sharp but not so wide it rejects the subcarrier — a set
+        // with no comb filter cannot have both, and the ~12% of subcarrier that survives IS
+        // the dot crawl. Chroma is deliberately ANISOTROPIC: NTSC transmits I at ~1.3 MHz
+        // but Q at only ~0.4 MHz, so green–magenta detail is transmitted mushier than
+        // orange–cyan detail no matter how good the receiver is. Real receivers then narrow
+        // I further (most demodulated barely past the ~1 MHz double-sideband region rather
+        // than pay for the asymmetric-sideband correction), which closes the gap without
+        // erasing it — hence a modest 3.0 vs 4.4 σ rather than the full 3:1 of the spec.
+        // Using one shared kernel for both, as before, threw the asymmetry away entirely.
         let lw = exp(-kk / (2.0 * 1.3 * 1.3)); // luma low-pass (leaves some subcarrier)
-        let bw = exp(-kk / (2.0 * 3.4 * 3.4)); // chroma band (narrow → bleed)
+        let iw = exp(-kk / (2.0 * 3.0 * 3.0)); // I band: orange–cyan, the wider axis
+        let qw = exp(-kk / (2.0 * 4.4 * 4.4)); // Q band: green–magenta, narrower → bleeds more
         y_acc = y_acc + comp * lw;
         yw = yw + lw;
-        i_acc = i_acc + comp * cos(ph) * bw;
-        q_acc = q_acc + comp * sin(ph) * bw;
-        cw = cw + bw;
+        i_acc = i_acc + comp * cos(ph) * iw;
+        q_acc = q_acc + comp * sin(ph) * qw;
+        cw = cw + iw;
+        qwsum = qwsum + qw;
     }
-    let yiq = vec3<f32>(y_acc / yw, 2.0 * i_acc / cw, 2.0 * q_acc / cw);
+    let yiq = vec3<f32>(y_acc / yw, 2.0 * i_acc / cw, 2.0 * q_acc / qwsum);
     return max(yiq2rgb(yiq), vec3<f32>(0.0));
 }
 
@@ -333,19 +346,25 @@ fn svideo(uv: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
     var i = 0.0;
     var q = 0.0;
     var cw = 0.0;
+    var qw = 0.0;
     for (var k = -8; k <= 8; k = k + 1) {
         let scx = cx + f32(k);
         let yiq = rgb2yiq(textureSampleLevel(t_screen, s_screen, vec2<f32>(scx * step / res.x, uv.y), 0.0).rgb);
         let kk = f32(k * k);
         let lw = exp(-kk / (2.0 * 0.9 * 0.9)); // sharp luma (no subcarrier to reject)
-        let bw = exp(-kk / (2.0 * 3.4 * 3.4)); // chroma bandwidth → colour bleed
+        // Y/C separation is perfect on separate wires, so what is left is the NTSC
+        // encoder's own asymmetry: I ~1.3 MHz, Q ~0.4 MHz. No subcarrier to reject means
+        // no receiver-side narrowing of I either, so the gap is wider than on composite.
+        let iw = exp(-kk / (2.0 * 2.6 * 2.6)); // I band: orange–cyan
+        let qw_k = exp(-kk / (2.0 * 4.4 * 4.4)); // Q band: green–magenta, bleeds further
         y = y + yiq.x * lw;
         yw = yw + lw;
-        i = i + yiq.y * bw;
-        q = q + yiq.z * bw;
-        cw = cw + bw;
+        i = i + yiq.y * iw;
+        q = q + yiq.z * qw_k;
+        cw = cw + iw;
+        qw = qw + qw_k;
     }
-    return max(yiq2rgb(vec3<f32>(y / yw, i / cw, q / cw)), vec3<f32>(0.0));
+    return max(yiq2rgb(vec3<f32>(y / yw, i / cw, q / qw)), vec3<f32>(0.0));
 }
 
 // Per-channel electron-beam width from that channel's drive (the guest-advanced /
@@ -360,31 +379,55 @@ fn beam_width(c: vec3<f32>) -> vec3<f32> {
 
 // Reconstruct the beam-scanned color at `uv` from the phosphor plane (already
 // NTSC-decoded and time-integrated by the accum pass). Each nearby source row emits
-// a per-channel gaussian beam; summing the overlapping profiles gives bright cores
+// a per-channel beam spot; summing the overlapping profiles gives bright cores
 // that bloom and dark gaps that stay open — resolution-correct, in linear light.
 // (Explicit-LOD sampling so it stays callable once per primary for dispersion.)
+//
+// Two pieces of physics decide the shape of the sum:
+//
+// 1. ENERGY. A phosphor emits photons in linear proportion to the beam current landing
+//    on it — the ~2.4 gamma of a CRT comes from the gun's grid transfer characteristic
+//    (drive volts → beam current), not from any phosphor nonlinearity. So when a bright
+//    row's spot blooms wider it must SPREAD that row's light, not create more of it.
+//    Each row is therefore normalised to unit area (`u.beam2.y / w` — the profile's area
+//    is 2·w·Γ(1+1/p)), which makes a flat field reconstruct to exactly its own value for
+//    any tube. Scanline structure then emerges purely as redistribution: a dark row keeps
+//    a tight core with a black gap either side, a bright row fattens until the gaps close.
+//    That is the real bloom, and it no longer smuggles in an extra gamma — the previous
+//    unnormalised sum scaled total energy by c·w(c), so a 2:1 signal ratio rendered as
+//    2.4:1 and every tube's beam setting silently re-exposed the whole picture.
+//
+// 2. PROFILE. The spot is the gun's imaged cathode crossover blurred by the optics'
+//    aberrations, so it is not a bell unless the tube is soft: a well-focused Trinitron or
+//    shadow-mask CRT has a plateau at the scanline centre with a steep wall down to the
+//    gap. exp(-|d/w|^p) covers both — p=2 is the plain gaussian of a defocused consumer
+//    set, p≈4 the flat-topped core of a broadcast monitor. The flat top also gives
+//    halation a concentrated source to spread from rather than a soft peak.
 fn scan_reconstruct(uv: vec2<f32>, res: vec2<f32>, wscale: f32) -> vec3<f32> {
     let fy = uv.y * res.y - 0.5;
     let row0 = floor(fy);
-    var beam = vec3<f32>(0.0); // energy-weighted beam sum (blooms where lines overlap)
-    var flat = vec3<f32>(0.0); // profile-normalised reference (the settled picture)
+    var beam = vec3<f32>(0.0); // energy-normalised beam sum (blooms where lines overlap)
+    var flat = vec3<f32>(0.0); // profile-weighted reference (the settled picture)
     var wsum = vec3<f32>(0.0);
     let range = i32(u.scan.w);
+    let p = u.beam2.x;
     for (var k = -range; k <= range + 1; k = k + 1) {
         let row = row0 + f32(k);
         let ly = (row + 0.5) / res.y;
         let c = textureSampleLevel(t_screen, s_screen, vec2<f32>(uv.x, ly), 0.0).rgb;
         // wscale > 1 near the edges: deflection defocus widens the vertical spot.
         let w = beam_width(c) * wscale;
-        let d = fy - row;
-        let g = exp(-(d * d) / (w * w)); // per-channel gaussian beam profile
-        beam = beam + c * g;
+        let d = abs(fy - row);
+        // Generalized gaussian, per channel, normalised to unit area over the row.
+        let g = exp(-pow(vec3<f32>(d) / w, vec3<f32>(p)));
+        beam = beam + c * g * (u.beam2.y / w);
         flat = flat + c * g;
         wsum = wsum + g;
     }
     flat = flat / max(wsum, vec3<f32>(1e-4));
-    let col = mix(flat, beam * u.tone.z, u.optics.z);
-    return col * (1.0 + u.optics.z * 0.5);
+    // Both terms now carry the same total energy, so `scanline` trades smooth-resample for
+    // scanline structure at constant brightness instead of also acting as a gain.
+    return mix(flat, beam, u.optics.z) * u.tone.z;
 }
 
 // ---------------------------------------------------------------------------
@@ -428,9 +471,19 @@ fn fs_phosphor(in: FullOut) -> @location(0) vec4<f32> {
 
     let dt = max(u.temporal.x, 0.0);
     // Per-phosphor decay: each primary keeps its own fraction of last field's charge.
-    // Red lingers, blue snaps off → moving highlights trail warm (the real P22 look).
+    // Red lingers a whole persistence class longer than green and blue → moving highlights
+    // trail warm (the real P22 look; see the ptau comment on the CPU side).
     let tau = max(u.ptau.rgb * max(u.temporal.y, 1e-4), vec3<f32>(1e-4));
-    let decay = exp(-vec3<f32>(dt) / tau);
+    // Sulfide phosphors do not decay as a single exponential. The measured curve is a fast
+    // near-exponential drop followed by a slow power-law tail (I = a/(t+t₀)^b), which is
+    // where the visible afterglow lives — a pure exponential drops it entirely. Physically
+    // that tail is bimolecular: the recombination rate scales with the remaining trapped
+    // charge, so dim charge decays SLOWER than bright charge. Model it as a level-dependent
+    // time constant rather than a true power law, which would decay as a fraction per frame
+    // forever and leave a faint permanent smudge; this keeps the correct fast-then-slow
+    // shape while still clearing exponentially. ptau.w sets how much the tail stretches.
+    let tail = 1.0 + u.ptau.w * (1.0 - clamp(prev, vec3<f32>(0.0), vec3<f32>(1.0)));
+    let decay = exp(-vec3<f32>(dt) / (tau * tail));
 
     // Interlace: on an interlaced field only alternate lines are re-excited this
     // frame; the others coast on their decayed charge, giving line twitter.
@@ -528,7 +581,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // (world z ~ 0 — the bezel and faceplate block) catch the picture's average
         // colour and brightness; it falls off down the funnel. This is what makes a
         // real set — and its bezel — glow with the on-screen colour in a dark room.
-        let front = smoothstep(-1.6, -0.05, in.world_pos.z);
+        // Irradiance from an area light falls off with distance from it, and this one is
+        // only ~1 unit across, so its reach is ~1 unit — not the 1.55 the old ramp spanned,
+        // which spread the bezel's glow evenly over the entire front box and lit parts of
+        // the cabinet the screen cannot really see. Squared, so it concentrates on the
+        // bezel immediately around the faceplate and fades quickly down the funnel.
+        let fz = smoothstep(-0.75, -0.02, in.world_pos.z);
+        let front = fz * fz;
         var glow_col = u.env.rgb;
         if (u.mono.w > 0.5) { glow_col = dot(u.env.rgb, vec3<f32>(0.299, 0.587, 0.114)) * u.mono.rgb; }
         // Screen-off / warming tubes don't light the bezel: gate the bounce by power.
@@ -604,8 +663,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (u.focus.x > 0.0) {
         let hamt = clamp(u.focus.x * (0.7 * abs(dfv.x) + 1.6 * r2), 0.0, 0.5);
         let hoff = vec2<f32>((0.5 + 2.0 * hamt) / res.x, 0.0);
+        // These are raw phosphor-plane samples in signal units, but `col` has already been
+        // through the tube drive, so scale them to match before mixing — otherwise the
+        // "blur" halves the brightness of whatever it softens and the astigmatism reads as
+        // an extra corner vignette. (The CRT transfer curve is applied further down, to
+        // both together, so it must NOT be pre-applied here.)
         let hb = 0.5 * (textureSampleLevel(t_screen, s_screen, uv + hoff, 0.0).rgb
-                      + textureSampleLevel(t_screen, s_screen, uv - hoff, 0.0).rgb);
+                      + textureSampleLevel(t_screen, s_screen, uv - hoff, 0.0).rgb) * u.tone.z;
         col = mix(col, hb, hamt);
     }
 
@@ -663,6 +727,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // (Phosphor persistence + the raster field sweep are now integrated over real
     // frame history in the accum pass, so there's no per-fragment temporal fake here.)
 
+    // The scatter taps below read the phosphor plane directly, which is still in SIGNAL
+    // units — but `col` has been through the tube drive and the CRT transfer curve by now
+    // and is on a different scale entirely (roughly 2x). Mixing the two as-is quietly broke
+    // the conservation: the fraction taken off `col` was worth about twice the fraction
+    // added back from the taps, so every tube lost a few percent of its brightness in
+    // proportion to how much it scattered. Put the taps through the same transfer first.
+    let emit = u.tone.z;
+    let xfer = vec3<f32>(u.phys.x);
+
     // Halation: light scattering laterally inside the glass, biased warm/red
     // because the red phosphor persists longest. Sampled around the parallax uv.
     let halo = u.optics.w;
@@ -677,25 +750,43 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         glow = glow + textureSample(t_screen, s_screen, uv - px).rgb;
         glow = glow + textureSample(t_screen, s_screen, uv + vec2<f32>(px.x, -px.y)).rgb;
         glow = glow + textureSample(t_screen, s_screen, uv + vec2<f32>(-px.x, px.y)).rgb;
-        glow = glow / 8.0;
-        if (u.mono.w > 0.5) {
-            // mono: the glow is the phosphor's own colour, not the warm-red halation.
-            col = col + dot(glow, vec3<f32>(0.299, 0.587, 0.114)) * u.mono.rgb * halo;
-        } else {
-            col = col + glow * vec3<f32>(1.0, 0.6, 0.45) * halo;
-        }
+        glow = pow(max(glow / 8.0, vec3<f32>(0.0)) * emit, xfer);
+        // Scattering REDISTRIBUTES light: whatever bounces off the phosphor and comes back
+        // out somewhere else left the spot it started from. So the scattered fraction comes
+        // OFF the direct term before the blurred copy is added back, and the two use the
+        // same fraction — that is what makes this a glow instead of a brightness offset.
+        // Added on its own, as it was before, a flat white field simply got uniformly
+        // brighter, which is a gain; only a pixel's difference from its surround is glow.
+        // Conserving it means a flat field passes through untouched while an isolated
+        // highlight dims a shade as it blooms, which is what one does on real glass.
+        let hshare = halo * u.beam2.w;
+        var htint = vec3<f32>(1.0, 0.6, 0.45); // warm: leaded panel + the longest-lit phosphor
+        if (u.mono.w > 0.5) { htint = u.mono.rgb; } // mono glows its own single colour
+        // Normalise the tint to unit luminance so the warm bias only shifts the glow's
+        // colour and does not smuggle in extra light (the old tint had a luma of 0.70, so
+        // adding it raised red 16% on every flat field — a cast, not a scatter).
+        htint = htint / max(dot(htint, vec3<f32>(0.299, 0.587, 0.114)), 1e-3);
+        let gl = select(glow, vec3<f32>(dot(glow, vec3<f32>(0.299, 0.587, 0.114))), u.mono.w > 0.5);
+        col = col * (1.0 - hshare) + gl * htint * hshare;
     }
 
     // Diffusion — a SECOND, wider bloom scale, physically distinct from halation.
     // Halation (above) is light reflecting off the phosphor back through the glass:
     // tight and warm/red. Diffusion is light SCATTERING inside the thick imperfect
     // faceplate — a broad, soft, near-neutral haze that lifts the whole lit region and
-    // gives bright CRT content its dense, "wet" glow. Two rings (~5px + ~10px) so the
-    // falloff is smooth rather than a single hard radius.
+    // gives bright CRT content its dense, "wet" glow. Two rings so the falloff is smooth
+    // rather than a single hard radius, and the ring weights matter as much as the radii:
+    // scattering in glass has a long-tailed PSF — most of the light stays close to where it
+    // was emitted and a thin tail reaches far. Light launched into a ~10 mm panel past the
+    // critical angle walks ~2·t·tan(41°) ≈ 17 mm before it escapes, which is a good 7% of a
+    // 240 mm face, so the outer ring goes wider than it used to; but that far excursion is
+    // the tail, not the bulk, so it carries proportionally much less weight. Giving the wide
+    // ring a third of the energy (as an even split did) is what turns a haze into a wash:
+    // it drags neighbouring bright content across narrow dark features and desaturates.
     let diff_amt = u.fx.y;
     if (diff_amt > 0.0) {
         let r1 = vec2<f32>(5.0, 5.0) / res;
-        let r2 = vec2<f32>(10.0, 10.0) / res;
+        let r2 = vec2<f32>(14.0, 14.0) / res;
         var d = textureSample(t_screen, s_screen, uv + vec2<f32>(r1.x, 0.0)).rgb
               + textureSample(t_screen, s_screen, uv - vec2<f32>(r1.x, 0.0)).rgb
               + textureSample(t_screen, s_screen, uv + vec2<f32>(0.0, r1.y)).rgb
@@ -712,12 +803,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                + textureSample(t_screen, s_screen, uv - r2).rgb
                + textureSample(t_screen, s_screen, uv + vec2<f32>(r2.x, -r2.y)).rgb
                + textureSample(t_screen, s_screen, uv + vec2<f32>(-r2.x, r2.y)).rgb;
-        let diff = (d + d2 * 0.5) / 12.0; // wide normalized glow
-        if (u.mono.w > 0.5) {
-            col = col + dot(diff, vec3<f32>(0.299, 0.587, 0.114)) * u.mono.rgb * diff_amt;
-        } else {
-            col = col + diff * vec3<f32>(1.0, 0.95, 0.9) * diff_amt; // near-neutral, faintly warm
-        }
+        // Long-tailed PSF: tight core, faint wide skirt — and through the same transfer as
+        // the halation taps, so the fraction added back matches the fraction taken off.
+        let diff = pow(max((d + d2 * 0.30) / 10.4, vec3<f32>(0.0)) * emit, xfer);
+        // Same conservation as halation: light scattered sideways inside the panel is light
+        // that did not come straight out, so the same fraction comes off the direct term as
+        // goes back on, and the tint is luma-normalised so it only recolours the haze.
+        let dshare = diff_amt * u.beam2.w;
+        var dtint = vec3<f32>(1.0, 0.95, 0.9); // near-neutral, faintly warm
+        if (u.mono.w > 0.5) { dtint = u.mono.rgb; }
+        dtint = dtint / max(dot(dtint, vec3<f32>(0.299, 0.587, 0.114)), 1e-3);
+        let dl = select(diff, vec3<f32>(dot(diff, vec3<f32>(0.299, 0.587, 0.114))), u.mono.w > 0.5);
+        col = col * (1.0 - dshare) + dl * dtint * dshare;
     }
 
     // Phosphor mask. Pitch is in *final* output pixels, scaled up by the render
@@ -750,7 +847,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Secondary internal reflection ("ghost"): a faint, offset second image from
     // the light that bounces off the inner glass surface before reaching the eye —
     // the double exposure you catch on a thick, glossy CRT faceplate.
-    var gcol = textureSampleLevel(t_screen, s_screen, uv + vec2<f32>(0.011, -0.008), 0.0).rgb;
+    // (Driven and transferred like the scatter taps above — a raw sample here would make the
+    // ghost about half as bright as the second reflection it stands in for.)
+    var gcol = pow(max(textureSampleLevel(t_screen, s_screen, uv + vec2<f32>(0.011, -0.008), 0.0).rgb,
+                       vec3<f32>(0.0)) * emit, xfer);
     if (u.mono.w > 0.5) { gcol = dot(gcol, vec3<f32>(0.299, 0.587, 0.114)) * u.mono.rgb; }
     col = col + gcol * u.look.w;
 
@@ -825,6 +925,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let fres = 0.043 + 0.957 * pow(1.0 - ndotv, 5.0);
     let refl = reflect(-v, n);
     col = col + room(refl) * fres * (0.35 + 1.1 * u.glass.y);
+    // Ambient wash: the other half of "a CRT in a lit room isn't black". The specular term
+    // above is the front surface acting as a 4% mirror — sharp, and it slides as you orbit.
+    // This is the DIFFUSE half: room light that gets through the panel, scatters off the
+    // phosphor powder and the mask behind it, and comes back out. It crosses the tinted
+    // faceplate twice against the picture's once, which is the entire reason tubes were
+    // built with 40–60% transmission glass in the first place — halving transmission costs
+    // you half your brightness but quarters the ambient wash, so contrast doubles. Being
+    // diffuse it lifts the black floor evenly instead of mirroring anything, so blacks go
+    // to a dark grey and stay there whatever angle you view from: the thing that makes a
+    // real dark screen read as glass over a grey powder rather than as a hole.
+    // Diffuse, so it samples the room broadly (around the normal) rather than in the mirror
+    // direction, and it falls off at grazing by (1-F)² — the same light has to get in
+    // through the front surface and back out through it, and both get harder as F rises.
+    let amb_room = (room(n) * 2.0 + room(refl)) / 3.0;
+    col = col + amb_room * u.beam2.z * (1.0 - fres) * (1.0 - fres);
     // Tight specular glare from the ceiling softbox — a hot spot sliding across the
     // curved glass as you move; the single most CRT-reading highlight.
     let light_dir = normalize(vec3<f32>(-0.35, 0.55, 0.95));

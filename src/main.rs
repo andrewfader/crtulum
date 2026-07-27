@@ -500,13 +500,13 @@ struct Uniforms {
     params: [f32; 4], // src_w, src_h, time, render_scale
     optics: [f32; 4], // mask_type, mask_strength, scanline, halation
     glass: [f32; 4],  // parallax, reflection, vignette, mask_pitch
-    tone: [f32; 4],   // hdr flag, peak/white-point, beam_drive, ntsc_strength
+    tone: [f32; 4],   // hdr flag, peak/white-point, tube drive (exposure), ntsc_strength
     scan: [f32; 4],   // beam math: beam_min, beam_max, beam_shape, beam_range
     env: [f32; 4],    // avg_r, avg_g, avg_b, apl  (screen-as-area-light bounce)
     look: [f32; 4],   // convergence, corner_radius, grain, ghost
     phys: [f32; 4],   // crt_gamma, warmth, glow_bounce, bloom
     temporal: [f32; 4], // dt(sec), persist_mult, interlace, field_parity
-    ptau: [f32; 4],   // per-phosphor decay tau: R, G, B (sec), _ (P22: red lingers, blue snaps off)
+    ptau: [f32; 4],   // per-phosphor decay tau: R, G, B (sec), w=power-law tail exponent
     geom: [f32; 4],   // raster geometry errors: pincushion, trapezoid, corner_pin, purity
     mono: [f32; 4],   // monochrome phosphor tint (rgb) + flag (w>0.5 = single-gun tube)
     cmat0: [f32; 4],  // CRT-phosphor → sRGB colour matrix, row 0 (real gamut + white pt)
@@ -515,6 +515,8 @@ struct Uniforms {
     pwr: [f32; 4],    // power state: warmup(0..1), collapse(0..1), degauss(0..1), _
     focus: [f32; 4],  // x=edge defocus (deflection spot growth), y=overscan (per side), z=roll rate, w=roll amp
     fx: [f32; 4],     // x=svm (scan-velocity crispen), y=diffusion (wide glass glow), z=subpixel mask flag, w=bfi screen mult
+    beam2: [f32; 4],  // x=spot profile exponent p, y=1/(2*gamma(1+1/p)) profile normalizer,
+                      // z=ambient diffuse wash through the tinted faceplate, w=scatter redistribution
 }
 
 // ---------------------------------------------------------------------------
@@ -576,9 +578,23 @@ struct Preset {
     // guest/Megatron beam focus [beam_min, beam_max, beam_shape, beam_range] — this
     // is the tube's sharpness / TVL: a tight beam = a sharp PVM, a wide one = fuzzy.
     beam: [f32; 4],
+    // Spot *profile* exponent for the generalized gaussian exp(-|d/w|^spot). The spot is
+    // the gun's imaged cathode crossover convolved with the optics' aberration blur, so a
+    // well-focused tube reads as a plateau with a steep falloff to the dark gap while a
+    // soft/defocused one collapses to a plain bell (spot = 2). Higher = flatter-topped.
+    spot: f32,
+    // Faceplate light transmission. Entertainment CRT panels are tinted glass to lift
+    // contrast: "clear" ≥75%, "gray" 60–75%, "tinted" ≤60%, and high-contrast tubes run
+    // ~40%. It matters twice over: emitted phosphor light crosses the panel ONCE, while
+    // room light reflected off the phosphor crosses it TWICE — so the ambient wash that
+    // greys out a CRT's blacks in a lit room goes as T², which is why tinting works.
+    glass_t: f32,
     // phosphor white point warmth (0 = cool/bright PC monitor, 1 = warm/aged TV).
     warmth: f32,
-    // global persistence multiplier (1.0 = colour TV; long-persistence mono ~3+).
+    // Phosphor persistence. A colour tube has three different phosphors, so this is a
+    // multiplier on the measured per-primary P22 decay constants (1.0 = stock P22). A
+    // single-gun mono tube has exactly ONE phosphor, so there is nothing to scale — this
+    // is its absolute decay time in seconds and all three stored channels use it.
     persist: f32,
     // input signal path: 0=RGB/component (clean), 1=S-video (Y/C split), 2=composite.
     signal: u8,
@@ -595,6 +611,29 @@ struct Preset {
 const PHOS_SMPTE_C: [[f32; 2]; 3] = [[0.630, 0.340], [0.310, 0.595], [0.155, 0.070]];
 const PHOS_P22: [[f32; 2]; 3] = [[0.625, 0.340], [0.280, 0.605], [0.155, 0.070]];
 const PHOS_SRGB: [[f32; 2]; 3] = [[0.640, 0.330], [0.300, 0.600], [0.150, 0.060]];
+
+// Γ(x) for x in (0, 3] — Lanczos approximation (g=7). Needed only to normalise the
+// generalized-gaussian beam profile exp(-|d/w|^p), whose area is 2·w·Γ(1+1/p).
+fn gamma_fn(x: f32) -> f32 {
+    const C: [f64; 9] = [
+        0.999_999_999_999_809_93,
+        676.520_368_121_885_1,
+        -1259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    let x = x as f64 - 1.0;
+    let mut a = C[0];
+    let t = x + 7.5;
+    for (i, c) in C.iter().enumerate().skip(1) {
+        a += c / (x + i as f64);
+    }
+    ((2.0 * std::f64::consts::PI).sqrt() * t.powf(x + 0.5) * (-t).exp() * a) as f32
+}
 
 // Build the 3x3 that maps CRT-phosphor drive RGB (linear) → linear sRGB (D65 display),
 // baking in the tube's real gamut AND white point (so a 9300K set reads blue). Rows
@@ -664,6 +703,8 @@ const TRINITRON: Preset = Preset {
     // studio-grade geometry: nearly straight, minimal impurity.
     geom: [0.008, 0.0, 0.010, 0.03],
     beam: [0.34, 0.74, 0.75, 1.0],
+    spot: 3.0,      // well-focused consumer Sony: flat-topped scanline
+    glass_t: 0.50,  // tinted consumer panel
     warmth: 0.5,
     persist: 1.0,
     phos: 0,
@@ -705,6 +746,8 @@ const PANASONIC: Preset = Preset {
     // consumer geometry: visible pincushion + a little keystone and purity drift.
     geom: [0.055, 0.022, 0.060, 0.10],
     beam: [0.36, 0.78, 0.75, 1.0],
+    spot: 2.4,      // ordinary consumer focus: nearly a plain bell
+    glass_t: 0.52,
     warmth: 0.5,
     persist: 1.0,
     phos: 0,
@@ -742,6 +785,8 @@ const SLOTMASK: Preset = Preset {
     corner_radius: 0.10,
     geom: [0.040, -0.015, 0.040, 0.08],
     beam: [0.35, 0.76, 0.75, 1.0],
+    spot: 2.4,
+    glass_t: 0.52,
     warmth: 0.5,
     persist: 1.0,
     phos: 0,
@@ -781,6 +826,8 @@ const RCA: Preset = Preset {
     corner_radius: 0.13,
     geom: [0.060, 0.025, 0.070, 0.14], // consumer bow + purity drift
     beam: [0.48, 0.98, 0.65, 1.0], // WIDE, unfocused beam = fuzzy / low TVL
+    spot: 2.0,      // soft gun: aberration blur dominates → pure gaussian bell
+    glass_t: 0.58,  // older, lighter-tinted console panel
     warmth: 0.72, // warm, aged/yellowed white point
     persist: 1.0,
     phos: 0,
@@ -820,6 +867,8 @@ const PVM: Preset = Preset {
     corner_radius: 0.04, // squarish pro face
     geom: [0.006, 0.0, 0.008, 0.02], // near-perfect
     beam: [0.26, 0.56, 0.85, 1.0], // TIGHT beam = sharp / high TVL
+    spot: 4.0,      // razor focus: a real plateau with steep walls
+    glass_t: 0.44,  // high-contrast tinted + AR-coated broadcast panel
     warmth: 0.34, // calibrated, slightly warm of D65
     persist: 1.0,
     phos: 0,
@@ -858,6 +907,8 @@ const ARCADE: Preset = Preset {
     corner_radius: 0.11,
     geom: [0.050, 0.020, 0.050, 0.10],
     beam: [0.40, 0.90, 0.70, 1.0], // wide, strong scanline gaps
+    spot: 2.6,
+    glass_t: 0.62,  // bare consumer-grade tube, only lightly tinted
     warmth: 0.50,
     persist: 1.0,
     phos: 0,
@@ -896,6 +947,8 @@ const VGA: Preset = Preset {
     corner_radius: 0.07,
     geom: [0.018, 0.005, 0.020, 0.04], // good geometry
     beam: [0.28, 0.60, 0.85, 1.0], // sharp
+    spot: 3.6,
+    glass_t: 0.60,
     warmth: 0.15, // cool / bright
     persist: 1.0,
     phos: 2,
@@ -934,6 +987,8 @@ const DIAMONDTRON: Preset = Preset {
     corner_radius: 0.03,
     geom: [0.010, 0.0, 0.010, 0.02], // flat, well-corrected
     beam: [0.26, 0.55, 0.88, 1.0], // very sharp / bright
+    spot: 4.2,      // the flattest-topped, best-focused gun here
+    glass_t: 0.50,  // AR-coated, tinted for contrast
     warmth: 0.10, // cool superbright
     persist: 1.0,
     phos: 2,
@@ -973,8 +1028,10 @@ const GREEN: Preset = Preset {
     corner_radius: 0.08,
     geom: [0.028, 0.0, 0.030, 0.0], // no purity error on a mono tube
     beam: [0.30, 0.62, 0.85, 1.0],  // fairly tight for readable text
+    spot: 3.2,
+    glass_t: 0.40,                  // terminals wore a dark contrast filter over the face
     warmth: 0.0,                    // colour comes from `mono`, not the warm tint
-    persist: 3.6,                   // long P39-style green afterglow
+    persist: 0.050,                 // P39: EIA class L, ~50 ms on an IBM 5151
     phos: 3,
     white_xy: [0.3127, 0.329],
     signal: 0,
@@ -1011,8 +1068,10 @@ const AMBER: Preset = Preset {
     corner_radius: 0.08,
     geom: [0.028, 0.0, 0.030, 0.0],
     beam: [0.30, 0.62, 0.85, 1.0],
+    spot: 3.2,
+    glass_t: 0.40,
     warmth: 0.0,
-    persist: 2.6,                  // amber P3: medium-long
+    persist: 0.013,                // P3 amber: EIA class M, ~13 ms to 10%
     phos: 3,
     white_xy: [0.3127, 0.329],
     signal: 0,
@@ -1573,15 +1632,23 @@ fn write_uniforms(
         ],
         // HDR path: on a scRGB swapchain, emit linear light with highlights >1.0
         // (peak/drive push the beam above white). On SDR, tonemap to `peak` white
-        // point. `beam_drive` is the extra gain applied to scanline-beam cores.
-        // tone.w = input signal path (0=RGB/component clean, 1=S-video, 2=composite).
+        // point. tone.w = input signal path (0=RGB/component clean, 1=S-video, 2=composite).
         // tone.y carries the exposure trim on the HDR path (scales SDR-white → panel
         // reference white) and the tonemap white-point × exposure on the SDR path, so
         // the [ and ] keys tune brightness identically in both.
+        //
+        // `beam_drive` (tone.z) is now the tube's overall drive — a straight exposure on the
+        // reconstructed beam — because the reconstruction is energy-normalised and no longer
+        // gains up bright rows by widening them. It went up (1.7→2.0 SDR) purely to put the
+        // picture back where it was: the old unnormalised beam sum was worth ~1.8× on a mid
+        // grey and carried an extra ~1.26 gamma with it, and both of those had to come out.
+        // Because that hidden gain scaled with beam WIDTH, it also flattered the fuzzy tubes
+        // most; with it gone the ten tubes sit much closer together in mean brightness, as
+        // they should — a wide beam spreads the same light, it does not make more.
         tone: if hdr {
-            [1.0, exposure, 1.9, preset.signal as f32]
+            [1.0, exposure, 2.2, preset.signal as f32]
         } else {
-            [0.0, 1.08 * exposure, 1.7, preset.signal as f32] // ACES exposure (was Reinhard white pt)
+            [0.0, 1.08 * exposure, 2.0, preset.signal as f32] // ACES exposure (was Reinhard white pt)
         },
         // Guest/Megatron beam math (per-tube focus/TVL): per-channel beam half-width
         // runs from beam_min (dark → tight) to beam_max (bright → wide); beam_shape
@@ -1599,15 +1666,43 @@ fn write_uniforms(
         // Phosphor persistence + interlace: dt drives per-frame decay; temporal.y is
         // the per-tube persistence multiplier; temporal.z = interlace amount, .w =
         // field parity (alternate fields excite alternate lines → 480i twitter).
-        temporal: [dt.max(0.0), preset.persist, interlace, field],
-        // Per-phosphor decay constants (seconds). Grounded in measured P22 decay-to-10%
-        // times (ePanorama/labguysworld phosphor data): red Y2O2S:Eu lingers a few
-        // hundred µs to ~1 ms, while green ZnS:Cu and blue ZnS:Ag both snap off in
-        // <100 µs (green a hair slower than blue) — so red ≈ 5× the blue/green tail.
-        // The absolute scale is exaggerated ~50× so the trail is visible at 60 Hz on an
-        // LCD, but the R:G:B ratio (≈5 : 1.3 : 1) now matches the real phosphors: bright
-        // motion trails warm/reddish, blue/green edges stay crisp together.
-        ptau: [0.055, 0.014, 0.011, 0.0],
+        // A mono tube's `persist` is already an absolute tau, so it must not be applied
+        // again as a multiplier on top of the flat ptau built below.
+        temporal: [
+            dt.max(0.0),
+            if preset.mono[3] > 0.5 { 1.0 } else { preset.persist },
+            interlace,
+            field,
+        ],
+        // Per-phosphor decay constants (seconds) + the tail exponent in .w.
+        //
+        // Nichia's EIA-registered CRT phosphor table classes the three P22 components
+        // separately: P22B ZnS:Ag,Cl = MS, P22G ZnS:Cu,Al = MS, but P22R Y2O2S:Eu = M —
+        // red sits a whole persistence class above the other two, because Eu³⁺ emits on a
+        // forbidden f–f transition with a ~1 ms lifetime while the sulfides recombine in
+        // tens of µs. ePanorama agrees: blue and green well under 100 µs to 10%, red a few
+        // hundred µs up to ~1 ms. So the real ratio is ~20 : 1.5 : 1, not the ~5 : 1.3 : 1
+        // used before, which had red only a little ahead of a pack it is really a decade
+        // clear of. Green keeps a modest lead over blue: ZnS:Cu,Al is the glow-in-the-dark
+        // sulfide and carries a long power-law tail, while ZnS:Ag,Cl has "no emission at
+        // long times". Absolute scale stays exaggerated ~50× so the trail survives being
+        // resampled to 60 Hz on a hold-type LCD; only the ratio is physical.
+        //
+        // A single-gun mono tube has ONE phosphor: give all three stored channels the same
+        // tau, or the luma sum below decays at three different rates and a green terminal
+        // trails red. Real numbers: P39 Zn2SiO4:Mn,As is class L (~50 ms on an IBM 5151),
+        // P3 is class M — the amber terminals genuinely were the shorter-persistence tube.
+        //
+        // .w = the decay TAIL exponent. Sulfide phosphors do not decay exponentially: the
+        // measured curve is an abrupt near-exponential drop followed by a slow power-law
+        // tail, I = a/(t+t0)^b with b ≈ 0.2–2 (and the hyperbolic form I₀(1+at)^-n is what
+        // gives these phosphors their "pronounced afterglow"). A pure exponential throws
+        // that tail away, which is exactly the part the eye reads as afterglow.
+        ptau: if preset.mono[3] > 0.5 {
+            [preset.persist, preset.persist, preset.persist, 1.4]
+        } else {
+            [0.055, 0.0042, 0.0028, 1.4]
+        },
         // Raster deflection geometry errors, per tube (see Preset.geom).
         geom: preset.geom,
         // Monochrome phosphor tint + flag (single-gun green/amber terminals).
@@ -1642,12 +1737,14 @@ fn write_uniforms(
                 }
             };
             // Rolling refresh band (focus.z = roll rate Hz, focus.w = amplitude): the
-            // vertical "hum bar" you see on a CRT is the BEAT between the viewing/capture
-            // rate and the tube's 59.94 Hz field sweep — a soft freshly-scanned bright
-            // band rolling down the picture. Dead-on by eye it's invisible; here (a
-            // "captured" CRT on an LCD) a gentle ~0.45 Hz beat reads as a living tube.
+            // "hum bar" is ripple from the mains leaking into the video/HV rails, so it
+            // beats the tube's field rate against full-wave-rectified mains: |120 −
+            // 2×59.94| = 0.12 Hz, i.e. one slow crawl down the screen every ~8 s. That
+            // creep is the whole tell — the old 0.45 Hz was nearly 4× too fast and read as
+            // a deliberate animation rather than a tube that is quietly out of lock. A
+            // 50 Hz mono terminal beats |100 − 2×50| ≈ 0, so it barely drifts at all.
             // 480i doubles the beat feel via field twitter (handled in the accum pass).
-            let roll_rate = if preset.mono[3] > 0.5 { 0.30 } else { 0.45 };
+            let roll_rate = if preset.mono[3] > 0.5 { 0.04 } else { 0.12 };
             [defocus, overscan, roll_rate, 0.05]
         },
         // fx: SVM + diffusion (both derived from the tube's character), subpixel-mask
@@ -1672,6 +1769,39 @@ fn write_uniforms(
             let diffusion = preset.halation * 0.55;
             let subpix = if subpixel { 1.0 } else { 0.0 };
             [svm, diffusion, subpix, bfi_mul]
+        },
+        beam2: {
+            // The spot profile is exp(-|d/w|^p). Its area is 2·w·Γ(1+1/p), so pass the
+            // reciprocal and the shader can normalise each row's beam to unit energy with
+            // one multiply. Energy normalisation is the point: light output is LINEAR in
+            // beam current (the ~2.4 CRT gamma comes from the gun's grid transfer curve,
+            // not the phosphor), so widening the spot on a bright row has to redistribute
+            // that row's light, never manufacture more of it.
+            let p = preset.spot.max(1.2);
+            let norm = 1.0 / (2.0 * gamma_fn(1.0 + 1.0 / p));
+            // Ambient wash: room light reflected off the phosphor/mask back out at the
+            // viewer. It crosses the tinted faceplate TWICE (hence T²) and bounces off a
+            // screen whose effective albedo is low — the phosphor itself is a pale powder,
+            // but the black matrix between the stripes swallows most of what lands on it.
+            // Unlike the specular room reflection this is diffuse, so it lifts the black
+            // floor evenly instead of mirroring, and it is the reason a CRT in a lit room
+            // never actually reaches black. Note it scales as T here, not T²: the emitted
+            // picture already loses its own single pass through the tint, and the exposure
+            // downstream normalises that away, so what survives as a tube-to-tube
+            // difference is the ratio T²/T. That ratio is the whole argument for tinting —
+            // halving transmission costs half the brightness but quarters the wash, so you
+            // buy a factor of two in contrast and win it back with more beam current.
+            // Scaled for a dimly-lit room rather than a bright one: this lands the tubes
+            // at ~60–90:1 in-room contrast, which is the right order for a CRT measured
+            // with the lights on (a dark-room measurement gives several hundred to one,
+            // and that is the number datasheets quoted). Turn it up and you get the
+            // daylight-on-the-screen look, at the cost of every saturated colour.
+            let t = preset.glass_t.clamp(0.2, 0.95);
+            let wash = t * 0.09;
+            // Scattering redistributes light rather than adding it, so halation/diffusion
+            // take their share out of the direct term. Kept partial (not the full 1.0) —
+            // some of what scatters forward still reaches the eye inside the same pixel.
+            [p, norm, wash, 0.55]
         },
     };
     queue.write_buffer(&res.ubuf, 0, bytemuck::bytes_of(&uniforms));
@@ -2743,6 +2873,52 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// The beam profile is normalised to unit area with 1/(2·Γ(1+1/p)), so a wrong Γ would
+    /// silently re-expose the whole picture by a few percent per preset with nothing to see
+    /// but "the tubes look a bit off". Pin it against known values, and — the property that
+    /// actually matters — check that the resulting normaliser really does make a flat field
+    /// reconstruct to exactly itself for every tube's spot exponent and beam width.
+    #[test]
+    fn beam_profile_normaliser_conserves_energy() {
+        for (x, want) in [(1.0, 1.0), (1.5, 0.886_227), (2.0, 1.0), (1.25, 0.906_402)] {
+            let got = gamma_fn(x);
+            assert!((got - want).abs() < 1e-4, "gamma_fn({x}) = {got}, want {want}");
+        }
+
+        for preset in ALL_PRESETS {
+            let p = preset.spot;
+            let norm = 1.0 / (2.0 * gamma_fn(1.0 + 1.0 / p));
+            // Signal levels from black to full white; each must come back at unit gain.
+            for c in [0.05f32, 0.25, 0.5, 0.75, 1.0] {
+                let w = preset.beam[0] + (preset.beam[1] - preset.beam[0]) * c.powf(preset.beam[2]);
+                // Average the reconstruction across one row's worth of subpixel phases:
+                // the sum oscillates (that oscillation IS the scanline), its mean is the
+                // settled brightness, and the mean is what has to equal the signal.
+                let n = 64;
+                let sum: f32 = (0..n)
+                    .map(|i| {
+                        let d0 = i as f32 / n as f32;
+                        // ±(beam_range+1) rows, matching scan_reconstruct's loop.
+                        (-(preset.beam[3] as i32)..=preset.beam[3] as i32 + 1)
+                            .map(|k| {
+                                let d = (d0 - k as f32).abs();
+                                c * (-(d / w).powf(p)).exp() * (norm / w)
+                            })
+                            .sum::<f32>()
+                    })
+                    .sum::<f32>()
+                    / n as f32;
+                assert!(
+                    (sum / c - 1.0).abs() < 0.01,
+                    "{}: flat field {c} reconstructed at {:.4}x (spot {p}, width {w:.3}) — the \
+                     beam is not energy-conserving, so brightness depends on beam width",
+                    preset.name,
+                    sum / c,
+                );
+            }
+        }
+    }
+
     // Headless device, or None on a machine with no usable GPU adapter (CI
     // software-render runners): the caller skips rather than fails.
     fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -2876,8 +3052,9 @@ mod tests {
     }
 
     /// The waterfall melts: fast-moving bright content leaves a *decaying phosphor
-    /// trail* on the tube, and that trail is red-dominant — because red P22
-    /// phosphor lingers ~5× longer than green/blue (see the decay constants in
+    /// trail* on the tube, and that trail is red-dominant — because the red P22
+    /// phosphor sits a whole EIA persistence class above green and blue and lingers
+    /// well over an order of magnitude longer (see the decay constants in
     /// `write_uniforms`). We prove it by rendering the same final field two ways:
     /// once fed as a moving band (real motion history) and once fed as a still at
     /// the final position (phosphor converged, no history). The difference is the
