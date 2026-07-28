@@ -275,10 +275,61 @@ fn geometry_warp(uv: vec2<f32>) -> vec2<f32> {
 const PI: f32 = 3.14159265;
 const TAU: f32 = 6.28318530;
 // Colour-subcarrier cycles per *content* pixel (on a virtual ~320-wide line — see the
-// `step` remap in ntsc()/svideo(), not per captured texel). 0.25 = 4 samples/cycle, which
-// gives clean quadrature I/Q recovery (cos:1,0,-1,0 / sin:0,1,0,-1 at integer pixels);
-// values near the pixel-Nyquist collapse the sin() channel and rotate hues, so keep it.
-const NTSC_FSC: f32 = 0.25;
+// `step` remap in ntsc()/svideo(), not per captured texel). This is a MEASURED ratio, not
+// a convenience: 320 active pixels across NTSC's 52.6 µs active line is a 6.0837 MHz
+// content-pixel rate, so f_sc = 3.579545 / 6.0837 = 0.58839 cycles per content pixel —
+// a 1.70-px subcarrier period. That number decides which picture detail turns into false
+// colour, so it cannot be chosen for arithmetic convenience: at 0.25 (4 samples/cycle,
+// what this used to be) the subcarrier sits at 1.52 MHz, cross-colour fires on 3.2–5.3-px
+// detail instead of 1.25–2.7-px, and ordinary 4-px-period pixel art — 2-px text stems,
+// wide dither — demodulates to full-strength false chroma that a real set leaves grey.
+const NTSC_FSC: f32 = 0.58839;
+// Tap spacing for the composite decode, in content pixels. 0.58839 cyc/px cannot be
+// demodulated on the integer content grid (0.5 cyc/px Nyquist), so the decode is
+// oversampled 2×: 0.29419 cyc/sample, 3.40 samples/cycle. That also puts the demodulator's
+// 2·f_sc product term (1.1768 cyc/px) at a fold-down of 0.8232 cyc/px, which the chroma
+// low-pass rejects by ~35 decades — so the oversampling is exactly enough, not arbitrary.
+//
+// KNOWN SIMPLIFICATION: the half-pixel taps come from the hardware linear sampler, so the
+// source is reconstructed with a triangle kernel. A console DAC is closer to a zero-order
+// hold, whose images carry sinc(0.588) = 52% of the input at f_sc; the triangle kernel
+// carries sinc²(0.583) = 28%. Both are real — stair-step source detail near 0.412 cyc/px
+// (a 2.43-px period) genuinely has subcarrier-band energy and genuinely cross-colours on a
+// real set — but this understates that path by ~2×. It errs toward too little false colour,
+// which is the safe direction. Fixing it properly means reconstructing each half-pixel tap
+// with a 4-tap cubic (4× the fetches) instead of trusting the sampler.
+const NTSC_STEP: f32 = 0.5;
+// Half-window, content pixels. 9 px is 2.47σ of the widest (Q) chroma kernel below; the
+// truncated tail carries 4.8% weight, and the sums are normalised so it costs gain, not
+// colour. 37 taps.
+const NTSC_TAPS: i32 = 18;
+
+// --- NTSC bandwidths, all in content pixels as gaussian σ ---
+// σ = sqrt(2 ln2)·6.0837 / (2π·f_MHz) — the -3 dB point of exp(-k²/2σ²) at 6.0837 MHz.
+//
+// Chroma is the CASCADE of two real filters, which is the part that is easy to get wrong.
+// The NTSC *encoder* transmits I at ~1.3 MHz and Q at only ~0.4 MHz, so green–magenta
+// detail leaves the studio mushier than orange–cyan. But a consumer RCA/Panasonic-class
+// receiver does not do wideband-I demodulation — that was high-end-set territory, because
+// it needs the asymmetric-sideband correction. It demodulates equiband at about 0.5 MHz on
+// both axes. Cascading the two (σ² adds) is what a consumer set actually delivers: the
+// encoder's 3.25:1 asymmetry survives, but compressed to 1.49:1, because the receiver's own
+// 0.5 MHz limit dominates the I axis and barely touches the already-narrower Q axis.
+const NTSC_SIG_I: f32 = 2.4429; // enc 1.3 MHz ⊗ rx 0.5 MHz → 0.467 MHz
+const NTSC_SIG_Q: f32 = 3.6498; // enc 0.4 MHz ⊗ rx 0.5 MHz → 0.312 MHz
+// Luma: the set's video amplifier, ~3.0 MHz for a mid-range consumer set (cheap RF-fed
+// sets run nearer 2.5). It is NOT narrowed to reject the subcarrier — that is the trap's
+// job, below. Making one gaussian do both jobs is what forced the old 0.88 MHz luma path,
+// i.e. most of the composite softness was a side effect of the f_sc error, not a tube.
+const NTSC_SIG_Y: f32 = 0.3800;
+// 3.58 MHz subcarrier trap: a series LC of Q ≈ 10 → 0.358 MHz bandwidth → σ 3.185 px, and
+// consumer traps are specified at 20–26 dB rejection. Take the loose end (20 dB = 0.90) for
+// an aged consumer set. The 3.0 MHz luma path already attenuates f_sc to 37.3%, so the trap
+// leaves 3.7% of a flat-field subcarrier — correctly subtle. The dot crawl you SEE comes
+// out of this for free and for the right reason: at a colour edge the trap's wide-kernel
+// estimate of the local subcarrier is wrong, so the cancellation fails exactly there.
+const NTSC_SIG_TRAP: f32 = 3.1848;
+const NTSC_TRAP: f32 = 0.90;
 
 fn rgb2yiq(c: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(
@@ -294,11 +345,22 @@ fn yiq2rgb(c: vec3<f32>) -> vec3<f32> {
         c.x - 1.106 * c.y + 1.703 * c.z,
     );
 }
-// Subcarrier phase at source column `px` on `line`. The +PI*line term flips the
-// subcarrier 180° every scanline (real NTSC line timing) and the time term makes the
-// residual crawl, so the dot pattern shimmers up the screen like a real set.
+// Subcarrier phase at source column `px` on `line`. Both offsets are NTSC line timing,
+// not free parameters. f_sc is 227.5 cycles per line, so the half cycle flips the phase
+// 180° every scanline (+PI*line). Over a field that is 227.5 × 262.5 = 59718.75 cycles —
+// a 0.75-cycle remainder, so the phase steps +270° per field and closes on itself after
+// four, which is the NTSC four-field colour sequence. Quantising to the 59.94 Hz field
+// index is what makes the residual a *crawl*: the pattern alternates at field rate and the
+// phosphor integrator averages most of it away, leaving the low-contrast creep a real set
+// shows. Drifting the phase on wall-clock time instead (this was `t * 6.0`, a 0.955 Hz
+// rotation) sweeps the hue of every cross-colour artifact through the wheel once a second,
+// which no set does — that reads as colour morphing rather than as an artifact.
 fn subcarrier(px: f32, line: f32, t: f32) -> f32 {
-    return TAU * NTSC_FSC * px + PI * line + t * 6.0;
+    // mod 4 is free: four fields is 3.0 whole cycles, so it wraps exactly. It also keeps the
+    // argument small — an unwrapped field index passes 10⁵ within half an hour, where f32
+    // cos/sin has lost the fractional radians the phase is made of.
+    let field = floor(t * 59.94) % 4.0;
+    return TAU * NTSC_FSC * px + PI * line + TAU * 0.75 * field;
 }
 
 // Encode RGB→composite along the scanline, then decode. Band-limited luma low-pass +
@@ -308,53 +370,63 @@ fn subcarrier(px: f32, line: f32, t: f32) -> f32 {
 //
 // `step` remaps the whole decode onto a virtual ~320-wide content line, so the bandwidths
 // and subcarrier are fixed in cycles-per-*line* — they track the source pixel grid no
-// matter how upscaled the captured frame is. This is what makes Mega Drive / Sonic dither
-// read like a real console: the checkerboard sits at the content pixel-Nyquist and the
-// luma low-pass averages it into a flat translucent tone. Without the remap, an integer-
-// scaled capture (e.g. 1280-wide RetroArch) makes each content pixel several texels, the
-// fixed-texel low-pass can't reach across the checkerboard, and the dither survives as a
-// raw grid. At native capture step→1 and this is identical to the original decode.
+// matter how upscaled the captured frame is. Without the remap, an integer-scaled capture
+// (e.g. 1280-wide RetroArch) makes each content pixel several texels, the fixed-texel
+// filters can't reach across a checkerboard, and everything below is mistuned by the
+// capture scale. At native capture step→1.
+//
+// That remap is also what makes Mega Drive / Sonic dither read like a real console — but by
+// the right mechanism, now that f_sc is where it belongs. A 1-px checkerboard sits at the
+// content Nyquist, 3.042 MHz, which is 0.54 MHz off the 3.58 MHz subcarrier: the 3.0 MHz
+// luma path keeps 49% of it, and 40% of it demodulates straight into chroma. So the dither
+// half-blends AND shimmers coloured, which is what a composite set does with it. The old
+// decode claimed a cleaner result — the checkerboard averaged to a flat translucent tone —
+// but only because the luma path had been narrowed to 0.88 MHz to reject a subcarrier
+// parked at 1.52 MHz. Real sets do not erase dither, they tint it.
 fn ntsc(uv: vec2<f32>, res: vec2<f32>, t: f32) -> vec3<f32> {
     let step = max(res.x / 320.0, 1.0); // texels per virtual-320 content pixel (1 at native capture)
     let cx = uv.x * (res.x / step);     // column on the virtual content line
     let line = floor(uv.y * res.y);
-    var y_acc = 0.0;
-    var i_acc = 0.0;
-    var q_acc = 0.0;
-    var yw = 0.0;
-    var cw = 0.0;
-    var qwsum = 0.0;
-    // ±10 content pixels: wide enough to span the chroma kernel at native and, via `step`,
-    // at any upscale factor for constant cost.
-    for (var k = -10; k <= 10; k = k + 1) {
-        let scx = cx + f32(k);
+    var y_acc = 0.0;  var yw = 0.0;     // luma low-pass
+    var i_acc = 0.0;  var iw_s = 0.0;   // I demod
+    var q_acc = 0.0;  var qw_s = 0.0;   // Q demod
+    var it_acc = 0.0; var qt_acc = 0.0; var tw_s = 0.0; // trap's narrow-band subcarrier estimate
+    // The luma kernel's own projection onto the subcarrier. Σcos(ph)·lw / Σlw is the luma
+    // filter's complex gain at f_sc rotated to the centre tap's phase, so subtracting
+    // trap·(Î·lc + Q̂·ls) removes the subcarrier residual with the right amplitude AND
+    // phase without a second pass over the taps — the alternative, notching each tap before
+    // the low-pass, needs Î/Q̂ before the loop can start.
+    var lc_acc = 0.0; var ls_acc = 0.0;
+    for (var k = -NTSC_TAPS; k <= NTSC_TAPS; k = k + 1) {
+        let d = f32(k) * NTSC_STEP;     // offset in content pixels
+        let scx = cx + d;
         let src = textureSampleLevel(t_screen, s_screen, vec2<f32>(scx * step / res.x, uv.y), 0.0).rgb;
         let yiq = rgb2yiq(src);
         let ph = subcarrier(scx, line, t);
-        let comp = yiq.x + yiq.y * cos(ph) + yiq.z * sin(ph); // composite sample
-        let kk = f32(k * k);
-        // Grounded NTSC bandwidths in content-pixel units. Luma is a plain low-pass wide
-        // enough to stay reasonably sharp but not so wide it rejects the subcarrier — a set
-        // with no comb filter cannot have both, and the ~12% of subcarrier that survives IS
-        // the dot crawl. Chroma is deliberately ANISOTROPIC: NTSC transmits I at ~1.3 MHz
-        // but Q at only ~0.4 MHz, so green–magenta detail is transmitted mushier than
-        // orange–cyan detail no matter how good the receiver is. Real receivers then narrow
-        // I further (most demodulated barely past the ~1 MHz double-sideband region rather
-        // than pay for the asymmetric-sideband correction), which closes the gap without
-        // erasing it — hence a modest 3.0 vs 4.4 σ rather than the full 3:1 of the spec.
-        // Using one shared kernel for both, as before, threw the asymmetry away entirely.
-        let lw = exp(-kk / (2.0 * 1.3 * 1.3)); // luma low-pass (leaves some subcarrier)
-        let iw = exp(-kk / (2.0 * 3.0 * 3.0)); // I band: orange–cyan, the wider axis
-        let qw = exp(-kk / (2.0 * 4.4 * 4.4)); // Q band: green–magenta, narrower → bleeds more
-        y_acc = y_acc + comp * lw;
-        yw = yw + lw;
-        i_acc = i_acc + comp * cos(ph) * iw;
-        q_acc = q_acc + comp * sin(ph) * qw;
-        cw = cw + iw;
-        qwsum = qwsum + qw;
+        let c = cos(ph);
+        let s = sin(ph);
+        let comp = yiq.x + yiq.y * c + yiq.z * s; // composite sample
+        let dd = d * d;
+        let lw = exp(-dd / (2.0 * NTSC_SIG_Y * NTSC_SIG_Y));
+        let iw = exp(-dd / (2.0 * NTSC_SIG_I * NTSC_SIG_I));
+        let qw = exp(-dd / (2.0 * NTSC_SIG_Q * NTSC_SIG_Q));
+        let tw = exp(-dd / (2.0 * NTSC_SIG_TRAP * NTSC_SIG_TRAP));
+        y_acc = y_acc + comp * lw;      yw = yw + lw;
+        i_acc = i_acc + comp * c * iw;  iw_s = iw_s + iw;
+        q_acc = q_acc + comp * s * qw;  qw_s = qw_s + qw;
+        it_acc = it_acc + comp * c * tw;
+        qt_acc = qt_acc + comp * s * tw;
+        tw_s = tw_s + tw;
+        lc_acc = lc_acc + c * lw;
+        ls_acc = ls_acc + s * lw;
     }
-    let yiq = vec3<f32>(y_acc / yw, 2.0 * i_acc / cw, 2.0 * q_acc / qwsum);
-    return max(yiq2rgb(yiq), vec3<f32>(0.0));
+    // ×2 recovers the demodulation loss: comp·cos = I/2 + (terms at 2·f_sc, rejected above).
+    let i_hat = 2.0 * i_acc / iw_s;
+    let q_hat = 2.0 * q_acc / qw_s;
+    let i_trap = 2.0 * it_acc / tw_s;
+    let q_trap = 2.0 * qt_acc / tw_s;
+    let y = y_acc / yw - NTSC_TRAP * (i_trap * lc_acc / yw + q_trap * ls_acc / yw);
+    return max(yiq2rgb(vec3<f32>(y, i_hat, q_hat)), vec3<f32>(0.0));
 }
 
 // S-video: luma and chroma travel on separate wires, so there's perfect Y/C
@@ -369,16 +441,27 @@ fn svideo(uv: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
     var q = 0.0;
     var cw = 0.0;
     var qw = 0.0;
-    for (var k = -8; k <= 8; k = k + 1) {
+    // No modulation on this path, so nothing needs oversampling: Y/I/Q come straight off
+    // the wires and the source itself holds no detail above the content Nyquist. Integer
+    // taps, ±9 px to span the Q kernel.
+    for (var k = -9; k <= 9; k = k + 1) {
         let scx = cx + f32(k);
         let yiq = rgb2yiq(textureSampleLevel(t_screen, s_screen, vec2<f32>(scx * step / res.x, uv.y), 0.0).rgb);
         let kk = f32(k * k);
-        let lw = exp(-kk / (2.0 * 0.9 * 0.9)); // sharp luma (no subcarrier to reject)
-        // Y/C separation is perfect on separate wires, so what is left is the NTSC
-        // encoder's own asymmetry: I ~1.3 MHz, Q ~0.4 MHz. No subcarrier to reject means
-        // no receiver-side narrowing of I either, so the gap is wider than on composite.
-        let iw = exp(-kk / (2.0 * 2.6 * 2.6)); // I band: orange–cyan
-        let qw_k = exp(-kk / (2.0 * 4.4 * 4.4)); // Q band: green–magenta, bleeds further
+        // Luma rides its own wire, so no 3.58 trap has to cut into it — the limit is just
+        // the set's video amp at ~4.0 MHz. That is wider than the 3.04 MHz content Nyquist,
+        // so this is very nearly a passthrough, and correctly so: an S-video-fed consumer
+        // set resolves single content pixels. Composite's softness is the trap's shoulder,
+        // not the tube's, which is why the two paths differ here at all.
+        let lw = exp(-kk / (2.0 * 0.2850 * 0.2850));
+        // Chroma is unchanged from composite: it is still a demodulated subcarrier, so it
+        // still cascades the encoder's 1.3/0.4 MHz asymmetry with the consumer receiver's
+        // 0.5 MHz equiband demodulator. Separate wires buy perfect Y/C separation — no dot
+        // crawl, no cross-colour — but they do not widen the chroma passband, so the old
+        // "no receiver-side narrowing of I either" was wrong: that narrowing is the
+        // demodulator, which S-video does not bypass.
+        let iw = exp(-kk / (2.0 * NTSC_SIG_I * NTSC_SIG_I));
+        let qw_k = exp(-kk / (2.0 * NTSC_SIG_Q * NTSC_SIG_Q));
         y = y + yiq.x * lw;
         yw = yw + lw;
         i = i + yiq.y * iw;

@@ -314,12 +314,19 @@ like an actual CRT instead of smearing like an LCD (you'll want a 120 Hz panel).
 
 **The signal path is period-correct.** RGB and component stay clean (PVM, arcade,
 PC monitors). S-video keeps sharp luma but band-limits color. Composite gets the
-full indignity — dot crawl, cross-color, bleed — tuned to real NTSC Y/I/Q
-bandwidths. Those bandwidths are deliberately lopsided, because NTSC's are: I gets about
-1.3 MHz and Q only 0.4, so green–magenta detail arrives mushier than orange–cyan no matter
-how good the receiver is. Real sets then narrowed I further to avoid paying for the
-asymmetric-sideband correction, which closes the gap without erasing it. So the Panasonic
-smears its reds the way composite did and the PVM doesn't.
+full indignity — dot crawl, cross-color, bleed — and all of it is pinned to one measured
+number: 320 active pixels across NTSC's 52.6 µs line is a 6.0837 MHz pixel rate, so the
+3.579545 MHz subcarrier lands at 0.588 cycles per pixel, a 1.70-px period. That ratio, not
+a taste knob, is what decides which detail turns into false color — cross-color peaks on
+1.7-px features and is gone by 4 px, which is why fine dither shimmers rainbow and a plain
+2-px text stem doesn't. Chroma is the cascade of two real filters: the encoder's lopsided
+1.3 MHz I and 0.4 MHz Q, then the *receiver's* own 0.5 MHz equiband demodulator, because a
+consumer RCA or Panasonic never paid for wideband-I. Cascading them keeps the encoder's
+green–magenta-vs-orange–cyan asymmetry but compresses it from 3.25:1 to 1.49:1. Luma is the
+set's video amp at 3.0 MHz with a real 3.58 trap (Q ≈ 10, 20 dB) sitting in it rather than
+one filter doing both jobs — so the dot crawl is 3.7% on a flat field and only rises where
+it should, at color edges, where the trap's estimate of the local subcarrier goes wrong. So
+the Panasonic smears its reds the way composite did and the PVM doesn't.
 
 **Plus the small stuff nobody asked for.** Deflection geometry errors (pincushion,
 keystone, corner defocus that only the cheap tubes show), convergence drift toward
