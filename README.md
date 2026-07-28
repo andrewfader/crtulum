@@ -339,6 +339,31 @@ aberration, so a well-focused Trinitron or a broadcast PVM draws a line with a f
 and a steep wall down to black, while a soft old console set collapses to a plain gaussian.
 Sharper tubes therefore get *both* a flatter core and darker gaps, at identical energy.
 
+The beam has a second axis, too, and it's the one everybody forgets. Vertically a raster
+really is a stack of discrete lines, so you sum overlapping spots. Horizontally it isn't —
+the signal is continuous, the DAC *holds* each source pixel for its whole dwell, and the
+beam paints that staircase blurred by the spot. Hand that axis to the GPU's bilinear filter
+and every pixel becomes a ramp between its neighbours' centres, so nothing ever reaches a
+flat top and the tube's focus gets no say at all: a razor PVM and a fuzzy console set come
+out identically soft sideways. Here the sampling ramp is set to the spot width instead, so
+a sharp tube resolves single pixels with hard edges and a soft one melts them together.
+
+**The mask is glued to the tube, not to your monitor.** A 20" Trinitron has 583 stripe
+triads across its face, a PVM-20L5 has 1235, a 0.24 mm Diamondtron 1467 — measured pitch
+over measured screen width, and the shader draws them on the faceplate itself. So the
+grille curves with the glass, foreshortens as the tube turns, and *magnifies when you lean
+in*. It also band-limits itself: unless your display is putting more than about two pixels
+on each triad, the stripes integrate to their own mean and vanish, exactly as they do when
+you look at a real TV from across the room and exactly as they don't in a macro photo of
+one. Nothing is faded by hand — the pattern's own pixel footprint does it, and because the
+mask is normalised to unit mean, the picture doesn't change brightness when it goes.
+
+Scanline depth works the same way, and for the same reason there's no knob for it: how deep
+the gaps run is decided by the spot width against the line pitch, both of which the beam
+math already knows. All that's left to ask is whether the display can *draw* the lines —
+which is why a 240p console shows hard scanlines on the same tube where a 1080p desktop
+capture shows none.
+
 **The glass is glass.** Snell refraction bends the view ray through the faceplate
 to the phosphor behind it, traced separately per color channel, so you get real
 chromatic fringing toward the corners. It's a mirror, too — dark screen catches a

@@ -501,7 +501,7 @@ struct Uniforms {
     cam_pos: [f32; 4],
     params: [f32; 4], // src_w, src_h, time, render_scale
     optics: [f32; 4], // mask_type, mask_strength, scanline, halation
-    glass: [f32; 4],  // parallax, reflection, vignette, mask_pitch
+    glass: [f32; 4],  // faceplate thickness, reflection, vignette, mask triads across the face
     tone: [f32; 4],   // hdr flag, peak/white-point, tube drive (exposure), ntsc_strength
     scan: [f32; 4],   // beam math: beam_min, beam_max, beam_shape, beam_range
     env: [f32; 4],    // avg_r, avg_g, avg_b, apl  (screen-as-area-light bounce)
@@ -564,13 +564,27 @@ struct Preset {
     // optics
     mask_type: f32, // 0 aperture grille, 1 shadow (dot), 2 slot
     mask_strength: f32,
-    scanline: f32,
     halation: f32,
     // glass
-    parallax: f32, // faceplate glass thickness driving refraction/dispersion
+    // Faceplate glass thickness, in world units, driving the refraction/dispersion trace.
+    // The screen mesh is HALF_W 0.667 wide, i.e. 1.333 units for a 20" tube's ~400 mm of
+    // visible picture, so ONE WORLD UNIT IS 300 mm and this number is the panel thickness
+    // in units of that. Entertainment CRT faceplates run 10-15 mm at the centre (they are
+    // thick because they are an implosion barrier), so a 20" panel is ~0.045 and a 25"
+    // console ~0.055. The old 0.10-0.13 was 30-39 mm of glass — nearly three times a real
+    // faceplate, which correspondingly tripled the parallax shift and the dispersion.
+    parallax: f32,
     reflection: f32,
     vignette: f32,
-    mask_pitch: f32,
+    // Phosphor mask geometry, as measured: stripe/dot pitch in mm and the tube's visible
+    // picture width in mm. The shader wants the triad count across the face (screen_mm /
+    // pitch_mm), which is the scale-free quantity — it is what decides whether the mask is
+    // resolvable at a given zoom, and it is the number that differs between tubes. This
+    // replaces a hand-set pitch in *output pixels*, which had no physical referent and got
+    // the ordering wrong: it drew a broadcast PVM's grille coarser than a consumer
+    // Trinitron's, where in truth the PVM has more than twice as many triads across its face.
+    pitch_mm: f32,
+    screen_mm: f32,
     // beam/geometry imperfections
     // RGB misregistration magnitude at the corners. The shader displaces red outward and
     // blue inward by cvec·|cvec|²·convergence·0.9, so peak red-to-blue separation in the
@@ -623,29 +637,6 @@ struct Preset {
 const PHOS_SMPTE_C: [[f32; 2]; 3] = [[0.630, 0.340], [0.310, 0.595], [0.155, 0.070]];
 const PHOS_P22: [[f32; 2]; 3] = [[0.625, 0.340], [0.280, 0.605], [0.155, 0.070]];
 const PHOS_SRGB: [[f32; 2]; 3] = [[0.640, 0.330], [0.300, 0.600], [0.150, 0.060]];
-
-// Γ(x) for x in (0, 3] — Lanczos approximation (g=7). Needed only to normalise the
-// generalized-gaussian beam profile exp(-|d/w|^p), whose area is 2·w·Γ(1+1/p).
-fn gamma_fn(x: f32) -> f32 {
-    const C: [f64; 9] = [
-        0.999_999_999_999_809_93,
-        676.520_368_121_885_1,
-        -1259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    let x = x as f64 - 1.0;
-    let mut a = C[0];
-    let t = x + 7.5;
-    for (i, c) in C.iter().enumerate().skip(1) {
-        a += c / (x + i as f64);
-    }
-    ((2.0 * std::f64::consts::PI).sqrt() * t.powf(x + 0.5) * (-t).exp() * a) as f32
-}
 
 // Build the 3x3 that maps CRT-phosphor drive RGB (linear) → linear sRGB (D65 display),
 // baking in the tube's real gamut AND white point (so a 9300K set reads blue). Rows
@@ -703,12 +694,20 @@ const TRINITRON: Preset = Preset {
     },
     mask_type: 0.0,
     mask_strength: 0.90,
-    scanline: 0.55,
     halation: 0.35,
-    parallax: 0.10,
+    parallax: 0.045,
     reflection: 0.50,
-    vignette: 0.30,
-    mask_pitch: 3.0,
+    vignette: 0.22,
+    // 20" consumer Trinitron TV, aperture grille. THE ONE ESTIMATED PITCH HERE — crtdatabase
+    // lists the KV-20TS20's tube (A51JUH50X) as an aperture grille but publishes no pitch, and
+    // Sony did not spec it on consumer sets the way they did on monitors, because a TV runs one
+    // scan rate and only has to resolve ~330 TVL. It is bounded from both sides though. The
+    // repairfaq slot-mask measurements (13" 0.60, 19" 0.75, 25" 0.90 mm) are almost exactly
+    // linear at 0.025 mm/inch, which puts a 20" consumer shadow/slot tube at ~0.78 mm; a
+    // Trinitron grille of the same size runs finer than that, which was half the point of the
+    // design. 0.66 mm over a 400 mm picture (a 20" 4:3 face is 406 mm wide) → 606 triads.
+    pitch_mm: 0.66,
+    screen_mm: 400.0,
     // a pro Trinitron/PVM is tightly converged with squarer corners.
     convergence: 0.010,
     corner_radius: 0.05,
@@ -746,12 +745,14 @@ const PANASONIC: Preset = Preset {
     },
     mask_type: 1.0,
     mask_strength: 0.85,
-    scanline: 0.55,
     halation: 0.42,
-    parallax: 0.13,
+    parallax: 0.048,
     reflection: 0.45,
-    vignette: 0.48,
-    mask_pitch: 3.0,
+    vignette: 0.38,
+    // Consumer dot mask at 0.75 mm — repairfaq's own machinist's-scale measurement of a 19"
+    // Samsung, over that tube's 386 mm picture width → 515 triads.
+    pitch_mm: 0.75,
+    screen_mm: 386.0,
     // consumer set: looser convergence, rounder tube corners.
     convergence: 0.024, // ~2.2 mm R–B in the corner: a consumer set well past its last alignment
     corner_radius: 0.12,
@@ -787,12 +788,14 @@ const SLOTMASK: Preset = Preset {
     },
     mask_type: 2.0,
     mask_strength: 0.85,
-    scanline: 0.52,
     halation: 0.40,
-    parallax: 0.11,
+    parallax: 0.052,
     reflection: 0.45,
-    vignette: 0.42,
-    mask_pitch: 3.0,
+    vignette: 0.34,
+    // Large consumer slot mask: 0.90 mm, repairfaq's measurement of a 25" RCA, over that
+    // tube's ~490 mm of visible picture → 544 triads.
+    pitch_mm: 0.90,
+    screen_mm: 490.0,
     convergence: 0.020, // ~1.8 mm: a slot-mask consumer set drifting, still short of a fault
     corner_radius: 0.10,
     geom: [0.040, -0.015, 0.040, 0.08],
@@ -828,12 +831,14 @@ const RCA: Preset = Preset {
     },
     mask_type: 1.0, // shadow-mask dot triads
     mask_strength: 0.62, // soft, low-contrast mask
-    scanline: 0.45,
     halation: 0.62, // glowy, blooms warm
-    parallax: 0.13,
+    parallax: 0.055,
     reflection: 0.55,
-    vignette: 0.50,
-    mask_pitch: 3.7, // coarse
+    vignette: 0.40,
+    // 25" console — repairfaq measured exactly this class of tube ("25 inch RCA - .9 mm.")
+    // at 0.90 mm; ~490 mm of visible picture → 544 triads.
+    pitch_mm: 0.90,
+    screen_mm: 490.0,
     convergence: 0.026, // ~2.4 mm: the loosest a real, working consumer set gets (was 5.0 mm — a fault)
     corner_radius: 0.13,
     geom: [0.060, 0.025, 0.070, 0.14], // consumer bow + purity drift
@@ -869,12 +874,14 @@ const PVM: Preset = Preset {
     },
     mask_type: 0.0, // aperture grille
     mask_strength: 0.95,
-    scanline: 0.56, // crisp, clean 240p scanlines
     halation: 0.22, // low bloom
-    parallax: 0.09,
+    parallax: 0.045,
     reflection: 0.34,
-    vignette: 0.26,
-    mask_pitch: 2.5, // fine ~0.25 mm stripe
+    vignette: 0.14,
+    // Sony PVM-20L5: 0.31 mm aperture grille (crtdatabase; the 14L5 is 0.25 mm) over a
+    // 386 mm picture (19" viewable) → 1245 triads, more than twice a consumer set's.
+    pitch_mm: 0.31,
+    screen_mm: 386.0,
     convergence: 0.008, // tight
     corner_radius: 0.04, // squarish pro face
     geom: [0.006, 0.0, 0.008, 0.02], // near-perfect
@@ -909,12 +916,16 @@ const ARCADE: Preset = Preset {
     },
     mask_type: 1.0, // shadow-mask triads
     mask_strength: 0.80,
-    scanline: 0.62, // big, proud scanlines
     halation: 0.44,
-    parallax: 0.13,
+    parallax: 0.045,
     reflection: 0.55, // bare (uncoated) glass
-    vignette: 0.46,
-    mask_pitch: 4.5, // coarse big-tube pitch
+    vignette: 0.36,
+    // 19" Wells Gardner K7000 class: the 25" K7000 measures 0.82 mm, which scales to
+    // ~0.63 mm on the 19" tube → 613 triads. Note that lands finer than the 0.75 mm
+    // repairfaq measured on a 19" TV: an arcade tube had to hold sharp pixel art, and the
+    // K7000 measurement says it did so with a finer mask than a television of the same size.
+    pitch_mm: 0.63,
+    screen_mm: 386.0,
     convergence: 0.025, // ~2.3 mm: an arcade tube nobody has converged in ten years (was 4.1 mm)
     corner_radius: 0.11,
     geom: [0.050, 0.020, 0.050, 0.10],
@@ -949,12 +960,14 @@ const VGA: Preset = Preset {
     },
     mask_type: 1.0, // fine shadow mask
     mask_strength: 0.85,
-    scanline: 0.34, // 480+ lines → subtle scanlines
     halation: 0.28,
-    parallax: 0.09,
+    parallax: 0.033,
     reflection: 0.42,
-    vignette: 0.30,
-    mask_pitch: 2.6, // fine ~0.28 mm
+    vignette: 0.18,
+    // 15" NEC MultiSync: 0.28 mm shadow mask — the coarse end of repairfaq's "typical high
+    // resolution CRTs ... .25 to .28 mm" — over a 280 mm picture (13.8" viewable) → 1000 triads.
+    pitch_mm: 0.28,
+    screen_mm: 280.0,
     convergence: 0.014, // ~1.3 mm: a consumer-grade VGA monitor, looser than a pro tube
     corner_radius: 0.07,
     geom: [0.018, 0.005, 0.020, 0.04], // good geometry
@@ -989,12 +1002,14 @@ const DIAMONDTRON: Preset = Preset {
     },
     mask_type: 0.0, // aperture grille (has damper wires)
     mask_strength: 0.92,
-    scanline: 0.30, // high-res, minimal scanlines
     halation: 0.20,
-    parallax: 0.07, // thin flat faceplate
+    parallax: 0.036,
     reflection: 0.30, // AR coated
-    vignette: 0.22,
-    mask_pitch: 2.2, // very fine ~0.24 mm
+    vignette: 0.12,
+    // 19" Diamondtron FE: 0.24 mm aperture grille over 352 mm → 1467 triads, the
+    // finest mask here — below even repairfaq's "as low as .22 mm" note on commercial monitors.
+    pitch_mm: 0.24,
+    screen_mm: 360.0,
     convergence: 0.010,
     corner_radius: 0.03,
     geom: [0.010, 0.0, 0.010, 0.02], // flat, well-corrected
@@ -1030,12 +1045,13 @@ const GREEN: Preset = Preset {
     },
     mask_type: 0.0,     // unused (mono skips the RGB triad mask)
     mask_strength: 0.0, // no colour mask on a single-phosphor tube
-    scanline: 0.42,
     halation: 0.55, // strong phosphor glow/bleed
-    parallax: 0.10,
+    parallax: 0.030,
     reflection: 0.42,
-    vignette: 0.36,
-    mask_pitch: 3.0,
+    vignette: 0.28,
+    // single-phosphor tube: no mask at all (mask_strength 0), value unused.
+    pitch_mm: 1.00,
+    screen_mm: 240.0,
     convergence: 0.0, // one gun → no RGB misconvergence
     corner_radius: 0.08,
     geom: [0.028, 0.0, 0.030, 0.0], // no purity error on a mono tube
@@ -1070,12 +1086,13 @@ const AMBER: Preset = Preset {
     },
     mask_type: 0.0,
     mask_strength: 0.0,
-    scanline: 0.42,
     halation: 0.52,
-    parallax: 0.10,
+    parallax: 0.030,
     reflection: 0.42,
-    vignette: 0.36,
-    mask_pitch: 3.0,
+    vignette: 0.28,
+    // no mask on a single-gun tube (unused).
+    pitch_mm: 1.00,
+    screen_mm: 240.0,
     convergence: 0.0,
     corner_radius: 0.08,
     geom: [0.028, 0.0, 0.030, 0.0],
@@ -1633,14 +1650,22 @@ fn write_uniforms(
         optics: [
             preset.mask_type,
             preset.mask_strength,
-            preset.scanline,
+            // Reserved. This was the per-tube scanline mix; scanline depth is now derived
+            // in the shader from the spot geometry and the display's ability to resolve the
+            // line pitch, which is what actually determines it (see scan_reconstruct).
+            0.0,
             preset.halation,
         ],
         glass: [
             preset.parallax,
             preset.reflection,
             preset.vignette,
-            preset.mask_pitch,
+            // Mask triads across the visible picture width. Scale-free, so the shader can
+            // key the mask off the faceplate itself and let the pixel footprint decide
+            // whether it resolves — a real grille magnifies when you lean in and integrates
+            // away when you step back, and neither of those happens to a pattern locked to
+            // output pixels.
+            preset.screen_mm / preset.pitch_mm.max(0.01),
         ],
         // HDR path: on a scRGB swapchain, emit linear light with highlights >1.0
         // (peak/drive push the beam above white). On SDR, tonemap to `peak` white
@@ -1870,14 +1895,15 @@ fn write_uniforms(
             [svm, diffusion, subpix, bfi_mul]
         },
         beam2: {
-            // The spot profile is exp(-|d/w|^p). Its area is 2·w·Γ(1+1/p), so pass the
-            // reciprocal and the shader can normalise each row's beam to unit energy with
-            // one multiply. Energy normalisation is the point: light output is LINEAR in
-            // beam current (the ~2.4 CRT gamma comes from the gun's grid transfer curve,
-            // not the phosphor), so widening the spot on a bright row has to redistribute
-            // that row's light, never manufacture more of it.
+            // The spot profile is exp(-|d/w|^p), p = the tube's low-current focus quality.
+            // The area normaliser 1/(2·Γ(1+1/p)) used to be computed here, once per frame;
+            // it moved into the shader because p is no longer constant across the picture —
+            // the profile relaxes toward a gaussian as the spot blooms (see
+            // scan_reconstruct). Energy normalisation is the point either way: light output
+            // is LINEAR in beam current (the ~2.4 CRT gamma comes from the gun's grid
+            // transfer curve, not the phosphor), so widening the spot on a bright row has to
+            // redistribute that row's light, never manufacture more of it.
             let p = preset.spot.max(1.2);
-            let norm = 1.0 / (2.0 * gamma_fn(1.0 + 1.0 / p));
             // Ambient wash: room light reflected off the phosphor/mask back out at the
             // viewer. It crosses the tinted faceplate TWICE (hence T²) and bounces off a
             // screen whose effective albedo is low — the phosphor itself is a pale powder,
@@ -1900,7 +1926,8 @@ fn write_uniforms(
             // Scattering redistributes light rather than adding it, so halation/diffusion
             // take their share out of the direct term. Kept partial (not the full 1.0) —
             // some of what scatters forward still reaches the eye inside the same pixel.
-            [p, norm, wash, 0.55]
+            // .y is reserved (was the CPU-side spot-area normaliser).
+            [p, 0.0, wash, 0.55]
         },
     };
     queue.write_buffer(&res.ubuf, 0, bytemuck::bytes_of(&uniforms));
@@ -2993,24 +3020,35 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// The beam profile is normalised to unit area with 1/(2·Γ(1+1/p)), so a wrong Γ would
-    /// silently re-expose the whole picture by a few percent per preset with nothing to see
-    /// but "the tubes look a bit off". Pin it against known values, and — the property that
-    /// actually matters — check that the resulting normaliser really does make a flat field
-    /// reconstruct to exactly itself for every tube's spot exponent and beam width.
+    /// Γ(1+x) as the shader computes it — a cubic fit over x = 1/p, p ∈ [1.2, 5]. It moved
+    /// into the shader when the spot exponent stopped being constant across the picture, so
+    /// this mirrors it here to keep it pinned; a wrong Γ would silently re-expose the whole
+    /// picture by a few percent per preset with nothing to see but "the tubes look a bit off".
+    fn gamma1p(x: f32) -> f32 {
+        ((-0.10654 * x + 0.58755) * x - 0.47554) * x + 0.99029
+    }
+
+    /// The property that actually matters: the beam reconstruction must make a flat field
+    /// come back as exactly itself for every tube, at every drive level — including the
+    /// drive-dependent spot exponent, which changes the normaliser as well as the profile.
+    /// If it does not, brightness depends on beam width and every preset sits at its own
+    /// exposure for no physical reason.
     #[test]
     fn beam_profile_normaliser_conserves_energy() {
-        for (x, want) in [(1.0, 1.0), (1.5, 0.886_227), (2.0, 1.0), (1.25, 0.906_402)] {
-            let got = gamma_fn(x);
-            assert!((got - want).abs() < 1e-4, "gamma_fn({x}) = {got}, want {want}");
+        // x = 1/p, so the fit's domain is [0.2, 0.833] — p from 5 down to 1.2.
+        for (x, want) in [(0.2f32, 0.918_169f32), (0.5, 0.886_227), (0.8, 0.931_384), (0.25, 0.906_402)] {
+            let got = gamma1p(x);
+            assert!((got - want).abs() < 1e-3, "gamma1p({x}) = {got}, want {want}");
         }
 
         for preset in ALL_PRESETS {
-            let p = preset.spot;
-            let norm = 1.0 / (2.0 * gamma_fn(1.0 + 1.0 / p));
+            let p0 = preset.spot.max(1.2);
             // Signal levels from black to full white; each must come back at unit gain.
             for c in [0.05f32, 0.25, 0.5, 0.75, 1.0] {
-                let w = preset.beam[0] + (preset.beam[1] - preset.beam[0]) * c.powf(preset.beam[2]);
+                let s = c.powf(preset.beam[2]);
+                let w = preset.beam[0] + (preset.beam[1] - preset.beam[0]) * s;
+                let p = p0 + (2.0 - p0) * s; // flat top relaxes to a gaussian as it blooms
+                let norm = 1.0 / (2.0 * gamma1p(1.0 / p));
                 // Average the reconstruction across one row's worth of subpixel phases:
                 // the sum oscillates (that oscillation IS the scanline), its mean is the
                 // settled brightness, and the mean is what has to equal the signal.
@@ -3037,6 +3075,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The scanline profile must never invert. Summing overlapping rows is an aperture
+    /// filter, and a flat-topped spot wider than half the line pitch has a NEGATIVE response
+    /// at the line frequency — the raster peaks BETWEEN the scanlines instead of on them.
+    /// That is what forced the spot exponent to relax with drive; without it the Trinitron
+    /// inverted by 11% on a white field and the arcade tube flipped phase partway down a
+    /// gradient. Assert the modulation stays non-negative and falls monotonically as the
+    /// spot blooms, for every tube.
+    #[test]
+    fn scanline_modulation_never_inverts() {
+        for preset in ALL_PRESETS {
+            let p0 = preset.spot.max(1.2);
+            let mut prev = f32::INFINITY;
+            for c in [0.15f32, 0.3, 0.5, 0.7, 1.0] {
+                let s = c.powf(preset.beam[2]);
+                let w = preset.beam[0] + (preset.beam[1] - preset.beam[0]) * s;
+                let p = p0 + (2.0 - p0) * s;
+                let norm = 1.0 / (2.0 * gamma1p(1.0 / p));
+                let at = |frac: f32| -> f32 {
+                    (-4..=4)
+                        .map(|k| (-((frac - k as f32).abs() / w).powf(p)).exp() * (norm / w))
+                        .sum::<f32>()
+                };
+                let (centre, gap) = (at(0.0), at(0.5));
+                let modulation = (centre - gap) / (centre + gap);
+                assert!(
+                    modulation > -0.02,
+                    "{}: scanlines invert at drive {c} (modulation {modulation:.3}) — the \
+                     raster is peaking between the lines",
+                    preset.name,
+                );
+                assert!(
+                    modulation <= prev + 0.02, // 1% wiggles from the Γ fit are not a rise
+                    "{}: scanline depth rose at drive {c} ({modulation:.3} after {prev:.3}) — a \
+                     brighter beam must merge the lines, never separate them",
+                    preset.name,
+                );
+                prev = modulation;
+            }
+        }
+    }
+
+    /// The mask has to be normalised to unit mean or the tube drive silently absorbs its
+    /// transmission loss, which differs per mask type and per strength — the ten tubes then
+    /// sit at ten different brightnesses for no physical reason. mask_mean() in the shader is
+    /// a closed form; check it against a numeric integration of the pattern it claims to
+    /// average, and check the open-area figures it implies are the real ones.
+    #[test]
+    fn mask_mean_matches_the_pattern_and_real_open_areas() {
+        let w = 0.105f32;
+        let gauss = |t: f32, c: f32| (-(t - c) * (t - c) / (2.0 * w * w)).exp();
+        let stripe = |t: f32| -> f32 {
+            (-2..=2)
+                .map(|k| {
+                    let tk = t + k as f32;
+                    gauss(tk, 1.0 / 6.0) + gauss(tk, 3.0 / 6.0) + gauss(tk, 5.0 / 6.0)
+                })
+                .sum::<f32>()
+                / 3.0
+        };
+        let n = 4096;
+        let mean = |f: &dyn Fn(f32, f32) -> f32| -> f32 {
+            let mut acc = 0.0;
+            for i in 0..n {
+                for j in 0..n / 64 {
+                    acc += f(i as f32 / n as f32, (j as f32 + 0.5) / (n / 64) as f32);
+                }
+            }
+            acc / (n * (n / 64)) as f32
+        };
+        // grille: stripes only. shadow: × the dot row profile. slot: × the slot profile.
+        let grille = mean(&|x, _| stripe(x));
+        let shadow = mean(&|x, y| stripe(x) * (0.35 + 0.65 * (-(y - 0.5) * (y - 0.5) / (2.0 * 0.09)).exp()));
+        let slot = mean(&|x, y| {
+            let s = ((y / 0.12).clamp(0.0, 1.0)).powi(2) * (3.0 - 2.0 * (y / 0.12).clamp(0.0, 1.0))
+                * (((1.0 - y) / 0.12).clamp(0.0, 1.0)).powi(2)
+                    * (3.0 - 2.0 * ((1.0 - y) / 0.12).clamp(0.0, 1.0));
+            stripe(x) * (0.45 + 0.55 * s)
+        });
+        for (name, got, want) in [
+            ("grille", grille, 0.263_17),
+            ("shadow", shadow, 0.263_17 * 0.792_20),
+            ("slot", slot, 0.263_17 * 0.934_00),
+        ] {
+            assert!(
+                (got - want).abs() < 0.006,
+                "mask_mean({name}) = {want}, pattern integrates to {got} — the normaliser and \
+                 the pattern have drifted apart, so this mask type is off-brightness",
+            );
+        }
+        // And the transmissions those means imply are the published open areas: aperture
+        // grille ~22-25%, slot ~20%, shadow mask ~15-18%.
+        assert!((0.22..0.28).contains(&grille), "grille open area {grille}");
+        assert!((0.19..0.26).contains(&slot), "slot open area {slot}");
+        assert!((0.15..0.22).contains(&shadow), "shadow open area {shadow}");
+    }
+
+    /// The mask is a physical grille on the faceplate, so its triad count has to come from a
+    /// measured pitch and a measured screen width — and the ordering that falls out of those
+    /// is the thing the old hand-set pitch-in-output-pixels got backwards: a broadcast PVM
+    /// and a PC monitor have far MORE triads across the face than any consumer TV.
+    #[test]
+    fn mask_triad_counts_follow_measured_pitch() {
+        let triads = |name: &str| -> f32 {
+            let p = preset_by_name(name);
+            p.screen_mm / p.pitch_mm
+        };
+        for (name, lo, hi) in [
+            ("trinitron", 450.0, 700.0),
+            ("panasonic", 450.0, 700.0),
+            ("rca", 450.0, 700.0),
+            ("arcade", 450.0, 700.0),
+            ("pvm", 1100.0, 1400.0),
+            ("vga", 900.0, 1100.0),
+            ("diamondtron", 1300.0, 1600.0),
+        ] {
+            let t = triads(name);
+            assert!((lo..hi).contains(&t), "{name}: {t:.0} triads across, want {lo}..{hi}");
+        }
+        assert!(
+            triads("pvm") > 2.0 * triads("trinitron"),
+            "a PVM's 0.31 mm grille must be far finer than a consumer TV's",
+        );
+        assert!(
+            triads("diamondtron") > triads("pvm"),
+            "a 0.24 mm Diamondtron is the finest mask here",
+        );
     }
 
     // Headless device, or None on a machine with no usable GPU adapter (CI
