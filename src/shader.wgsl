@@ -94,6 +94,28 @@ fn phosphor3(t: f32) -> vec3<f32> {
     return vec3<f32>(r, g, b);
 }
 
+// Mean transmission of `mask()` over one full period, per channel — the DC term of the
+// mask pattern, needed to normalise it to unit energy (see the call site in fs_main).
+// Closed form rather than a numeric sum, because every factor is analytic:
+//   * one stripe is a gaussian of sigma w summed over its periodic images, so over a unit
+//     period its mean is exactly w·sqrt(2*pi) = 0.105 × 2.5066 = 0.2632;
+//   * the shadow mask multiplies that by mix(0.35, 1, gauss(ty, 0.5, 0.30)), whose mean is
+//     0.35 + 0.65 · sigma·sqrt(2*pi)·erf(0.5/(sigma·sqrt2)) = 0.35 + 0.65 × 0.6803 = 0.792;
+//   * the slot mask multiplies by mix(0.45, 1, slot), and a smoothstep ramp of width a
+//     integrates to a/2, so the duty is 1 − 0.12 = 0.88 → 0.45 + 0.55 × 0.88 = 0.934.
+// The resulting transmissions — grille 0.263, slot 0.246, shadow 0.208 — land right on the
+// published open-area figures for real masks (aperture grille ~22-25%, slot ~20%, shadow
+// mask ~15-18%), which is a good sign the stripe geometry above is honest.
+fn mask_mean(kind: f32) -> f32 {
+    let stripe = 0.26317;                      // 0.105 · sqrt(2·pi)
+    if (kind < 0.5) {
+        return stripe;                         // aperture grille
+    } else if (kind < 1.5) {
+        return stripe * 0.79220;               // shadow mask (dot triads)
+    }
+    return stripe * 0.93400;                   // slot mask
+}
+
 // Phosphor mask weights at framebuffer pixel `px`.
 fn mask(px: vec2<f32>, kind: f32, pitch: f32) -> vec3<f32> {
     if (kind < 0.5) {
@@ -687,7 +709,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let cL = dot(textureSampleLevel(t_screen, s_screen, uv - dx, 0.0).rgb, lw);
         let cR = dot(textureSampleLevel(t_screen, s_screen, uv + dx, 0.0).rgb, lw);
         let lap = clamp(2.0 * cC - cL - cR, -0.6, 0.6); // + on ridges, − in troughs
-        col = max(col * (1.0 + u.fx.x * lap * 2.0), vec3<f32>(0.0));
+        // Depth. On a hard black-to-white step the laplacian saturates the ±0.6 clamp, so
+        // this constant sets the worst-case overshoot directly: it was 2.0, which at the
+        // composite set's fx.x = 0.55 put the halo at ±66% of local brightness. Scope traces
+        // of VM sets show the leading-edge overshoot running more like 20-30% above the flat
+        // white level — a crisp bright lip, not a doubled edge. 0.9 lands the composite set
+        // at 0.55 × 0.9 × 0.6 ≈ 30% worst case, with the S-video Trinitron near 19%.
+        col = max(col * (1.0 + u.fx.x * lap * 0.9), vec3<f32>(0.0));
     }
 
     // CRT transfer + phosphor colour. A real tube's response deepens the blacks
@@ -696,13 +724,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     col = pow(max(col, vec3<f32>(0.0)), vec3<f32>(u.phys.x));
     col = col * mix(vec3<f32>(1.0), vec3<f32>(1.06, 1.015, 0.93), u.phys.y);
 
-    // Beam bloom + high-voltage sag, driven by average picture level (APL). On a
-    // bright full-screen scene the power supply sags — the whole image dims a hair
-    // and the beam widens, so highlights bleed. This "breathing" is a real-set tell.
+    // High-voltage sag, driven by average picture level (APL). The flyback supplies the
+    // final anode through a finite source impedance, so total beam current pulls the anode
+    // voltage down and the whole picture dims — the "breathing" you see when a scene cuts
+    // to full white. It is why a CRT's full-field white is well below its small-window
+    // white, the same measurement an LCD calls ANSI vs peak contrast: a pro monitor with a
+    // regulated supply gives up only a few percent, a cheap consumer chassis 10-15%.
+    // phys.w carries the per-tube coefficient (see write_uniforms).
+    //
+    // The additive highlight bloom that used to sit here is gone — it double-counted the
+    // beam growth already in the reconstruction and added energy on top. See phys.w's note.
     let apl = u.env.w;
-    col = col * (1.0 - apl * 0.06);
-    let bright = max(col - vec3<f32>(0.72), vec3<f32>(0.0));
-    col = col + bright * u.phys.w * (0.6 + apl);
+    col = col * (1.0 - apl * u.phys.w);
 
     // Rolling refresh band ("hum bar"): the beam sweeps top→bottom at the field rate, so
     // a just-scanned line glows a hair brighter and fades as it ages toward the next
@@ -821,14 +854,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // scale so supersampling anti-aliases the mask instead of erasing it.
     let mask_pitch = max(u.glass.w, 1.0) * max(u.params.w, 1.0);
     if (u.fx.z > 0.5 && u.mono.w < 0.5) {
-        // Subpixel-accurate mask: each real LCD subpixel driven by the matching phosphor
-        // (~3x compensation for the 1/3 duty — bright content still lights all three).
+        // Subpixel-accurate mask: each real LCD subpixel driven by the matching phosphor.
+        // Same unit-mean normalisation as the resolution-independent path below — the DC of
+        // mask_subpixel is (1.0 + 0.06 + 0.06)/3 = 0.37333 per channel across the LCD triad.
+        // The old `× (1 + strength·2.0)` over-compensated by ~22% at strength 0.9 (2.8 where
+        // the mean calls for 2.29), so turning the subpixel mask on brightened the picture.
         let m = mask_subpixel(in.clip.xy);
-        col = col * mix(vec3<f32>(1.0), m, u.optics.y) * (1.0 + u.optics.y * 2.0);
+        let mm = mix(1.0, 0.37333, u.optics.y);
+        col = col * mix(vec3<f32>(1.0), m, u.optics.y) / max(mm, 1e-3);
     } else {
+        // The mask is a spatial modulation, not a dimmer. A real tube's rated white is
+        // measured THROUGH its own mask: the set runs whatever beam current it needs to hit
+        // that white, which is exactly why a shadow-mask tube (~16% open area) drives harder
+        // than an aperture grille (~24%) and still reaches the same peak. So the mask must
+        // be normalised to unit mean — then mask_strength controls how deep the stripes cut
+        // (structure) and nothing else, and the tube drive alone sets brightness.
+        //
+        // It used to be `× (1 + strength·0.7)`, a hand-fitted number that under-compensated:
+        // at the Trinitron's strength 0.9 the mask path passed mix(1, 0.263, 0.9) = 0.337 of
+        // the light and handed back 1.63×, netting 0.549 — a 45% loss the drive constant had
+        // silently absorbed. Worse, the loss varied with mask_strength AND mask type, so the
+        // ten tubes were sitting at brightnesses that differed for no physical reason. The
+        // exact normaliser is 1/mean(mix(1, m, strength)), which is one reciprocal.
         let m = mask(in.clip.xy, u.optics.x, mask_pitch);
-        col = col * mix(vec3<f32>(1.0), m, u.optics.y);
-        col = col * (1.0 + u.optics.y * 0.7); // compensate mask darkening
+        let mm = mix(1.0, mask_mean(u.optics.x), u.optics.y); // DC of the modulation
+        col = col * mix(vec3<f32>(1.0), m, u.optics.y) / max(mm, 1e-3);
     }
 
     // Damper wires: the signature of an aperture-grille (Trinitron) tube. The
@@ -837,11 +887,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // (not on a monochrome tube, which has no grille).
     if (u.optics.x < 0.5 && u.mono.w < 0.5) {
         let wy = in.uv.y;
-        // two wires (large-set layout) at ~1/3 and ~2/3 height; ~1.5px soft shadow
+        // two wires (large-set layout) at ~1/3 and ~2/3 height; ~1.5px soft shadow.
+        // Depth: the wire is a tungsten filament ~0.015 mm across on a 20" tube (Sony ran
+        // roughly 0.012-0.020 mm), strung a few mm in front of the grille. It occludes its
+        // own width of beam, but it sits far enough forward that the shadow is penumbral —
+        // the beam converges through a finite crossover, so the wire never fully blocks any
+        // one point, and what lands on the phosphor is a soft dip a few tenths of a mm wide.
+        // Against a ~0.4 mm scanline pitch that is a shallow attenuation, which is why the
+        // wires are famously invisible on picture content and only show against a flat
+        // bright field. 0.45 was drawing them as hard black rules across the screen; the
+        // measured depth is more like a fifth of the local brightness at the very centre.
         let w = 0.0016;
         let s1 = exp(-(wy - 0.333) * (wy - 0.333) / (2.0 * w * w));
         let s2 = exp(-(wy - 0.667) * (wy - 0.667) / (2.0 * w * w));
-        col = col * (1.0 - 0.45 * (s1 + s2));
+        col = col * (1.0 - 0.20 * (s1 + s2));
     }
 
     // Secondary internal reflection ("ghost"): a faint, offset second image from
@@ -942,9 +1001,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     col = col + amb_room * u.beam2.z * (1.0 - fres) * (1.0 - fres);
     // Tight specular glare from the ceiling softbox — a hot spot sliding across the
     // curved glass as you move; the single most CRT-reading highlight.
+    //
+    // Magnitude is a Fresnel problem, not a taste problem. Bare glass reflects R0 ≈ 4% at
+    // normal incidence (n ≈ 1.52); a bonded/AR-coated pro panel is nearer 0.5-1%, which is
+    // what `glass.y` (the preset's `reflection`) is scaling between. What the eye sees is
+    // R0 × the source's luminance relative to the tube's white, and a ceiling fixture runs
+    // maybe 5-15× a CRT's ~100 nit white — so the hot spot lands around 0.04 × 10 ≈ 0.4 of
+    // white, bright enough to bloom through the tonemapper but not a blown highlight. The
+    // old × 2.0 put it at ~1.6 — four times over, a mirror-finish sheen no faceplate has.
     let light_dir = normalize(vec3<f32>(-0.35, 0.55, 0.95));
     let glare = pow(max(dot(refl, light_dir), 0.0), 130.0);
-    col = col + vec3<f32>(1.0, 0.98, 0.92) * glare * (0.3 + u.glass.y) * 2.0;
+    col = col + vec3<f32>(1.0, 0.98, 0.92) * glare * (0.3 + u.glass.y) * 0.5;
 
     // Output. col is HDR (linear light, BT.709/sRGB primaries, highlights >1.0).
     if (u.tone.x > 0.5) {
@@ -964,8 +1031,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // sRGB, so return linear — the swapchain encodes the transfer function. The small
     // exposure lift keeps midtones from darkening under the ACES toe.
     let toned = aces(col * u.tone.y);
-    // ACES desaturates bright colours; the CRT phosphors should stay vivid, so nudge
-    // saturation back ~14% around luminance (cheap, keeps the picture punchy).
+    // ACES desaturates bright colours as it rolls them off — that is the RRT's film
+    // "path to white", a print-stock emulation. A CRT has no such behaviour: the guns clip
+    // per-channel at maximum beam current, so a saturated primary stays saturated right up
+    // to clipping and never bleaches toward white. Undoing that desaturation is therefore a
+    // correction, not a look. But it has to be applied WHERE ACES actually does it: the
+    // shoulder. The old flat +14% saturated the entire picture including shadows and
+    // midtones, where the RRT is essentially linear and there is nothing to correct — that
+    // part was pure punch. Gate it on luminance so only the rolled-off highlights get their
+    // chroma back.
     let l = dot(toned, vec3<f32>(0.2126, 0.7152, 0.0722));
-    return vec4<f32>(clamp(toned + (toned - vec3<f32>(l)) * 0.14, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    let shoulder = smoothstep(0.45, 1.0, l);
+    return vec4<f32>(clamp(toned + (toned - vec3<f32>(l)) * 0.22 * shoulder, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

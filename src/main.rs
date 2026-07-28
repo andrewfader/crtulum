@@ -570,7 +570,17 @@ struct Preset {
     vignette: f32,
     mask_pitch: f32,
     // beam/geometry imperfections
-    convergence: f32,   // RGB misregistration magnitude at the corners
+    // RGB misregistration magnitude at the corners. The shader displaces red outward and
+    // blue inward by cvec·|cvec|²·convergence·0.9, so peak red-to-blue separation in the
+    // corner is 0.225 × this, in uv. On a 20" 4:3 tube (~406 mm of visible width) that is
+    // 91 mm × convergence — which is the number to check against a service spec, because
+    // misconvergence is always quoted in mm in a named corner zone. Sony's consumer spec
+    // was ≤0.9 mm in the corner zone (0.5 mm centre); a studio PVM held ~0.3 mm; a tired,
+    // never-adjusted consumer set or an arcade tube nobody has touched in a decade runs
+    // 1.5-2.5 mm and looks visibly fringed. Anything past ~3 mm is not a character trait,
+    // it is a set that needs a convergence strip and a service manual — which is where the
+    // loose end of this range used to sit (0.055 = 5.0 mm, roughly double a bad real tube).
+    convergence: f32,
     corner_radius: f32, // rounding of the active phosphor rectangle
     // raster deflection geometry errors (a pro monitor is near-perfect; consumer
     // sets bow and drift): [pincushion, trapezoid, corner_pincushion, purity]
@@ -741,7 +751,7 @@ const PANASONIC: Preset = Preset {
     vignette: 0.48,
     mask_pitch: 3.0,
     // consumer set: looser convergence, rounder tube corners.
-    convergence: 0.038,
+    convergence: 0.024, // ~2.2 mm R–B in the corner: a consumer set well past its last alignment
     corner_radius: 0.12,
     // consumer geometry: visible pincushion + a little keystone and purity drift.
     geom: [0.055, 0.022, 0.060, 0.10],
@@ -781,7 +791,7 @@ const SLOTMASK: Preset = Preset {
     reflection: 0.45,
     vignette: 0.42,
     mask_pitch: 3.0,
-    convergence: 0.028,
+    convergence: 0.020, // ~1.8 mm: a slot-mask consumer set drifting, still short of a fault
     corner_radius: 0.10,
     geom: [0.040, -0.015, 0.040, 0.08],
     beam: [0.35, 0.76, 0.75, 1.0],
@@ -822,7 +832,7 @@ const RCA: Preset = Preset {
     reflection: 0.55,
     vignette: 0.50,
     mask_pitch: 3.7, // coarse
-    convergence: 0.055, // loose → colour fringing
+    convergence: 0.026, // ~2.4 mm: the loosest a real, working consumer set gets (was 5.0 mm — a fault)
     corner_radius: 0.13,
     geom: [0.060, 0.025, 0.070, 0.14], // consumer bow + purity drift
     beam: [0.48, 0.98, 0.65, 1.0], // WIDE, unfocused beam = fuzzy / low TVL
@@ -903,7 +913,7 @@ const ARCADE: Preset = Preset {
     reflection: 0.55, // bare (uncoated) glass
     vignette: 0.46,
     mask_pitch: 4.5, // coarse big-tube pitch
-    convergence: 0.045, // frequently misadjusted
+    convergence: 0.025, // ~2.3 mm: an arcade tube nobody has converged in ten years (was 4.1 mm)
     corner_radius: 0.11,
     geom: [0.050, 0.020, 0.050, 0.10],
     beam: [0.40, 0.90, 0.70, 1.0], // wide, strong scanline gaps
@@ -943,7 +953,7 @@ const VGA: Preset = Preset {
     reflection: 0.42,
     vignette: 0.30,
     mask_pitch: 2.6, // fine ~0.28 mm
-    convergence: 0.018,
+    convergence: 0.014, // ~1.3 mm: a consumer-grade VGA monitor, looser than a pro tube
     corner_radius: 0.07,
     geom: [0.018, 0.005, 0.020, 0.04], // good geometry
     beam: [0.28, 0.60, 0.85, 1.0], // sharp
@@ -1645,10 +1655,18 @@ fn write_uniforms(
         // Because that hidden gain scaled with beam WIDTH, it also flattered the fuzzy tubes
         // most; with it gone the ten tubes sit much closer together in mean brightness, as
         // they should — a wide beam spreads the same light, it does not make more.
+        //
+        // It has now come back DOWN (2.0 → 1.30 SDR, 2.2 → 1.43 HDR) for the mirror-image
+        // reason: the mask is normalised to unit mean in the shader, so the ~45% the old
+        // hand-fitted mask compensation was quietly losing is no longer lost, and the
+        // additive highlight bloom that was manufacturing light is gone. Both were being
+        // paid for out of the drive. Measured on the reference shot, 1.30 puts mean screen
+        // luminance at 0.245 against the pre-audit 0.246 — the same picture brightness,
+        // arrived at without the two fudges.
         tone: if hdr {
-            [1.0, exposure, 2.2, preset.signal as f32]
+            [1.0, exposure, 1.43, preset.signal as f32]
         } else {
-            [0.0, 1.08 * exposure, 2.0, preset.signal as f32] // ACES exposure (was Reinhard white pt)
+            [0.0, 1.08 * exposure, 1.30, preset.signal as f32] // ACES exposure (was Reinhard white pt)
         },
         // Guest/Megatron beam math (per-tube focus/TVL): per-channel beam half-width
         // runs from beam_min (dark → tight) to beam_max (bright → wide); beam_shape
@@ -1657,12 +1675,71 @@ fn write_uniforms(
         scan: preset.beam,
         // The screen radiates its average color/brightness onto the tube body.
         env: res.avg,
-        // convergence + corner rounding come from the preset; grain (analog noise
-        // floor) and ghost (secondary internal glass reflection) are global.
-        look: [preset.convergence, preset.corner_radius, 0.015, 0.012],
+        // convergence + corner rounding come from the preset; ghost (secondary internal
+        // glass reflection) is global; grain is the analog noise floor and belongs to the
+        // SIGNAL, not the tube — a flat global value put broadcast-grade snow on an RGB-fed
+        // PVM and on a TTL-driven mono terminal, neither of which has a noisy path to be
+        // noisy about. RS-250B short-haul spec is ~40 dB weighted SNR for a broadcast feed;
+        // off-air consumer RF is worse (~35-40 dB) and an RGB/component studio link better
+        // (>50 dB). dB → rms = 10^(-dB/20), and this grain is uniform in ±amt/2 (rms =
+        // amt/√12), so amt ≈ 3.46 × rms. It is applied after the tube drive (~2×), so halve
+        // again to land in signal terms. Caveat kept honest: because it is added at the end
+        // of fs_main rather than to `sig` in the accum pass, it does not decay with the
+        // phosphor or go through the transfer curve — it reads as display noise rather than
+        // signal noise. The magnitudes below are right; the placement is a simplification.
+        look: [
+            preset.convergence,
+            preset.corner_radius,
+            if preset.mono[3] > 0.5 || preset.phos >= 2 {
+                0.002 // TTL/VGA-driven terminal or PC monitor: essentially a clean path
+            } else {
+                match preset.signal {
+                    2 => 0.020, // composite RF off-air, ~36 dB unweighted
+                    1 => 0.010, // S-video baseband, ~42 dB
+                    _ => 0.003, // RGB/component studio feed, >50 dB
+                }
+            },
+            0.012,
+        ],
         // CRT gamma (deepens blacks), per-tube warm/cool phosphor white point,
         // screen→tube glow bounce strength, and highlight bloom gain.
-        phys: [1.12, preset.warmth, 0.42, 0.5],
+        //
+        // phys.x = 1.12 is NOT a look control: the source is an sRGB texture the hardware
+        // already decoded at ~2.2, and a real tube's EOTF is ~2.4 (BT.1886), so 2.2 × 1.12
+        // = 2.46 lands the end-to-end transfer where a measured tube sits. Leave it.
+        //
+        // phys.w USED to be an additive highlight bloom set to 0.5 — a straight energy ADD
+        // on everything above 0.72, worth up to +70% on a highlight. Every mechanism it
+        // stood in for is already modelled, and modelled conservatively: the spot grows with
+        // beam current in the reconstruction (beam_min → beam_max more than doubles the
+        // half-width), halation redistributes the glass back-reflection, and diffusion
+        // redistributes the panel scatter. Stacking a fourth, non-conserving term on top
+        // double-counted the first and manufactured light the tube never emitted — the
+        // source is clipped at 1.0, so there is no above-white drive for it to represent.
+        // Deleted; the three physical terms carry the glow and the drive above absorbs the
+        // mean change.
+        //
+        // The slot now carries the HV sag coefficient, which used to be hardcoded at a flat
+        // 0.06 for every tube. Sag is a power-supply property, so it separates exactly along
+        // build class: a studio monitor regulates the final anode hard and loses only a few
+        // percent between a 10% window and full field, while a consumer chassis on a cost
+        // budget gives up 10-15% — that visible dimming when a scene cuts to white is one of
+        // the things that most reads as "a real TV". Signal path is the proxy for build
+        // class here, the same way it already is for SVM and overscan.
+        phys: [
+            1.12,
+            preset.warmth,
+            0.42,
+            if preset.mono[3] > 0.5 || preset.phos >= 2 {
+                0.05 // terminal / PC monitor: modest, steady raster, decent regulation
+            } else {
+                match preset.signal {
+                    2 => 0.13, // composite consumer set — cheapest chassis, sags most
+                    1 => 0.09, // better consumer / prosumer
+                    _ => 0.04, // RGB/component studio monitor: tightly regulated
+                }
+            },
+        ],
         // Phosphor persistence + interlace: dt drives per-frame decay; temporal.y is
         // the per-tube persistence multiplier; temporal.z = interlace amount, .w =
         // field parity (alternate fields excite alternate lines → 480i twitter).
@@ -1685,8 +1762,17 @@ fn write_uniforms(
         // used before, which had red only a little ahead of a pack it is really a decade
         // clear of. Green keeps a modest lead over blue: ZnS:Cu,Al is the glow-in-the-dark
         // sulfide and carries a long power-law tail, while ZnS:Ag,Cl has "no emission at
-        // long times". Absolute scale stays exaggerated ~50× so the trail survives being
-        // resampled to 60 Hz on a hold-type LCD; only the ratio is physical.
+        // long times". Absolute scale stays exaggerated so the trail survives being resampled
+        // to 60 Hz on a hold-type LCD — but the RATIO cannot be exaggerated with it. Real red
+        // is ~1 ms to 10%, i.e. ~16 time constants inside ONE 60 Hz frame: on a real tube the
+        // afterglow is an intra-frame effect, gone before the next field is drawn, and what
+        // the eye reads is a warm glow behind the beam, not a coloured ghost of the previous
+        // frame. Stretch the whole curve to frame scale at the physical 20:1.5:1 and that
+        // intensity effect turns into a chroma effect: red survives the frame boundary at 74%
+        // while green and blue die inside it, so motion drags a saturated red ghost that no
+        // tube has ever produced. So: red still leads (the signature is real and it is warm),
+        // but by ~3-4× rather than a decade, and the absolute scale is ~18× rather than ~50×.
+        // Red now falls to 40% across a frame instead of 74% — visible melt, not a smear.
         //
         // A single-gun mono tube has ONE phosphor: give all three stored channels the same
         // tau, or the luma sum below decays at three different rates and a green terminal
@@ -1697,11 +1783,14 @@ fn write_uniforms(
         // measured curve is an abrupt near-exponential drop followed by a slow power-law
         // tail, I = a/(t+t0)^b with b ≈ 0.2–2 (and the hyperbolic form I₀(1+at)^-n is what
         // gives these phosphors their "pronounced afterglow"). A pure exponential throws
-        // that tail away, which is exactly the part the eye reads as afterglow.
+        // that tail away, which is exactly the part the eye reads as afterglow. Kept, but
+        // halved (1.4 → 0.7): the tail is level-dependent, so it stretched *dim* charge the
+        // most (tau × 2.4 as prev → 0) and the faint end of a trail decayed slower the fainter
+        // it got — the part that actually read as lingering.
         ptau: if preset.mono[3] > 0.5 {
-            [preset.persist, preset.persist, preset.persist, 1.4]
+            [preset.persist, preset.persist, preset.persist, 0.7]
         } else {
-            [0.055, 0.0042, 0.0028, 1.4]
+            [0.018, 0.006, 0.004, 0.7]
         },
         // Raster deflection geometry errors, per tube (see Preset.geom).
         geom: preset.geom,
@@ -1745,7 +1834,15 @@ fn write_uniforms(
             // 50 Hz mono terminal beats |100 − 2×50| ≈ 0, so it barely drifts at all.
             // 480i doubles the beat feel via field twitter (handled in the accum pass).
             let roll_rate = if preset.mono[3] > 0.5 { 0.04 } else { 0.12 };
-            [defocus, overscan, roll_rate, 0.05]
+            // Amplitude. The hum bar is mains ripple on the video/HV rails getting past the
+            // supply's filtering, so its size is set by how much ripple survives — on a set
+            // in good health, not much. Measured, a healthy CRT's hum bar is a percent or
+            // two of peak white: you can find it on a flat grey field if you look, and it
+            // disappears into normal picture content. Only a set with dried-out filter caps
+            // shows the textbook 5-10% band, and that is a fault, not the look of a working
+            // tube. 0.05 was drawing the fault. 0.02 draws a healthy set that is still
+            // visibly analog.
+            [defocus, overscan, roll_rate, 0.02]
         },
         // fx: SVM + diffusion (both derived from the tube's character), subpixel-mask
         // toggle, and the per-frame BFI screen multiplier.
