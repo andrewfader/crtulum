@@ -27,6 +27,7 @@ gl = "0.14.0"
 ash = "0.37"
 gilrs = "0.11.2"
 cpal = "0.18.1"
+serde_json = "1.0.151"
 
 # crtulum patch: vendored wgpu-hal with HDR colorspace mapping for Wayland/mutter
 # (maps BT.2020-linear surfaces to Rgba16Float so an HDR swapchain is reachable).

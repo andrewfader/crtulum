@@ -81,6 +81,8 @@ pub struct Opts {
     /// libretro core options, e.g. `parallel-n64-gfxplugin=angrylion`. Needed to put
     /// the 3D cores on a software renderer, since this host has no GL/Vulkan path.
     pub core_options: Vec<(String, String)>,
+    /// Microsoft Agent character to put on the screen — a name or an asset directory.
+    pub agent: Option<String>,
     pub dry_run: bool,
 }
 
@@ -166,6 +168,12 @@ pub enum Action {
     /// Press and leave down until a matching `release`.
     Hold { buttons: u32 },
     Release { buttons: u32 },
+
+    // --- the character on the screen (only meaningful with an `agent`) ---
+    /// One instruction to the Microsoft Agent character. Kept out of [`Timeline`]
+    /// because an animation isn't a function of the clock — it branches, so it has
+    /// to be folded frame by frame. See [`crate::agent`].
+    Agent(crate::agent::Cmd),
 }
 
 /// A span written either in seconds or in exact frames. Frames are what a TAS is
@@ -212,6 +220,9 @@ impl When {
 pub struct Script {
     pub source: Option<String>,
     pub rom: Option<String>,
+    /// Character to put on the screen — a name to look up, or a path to an asset
+    /// directory.
+    pub agent: Option<String>,
     pub core: Option<String>,
     /// Explicit run length in emulated frames (a `duration` in seconds also works).
     pub frames: Option<u64>,
@@ -260,6 +271,55 @@ fn parse_size(s: &str) -> Result<(u32, u32)> {
         .split_once(['x', 'X'])
         .ok_or_else(|| anyhow!("bad size `{s}` (want WxH, e.g. 1280x960)"))?;
     Ok((w.trim().parse()?, h.trim().parse()?))
+}
+
+/// Split a script line into tokens, honouring quotes — `agent say "well hi there"`
+/// is four tokens, and a `#` inside the quotes is text, not a comment.
+fn tokenize(line: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quote, mut quoted) = (Vec::new(), String::new(), None, false);
+    for c in line.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.push(c),
+            None => match c {
+                '#' => break,
+                '"' | '\'' => {
+                    quote = Some(c);
+                    quoted = true;
+                }
+                c if c.is_whitespace() => {
+                    if quoted || !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                        quoted = false;
+                    }
+                }
+                c => cur.push(c),
+            },
+        }
+    }
+    if quoted || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// A point on the screen, in raster-normalised coordinates: `0.7,0.3` or `0.7 0.3`,
+/// where (0,0) is the top-left of the picture and (1,1) the bottom-right.
+fn parse_point(a: &mut Args) -> Result<[f32; 2]> {
+    let first = a.next().ok_or_else(|| anyhow!("expected a point like `0.7,0.3`"))?;
+    let (x, y) = match first.split_once(',') {
+        Some((x, y)) if !y.is_empty() => (x.to_string(), y.to_string()),
+        _ => (
+            first.trim_end_matches(',').to_string(),
+            a.next()
+                .ok_or_else(|| anyhow!("`{first}` is only half a point — want `x,y`"))?
+                .to_string(),
+        ),
+    };
+    Ok([
+        x.parse().with_context(|| format!("bad x in `{first}`"))?,
+        y.parse().with_context(|| format!("bad y in `{first}`"))?,
+    ])
 }
 
 fn parse_bool(s: &str) -> Result<bool> {
@@ -376,6 +436,57 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
         "bfi" => Ok(Action::Bfi(parse_bool(rest.first().unwrap_or(&"on"))?)),
         "wait" => Ok(Action::Wait(parse_time(rest.first().unwrap_or(&"0"))?)),
 
+        // --- the character (only meaningful with an `agent`) ---
+        // agent show / hide
+        // agent at 0.78,0.7            put him there
+        // agent move to 0.25,0.6 over 1.5
+        // agent point 0.3,0.55         turn and gesture at a spot on the picture
+        // agent say "watch this"
+        // agent play Congratulate
+        // agent scale 1.4
+        "agent" | "clippy" => {
+            use crate::agent::Cmd;
+            let verb = a
+                .next()
+                .ok_or_else(|| anyhow!("`agent` needs something to do (show/hide/at/move/point/say/play/scale)"))?
+                .to_ascii_lowercase();
+            let cmd = match verb.as_str() {
+                "show" | "appear" => Cmd::Show,
+                "hide" | "leave" => Cmd::Hide,
+                "at" | "to" => Cmd::At(parse_point(&mut a)?),
+                "move" | "walk" => {
+                    // `move to 0.2,0.6 over 1.5` — `to` is optional sugar.
+                    if a.toks.get(a.i).is_some_and(|t| t.eq_ignore_ascii_case("to")) {
+                        a.next();
+                    }
+                    let to = parse_point(&mut a)?;
+                    let mut over = 1.0;
+                    if a.toks.get(a.i).is_some_and(|t| t.eq_ignore_ascii_case("over")) {
+                        a.next();
+                        over = a.value_for("over", None)?;
+                    }
+                    Cmd::MoveTo { to, over }
+                }
+                "point" | "gesture" => Cmd::Point(parse_point(&mut a)?),
+                "say" | "speak" => Cmd::Say(
+                    a.next()
+                        .ok_or_else(|| anyhow!("`agent say` needs something to say, in quotes"))?
+                        .to_string(),
+                ),
+                "play" | "animate" => Cmd::Play(
+                    a.next()
+                        .ok_or_else(|| anyhow!("`agent play` needs an animation name"))?
+                        .to_string(),
+                ),
+                "scale" | "size" => Cmd::Scale(a.value_for("scale", None)?),
+                other => bail!(
+                    "unknown agent action `{other}` \
+                     (show, hide, at, move, point, say, play, scale)"
+                ),
+            };
+            Ok(Action::Agent(cmd))
+        }
+
         // --- emulator input ---
         // press a right           momentary (PRESS_FRAMES)
         // press a for 18 frames   an exact span — how a TAS is written
@@ -431,11 +542,11 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
 pub fn parse_script(text: &str) -> Result<Script> {
     let mut s = Script::default();
     for (lineno, raw) in text.lines().enumerate() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
+        let owned = tokenize(raw);
+        if owned.is_empty() {
             continue;
         }
-        let toks: Vec<&str> = line.split_whitespace().collect();
+        let toks: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
         let ctx = || format!("script line {}: `{}`", lineno + 1, raw.trim());
 
         // `at <time> …` (wall clock) or `frame <n> …` (exact emulated frame).
@@ -461,6 +572,13 @@ pub fn parse_script(text: &str) -> Result<Script> {
             match key.as_str() {
                 "source" | "input" => s.source = Some(arg.trim_matches(['"', '\'']).to_string()),
                 "rom" | "game" => s.rom = Some(arg.trim_matches(['"', '\'']).to_string()),
+                // `agent merlin` — a name to look up, or a path to an asset directory.
+                "agent" | "character" => {
+                    if arg.is_empty() {
+                        bail!("`agent` needs a character (e.g. `agent merlin`)");
+                    }
+                    s.agent = Some(arg.to_string());
+                }
                 "core" => s.core = Some(arg.to_string()),
                 "frames" => s.frames = Some(arg.parse()?),
                 // `option key=value` (or `option key value`) — passed to the core.
@@ -671,6 +789,9 @@ impl Timeline {
                     tl.end = tl.end.max(t + d);
                 }
                 Action::Hold { .. } | Action::Release { .. } => tl.end = tl.end.max(t),
+                // The character is folded frame by frame, not sampled — see
+                // `agent_events`. He still counts toward the end of the script.
+                Action::Agent(_) => tl.end = tl.end.max(t),
             }
         }
         tl
@@ -717,6 +838,21 @@ impl Timeline {
             bfi: step_at(&self.bfi, t, self.bfi0),
         }
     }
+}
+
+/// The character's instructions, on the same wall clock the camera runs on. Pulled
+/// out of the event list rather than compiled into [`Timeline`] because animation
+/// state is a fold, not a sample: a frame's weighted branches mean where the
+/// character *is* depends on where he's been.
+pub fn agent_events(script: &Script, fps: f64) -> Vec<(f32, crate::agent::Cmd)> {
+    script
+        .events
+        .iter()
+        .filter_map(|(when, action)| match action {
+            Action::Agent(cmd) => Some((when.seconds(fps), cmd.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,6 +1292,77 @@ fn probe(path: &Path) -> Result<Probe> {
     })
 }
 
+/// A raw stereo PCM track waiting to be muxed onto the finished video.
+struct PcmBed {
+    path: PathBuf,
+    rate: u32,
+}
+
+/// Does this file carry an audio stream? Only asked when a bed has to be mixed
+/// *with* whatever the source brought, since naming a stream that isn't there is a
+/// hard error inside `-filter_complex`.
+fn has_audio_stream(path: &Path) -> bool {
+    Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("audio"))
+        .unwrap_or(false)
+}
+
+/// Mux one or more raw PCM beds onto `video`, mixing them with each other (and with
+/// the video's own audio, if `embedded`). The video is stream-copied.
+///
+/// `normalize=0` matters: `amix` otherwise divides every input by the input count, so
+/// adding a character who says one line halfway through would quietly halve the game's
+/// volume for the whole run.
+fn mux_beds(video: &Path, beds: &[PcmBed], embedded: bool, out: &Path) -> Result<()> {
+    let mut args: Vec<String> = ["-hide_banner", "-v", "error", "-y", "-i"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.push(video.to_string_lossy().into());
+    for bed in beds {
+        args.extend([
+            "-f".into(), "s16le".into(),
+            "-ar".into(), bed.rate.to_string(),
+            "-ac".into(), "2".into(),
+            "-i".into(), bed.path.to_string_lossy().into(),
+        ]);
+    }
+
+    let mut labels: Vec<String> = Vec::new();
+    if embedded {
+        labels.push("[0:a]".into());
+    }
+    labels.extend((1..=beds.len()).map(|i| format!("[{i}:a]")));
+
+    args.extend(["-map".into(), "0:v:0".into()]);
+    if labels.len() == 1 {
+        args.extend(["-map".into(), labels[0].trim_matches(['[', ']']).to_string()]);
+    } else {
+        args.extend([
+            "-filter_complex".into(),
+            format!("{}amix=inputs={}:normalize=0[aout]", labels.concat(), labels.len()),
+            "-map".into(),
+            "[aout]".into(),
+        ]);
+    }
+    args.extend([
+        "-c:v".into(), "copy".into(),
+        "-c:a".into(), "aac".into(),
+        "-b:a".into(), "192k".into(),
+        "-shortest".into(),
+        out.to_string_lossy().into(),
+    ]);
+
+    let status = Command::new("ffmpeg").args(&args).status().context("muxing audio")?;
+    if !status.success() {
+        bail!("ffmpeg failed to mux the audio ({status})");
+    }
+    Ok(())
+}
+
 /// A directory of stills is fed to ffmpeg as a glob; probing it means probing the
 /// first image, and the file count gives the progress bar something to aim at.
 fn list_images(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1471,6 +1678,41 @@ pub fn render(opts: Opts) -> Result<()> {
             .unwrap_or(TRINITRON),
         fps,
     );
+    // The character, if the script (or `--agent`) asked for one. Loading him here —
+    // after `fps` is settled but before the first frame — is also when his speech is
+    // synthesised, since the balloon fills at the rate the voice reads it.
+    let mut agent = match opts.agent.as_deref().or(opts.script.agent.as_deref()) {
+        Some(name) if !opts.dry_run => {
+            let dir = crate::agent::resolve(name)?;
+            let ch = crate::agent::Character::load(&dir, opts.audio)?;
+            eprintln!(
+                "[agent] {} · {}x{} · {} animations",
+                ch.name,
+                ch.frame_w,
+                ch.frame_h,
+                ch.animation_names().len()
+            );
+            Some(crate::agent::Agent::new(
+                ch,
+                agent_events(&opts.script, fps),
+                opts.audio,
+            ))
+        }
+        _ => None,
+    };
+
+    // A run whose length was left to us stops when the last input has played out —
+    // which would cut the character off mid-sentence. Give him room to finish.
+    if let (Some(e), Some(a)) = (&mut emu, &agent) {
+        if opts.script.frames.is_none() && opts.duration.or(opts.script.duration).is_none() {
+            let needed = ((a.end() + 0.5) as f64 * fps).round() as u64;
+            if needed > e.total {
+                eprintln!("[render] extending the run to {needed} frames so the character finishes");
+                e.total = needed;
+            }
+        }
+    }
+
     let est_frames = match (&emu, &stills) {
         (Some(e), _) => Some(e.total),
         (None, Some(files)) => Some(files.len() as u64),
@@ -1535,7 +1777,10 @@ pub fn render(opts: Opts) -> Result<()> {
     // open, so its audio is muxed in a second (stream-copy) pass at the end.
     let emu_audio = emu.as_ref().map(|e| (e.core.sample_rate, e.audio.is_some())).filter(|(_, on)| *on);
     let want_audio = opts.audio && !glob && emu.is_none();
-    let video_target = if emu_audio.is_some() {
+    // The character's voice and sound effects land on their own bed, mixed in at the
+    // end alongside whatever the picture came with.
+    let agent_audio = agent.is_some() && opts.audio;
+    let video_target = if emu_audio.is_some() || agent_audio {
         work.join(format!(
             "video-only.{}",
             opts.output.extension().and_then(|e| e.to_str()).unwrap_or("mkv")
@@ -1749,6 +1994,16 @@ pub fn render(opts: Opts) -> Result<()> {
             eprintln!("[render] {:>8.2}s · preset → {}", t, cur_preset.name);
         }
 
+        // The character goes into the *signal*, not over the finished picture — so he
+        // is made of phosphor like everything else: scanlines across him, the beam
+        // blooming his highlights, his motion trailing red as the green and blue decay
+        // out from under it. Compositing him after the tube would have made him a
+        // sticker on a photograph.
+        if let Some(a) = &mut agent {
+            a.step(t, 1.0 / fps as f32);
+            a.draw(&mut src_buf, src_dim.0, src_dim.1);
+        }
+
         res.set_source(&device, &queue, src_dim.0, src_dim.1, format, &src_buf);
 
         // Black-frame insertion blanks the emitted phosphor on alternate frames; only
@@ -1847,28 +2102,36 @@ pub fn render(opts: Opts) -> Result<()> {
         bail!("no frames were decoded from {media:?} — is it a video?");
     }
 
-    // The emulator's PCM is muxed on after the fact (stream-copying the video), which
-    // is why this path encodes to a scratch file first.
+    // Anything that arrived as raw PCM rather than as a file ffmpeg could open — the
+    // core's output, the character's voice — is muxed on after the fact against the
+    // stream-copied video, which is why those paths encoded to a scratch file first.
+    let mut beds: Vec<PcmBed> = Vec::new();
     if let Some((rate, _)) = emu_audio {
-        let pcm = work.join("emu-audio.raw");
         if emu_audio_frames == 0 {
-            eprintln!("[render] core produced no audio — leaving the video silent");
+            eprintln!("[render] core produced no audio — leaving the game silent");
+        } else {
+            beds.push(PcmBed { path: work.join("emu-audio.raw"), rate: rate as u32 });
+        }
+    }
+    if let Some(a) = &agent {
+        if !a.audio.is_empty() {
+            let path = work.join("agent-audio.raw");
+            a.audio.write_raw(&path)?;
+            beds.push(PcmBed { path, rate: crate::agent::AUDIO_RATE });
+        }
+    }
+    if video_target != opts.output {
+        if beds.is_empty() {
             std::fs::rename(&video_target, &opts.output).context("moving the finished video")?;
         } else {
-            let mux = Command::new("ffmpeg")
-                .args(["-hide_banner", "-v", "error", "-y", "-i"])
-                .arg(&video_target)
-                .args(["-f", "s16le", "-ar", &format!("{rate:.0}"), "-ac", "2", "-i"])
-                .arg(&pcm)
-                .args(["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest"])
-                .arg(&opts.output)
-                .status()
-                .context("muxing the emulator audio")?;
-            if !mux.success() {
-                bail!("ffmpeg failed to mux the emulator audio ({mux})");
-            }
+            // `want_audio` put the source's own track into the scratch file already; it
+            // joins the mix rather than being replaced by it.
+            let embedded = want_audio && has_audio_stream(&video_target);
+            mux_beds(&video_target, &beds, embedded, &opts.output)?;
             std::fs::remove_file(&video_target).ok();
-            std::fs::remove_file(&pcm).ok();
+        }
+        for bed in &beds {
+            std::fs::remove_file(&bed.path).ok();
         }
     }
     println!(
@@ -1911,7 +2174,11 @@ Options:
   --movie FILE       instead, play a pre-authored replay/TAS through RetroArch
   --core NAME        libretro core (guessed from the ROM extension otherwise)
   --option K=V       libretro core option, repeatable (e.g. for a software renderer)
+  --agent NAME       put a Microsoft Agent character on the screen (Clippy, Merlin, …)
+                     and drive him from the script: show/say/point/play/move
   --dry-run          print the plan and the ffmpeg commands, then stop
+
+  crtulum --fetch-agent NAME   download a character's assets first
 ";
 
 /// Parse the `--render …` tail of the command line.
@@ -1927,6 +2194,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
     let (mut size, mut fps, mut ssaa, mut source_size) = (None, None, None, None);
     let (mut start, mut duration, mut crf, mut codec) = (None, None, None, None);
     let (mut audio, mut dry_run, mut preset_arg) = (true, false, None);
+    let mut agent = None;
     let mut core_options: Vec<(String, String)> = Vec::new();
 
     let mut i = 0;
@@ -1959,6 +2227,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
                     .ok_or_else(|| anyhow!("--option wants key=value, got `{kv}`"))?;
                 core_options.push((k.to_string(), v.to_string()));
             }
+            "--agent" | "--character" => agent = Some(val()?),
             "--no-audio" | "-an" => audio = false,
             "--dry-run" => dry_run = true,
             "-o" | "--out" => positionals.insert(0, val()?),
@@ -2027,6 +2296,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
         duration: duration.or(script.duration),
         codec: codec.unwrap_or_else(|| default_codec.to_string()),
         crf: crf.unwrap_or(18),
+        agent: agent.or_else(|| script.agent.clone()),
         audio,
         // Script options first, so a --option on the command line overrides one.
         core_options: script.options.iter().cloned().chain(core_options).collect(),
@@ -2057,6 +2327,61 @@ mod tests {
         assert_eq!(parse_time("1:03").unwrap(), 63.0);
         assert_eq!(parse_time("1:02:30").unwrap(), 3750.0);
         assert!((parse_time("0:01.5").unwrap() - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_example_agent_script_compiles() {
+        use crate::agent::Cmd;
+        let text = std::fs::read_to_string("examples/agent.crts").expect("examples/agent.crts");
+        let s = parse_script(&text).expect("parse");
+        assert_eq!(s.agent.as_deref(), Some("merlin"));
+        // The run and the commentary share one timeline: inputs on exact frames,
+        // the character on the wall clock.
+        let mut inputs = InputTrack::compile(&s, 60.0);
+        assert_eq!(inputs.advance(512), crate::libretro::button_bit("a").unwrap() | crate::libretro::button_bit("right").unwrap());
+        let ev = agent_events(&s, 60.0);
+        assert_eq!(ev.len(), 8);
+        assert!(matches!(ev[0].1, Cmd::At(_)));
+        assert!(matches!(ev.last().unwrap().1, Cmd::Hide));
+        // Every animation the script names by hand has to exist on the character it
+        // names, or the example teaches a script that prints a warning and does nothing.
+        if let Ok(dir) = crate::agent::resolve("merlin") {
+            let c = crate::agent::Character::load(&dir, false).expect("load Merlin");
+            for (_, cmd) in &ev {
+                if let Cmd::Play(name) = cmd {
+                    assert!(c.animation(name).is_some(), "Merlin has no `{name}`");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parses_the_agent_track() {
+        let s = parse_script(
+            r#"
+            agent merlin
+            at 0.2  agent at 0.75,0.62
+            at 0.4  agent show
+            at 1.2  agent say "Watch this # frame-perfect jump."
+            at 4.0  agent point 0.2,0.55
+            at 5.5  agent move to 0.25,0.35 over 1.5
+            at 7.5  agent play Congratulate
+            at 9.0  agent hide
+            "#,
+        )
+        .unwrap();
+        assert_eq!(s.agent.as_deref(), Some("merlin"));
+        let ev = agent_events(&s, 60.0);
+        use crate::agent::Cmd;
+        assert_eq!(ev.len(), 7);
+        assert_eq!(ev[0], (0.2, Cmd::At([0.75, 0.62])));
+        assert_eq!(ev[1], (0.4, Cmd::Show));
+        // A `#` inside quotes is text, not the start of a comment.
+        assert_eq!(ev[2], (1.2, Cmd::Say("Watch this # frame-perfect jump.".into())));
+        assert_eq!(ev[3], (4.0, Cmd::Point([0.2, 0.55])));
+        assert_eq!(ev[4], (5.5, Cmd::MoveTo { to: [0.25, 0.35], over: 1.5 }));
+        assert_eq!(ev[5], (7.5, Cmd::Play("Congratulate".into())));
+        assert_eq!(ev[6], (9.0, Cmd::Hide));
     }
 
     #[test]

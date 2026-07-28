@@ -173,6 +173,65 @@ misbehaves takes the process with it — the mesen build on this machine segfaul
 hosted outside RetroArch, so the NES default order is nestopia, fceumm, quicknes,
 then mesen.
 
+### Someone to explain it
+
+A run is more watchable with a narrator, so a script can put a **Microsoft Agent**
+character on the screen — Clippy, Merlin, Genie, Peedy — and drive him along the same
+timeline as the run:
+
+```
+agent    merlin
+
+at 0.2   agent at 0.78,0.66            # bottom-right, where Clippy always sat
+at 0.5   agent show                    # plays the character's own entrance
+at 1.5   agent say "This run saves four frames on the first jump."
+at 6.0   agent point 0.30,0.62         # turns and gestures at part of the picture
+at 9.0   agent move to 0.22,0.30 over 1.2
+at 11.0  agent play Congratulate       # any animation the character has, by name
+at 13.0  agent hide
+```
+
+He is composited into the **signal**, before the tube — so he's made of phosphor like
+everything else on the screen. The mask breaks him into RGB stripes, the beam blooms
+his highlights, and when he crosses the screen he trails red as the green and blue
+decay out from under him. Compositing him over the finished render would have made
+him a sticker on a photograph.
+
+Between instructions he falls back to his rest pose, and after a few idle seconds he
+starts one of his own idle animations, the way he did on the desktop. Coordinates are
+normalised to the picture (`0,0` top-left, `1,1` bottom-right), so they survive a
+change of signal resolution. `agent point` and `agent move` pick the character's own
+directional `Gesture`/`Move` animations from where he is to where you sent him.
+
+`say` draws a word balloon that fills in as he speaks, and if `espeak-ng` is installed
+he actually says it — a formant synthesiser, like the SAPI 4 voice the real thing used,
+rather than something that sounds thirty years too new. `CRTULUM_TTS` replaces the
+command (`{out}` is the WAV path, the text arrives on stdin) if you'd rather use
+`piper` or anything else. His voice and the character's own sound effects are mixed
+onto the game's audio, not over it.
+
+Characters aren't in this repository — they're Microsoft's artwork and this is a
+reader for them. `--fetch-agent` pulls the sprite sheet and frame table
+[clippy.js](https://github.com/clippyjs/clippy.js) extracted from the original `.acs`
+files:
+
+```sh
+cargo run --release -- --fetch-agent Merlin
+cargo run --release -- --render out.mp4 --script examples/agent.crts
+```
+
+They land in `~/.local/share/crtulum/agents/`; `--agent` also takes a path to any
+directory holding an `agent.js` and a `map.png`, and `$CRTULUM_AGENTS` adds a search
+root. The animation model is the `.acs` one — an image plus overlays, a duration, and
+weighted branches back into the animation — so `agent play <name>` reaches anything
+the character can do. Branch choices come from a seeded generator advanced only by
+the frame loop, so a scripted run animates identically every time you render it.
+
+One thing these assets can't do: the original `.acs` carries mouth shapes for
+viseme-accurate lip-sync, and clippy.js baked its overlays into the frames. What you
+get is a speaking animation held for the length of the line. Real lip-sync needs an
+`.acs` reader.
+
 ### Which systems
 
 Three rendering paths, and the core chooses: a software framebuffer, **OpenGL** via a
@@ -367,6 +426,10 @@ colorspace mapping right. Use `[` / `]` to trim exposure to taste.
   the audio output.
 - `src/vkctx.rs` — the Vulkan equivalent: instance, device, the negotiation handshake,
   the `retro_hw_render_interface_vulkan` callbacks, and the image copy back to RGBA.
+- `src/agent.rs` — the Microsoft Agent character: sprite sheet and frame table,
+  the animator, the word balloon, speech, and the composite into the signal.
+  `src/font8x8.rs` is the balloon's character generator.
 - `examples/demo.crts` — a commented script showing every action.
+- `examples/agent.crts` — a scripted run with a character commentating it.
 - `examples/tas.crts` + `examples/make_test_rom.py` / `make_genesis_test_rom.py` — a
   scripted run, and the homebrew NES and Mega Drive ROMs it's verified against.

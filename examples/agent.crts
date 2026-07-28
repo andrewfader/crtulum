@@ -1,0 +1,46 @@
+# crtulum script — a scripted run with a Microsoft Agent character commentating.
+#
+#   crtulum --fetch-agent Merlin           # once: pull the sprite sheet down
+#   crtulum --render out.mp4 --script examples/agent.crts
+#
+# The character is composited into the *signal*, before the tube — so he's made of
+# phosphor like everything else on the screen. Scanlines run across him, the mask
+# breaks him into RGB stripes, and when he moves he trails red as the green and blue
+# phosphors decay out from under him.
+
+# ---- setup ----------------------------------------------------------------
+rom      "game.nes"            # quote anything with spaces in it
+frames   1200
+size     1280x960
+ssaa     2
+preset   trinitron
+camera   yaw=0.0 pitch=0.06 dist=2.6
+
+agent    merlin                # or clippy, genie, peedy, rover, links, …
+
+# ---- the run --------------------------------------------------------------
+# Inputs land on exact frames; the character runs on the wall clock beside them.
+
+at 1.0      press start
+frame 240   hold right
+frame 512   press a for 18 frames
+frame 700   release right
+
+# ---- the commentary -------------------------------------------------------
+# Coordinates are normalised to the picture: 0,0 is the top-left of the raster and
+# 1,1 the bottom-right, so they don't change when the signal resolution does.
+
+at 0.2   agent at 0.78,0.66            # park him bottom-right, where Clippy always sat
+at 0.5   agent show                    # plays the character's own entrance
+at 1.5   agent say "This run saves four frames on the first jump."
+
+at 6.0   agent point 0.30,0.62         # turn and gesture at part of the picture
+at 6.4   agent say "Right here."
+
+at 9.0   agent move to 0.22,0.30 over 1.2   # walks, playing his Move animation
+at 11.0  agent play Congratulate       # any animation the character has, by name
+at 13.0  agent hide
+
+# Between instructions he falls back to his rest pose, and after a few idle seconds
+# he'll start one of his own idle animations — the same behaviour he had on the
+# desktop. `crtulum --agent merlin` with no script gets you exactly that.

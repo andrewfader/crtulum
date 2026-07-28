@@ -13,7 +13,9 @@
 //
 // Controls: left-drag orbit · scroll zoom · Esc quit
 
+mod agent;
 mod capture;
+mod font8x8;
 mod glctx;
 mod vkctx;
 mod libretro;
@@ -2762,6 +2764,27 @@ fn main() {
             .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
             .unwrap_or((1000, 800));
         save_clip(in_dir, out_dir, w, h, preset);
+        return;
+    }
+
+    // `crtulum --fetch-agent Merlin` — pull a character's sprite sheet and frame table
+    // into the user's data directory, since we ship the reader and not the artwork.
+    if let Some(i) = args.iter().position(|a| a == "--fetch-agent") {
+        match args.get(i + 1) {
+            Some(name) if !name.starts_with('-') => {
+                if let Err(e) = agent::fetch(name) {
+                    eprintln!("[agent] {e:#}");
+                    std::process::exit(1);
+                }
+            }
+            _ => {
+                eprintln!(
+                    "--fetch-agent needs a character name: {}",
+                    agent::KNOWN.join(", ")
+                );
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
