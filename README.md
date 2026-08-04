@@ -458,3 +458,14 @@ colorspace mapping right. Use `[` / `]` to trim exposure to taste.
 - `examples/agent.crts` — a scripted run with a character commentating it.
 - `examples/tas.crts` + `examples/make_test_rom.py` / `make_genesis_test_rom.py` — a
   scripted run, and the homebrew NES and Mega Drive ROMs it's verified against.
+
+## License
+
+This project is licensed under the **CRTULUM Source-Available License**.
+
+- **Personal & Non-Commercial Use:** Free to view, compile, and use for personal, non-commercial, or evaluation purposes.
+- **Attribution Required:** Any distribution or copy must retain copyright notices and license text.
+- **Mandatory Notification:** Public redistribution or adaptation requires notifying the author prior to or upon release.
+- **Commercial Use & Authorization:** Commercial use, embedding, or commercial redistribution requires explicit prior authorization from the author. The author reserves the right to deny permission or require a negotiated licensing fee.
+
+See [`LICENSE`](LICENSE) for the full license text.

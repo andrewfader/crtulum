@@ -8,6 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CRTULUM_REQUIRE_GPU: "1"
+  VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+  VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
 
 jobs:
   build:
@@ -41,7 +44,5 @@ jobs:
       # CRTULUM_REQUIRE_GPU makes the melt test fail (not skip) if no adapter is
       # found — proving CI genuinely exercised the phosphor-persistence path.
       # Force lavapipe so we don't depend on any runner GPU being present.
-      env:
-        CRTULUM_REQUIRE_GPU: "1"
-        VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
       run: cargo test --verbose
+

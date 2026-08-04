@@ -3,6 +3,7 @@ name = "crtulum"
 version = "0.1.0"
 edition = "2021"
 description = "A manipulable 3D CRT tube renderer (M1: static test-pattern source)"
+license-file = "LICENSE"
 
 [dependencies]
 winit = "0.29"
