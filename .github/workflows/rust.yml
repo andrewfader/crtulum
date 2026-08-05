@@ -33,6 +33,7 @@ jobs:
           libpipewire-0.3-dev \
           libdbus-1-dev \
           libwayland-dev \
+          libasound2-dev \
           mesa-vulkan-drivers \
           libvulkan1 \
           vulkan-tools
