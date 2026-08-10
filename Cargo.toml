@@ -36,6 +36,15 @@ acs = { path = "crates/acs" }
 [patch.crates-io]
 wgpu-hal = { path = "vendor/wgpu-hal" }
 
+# Build scripts only -- does not affect codegen of the shipped binary.
+# Without debug-assertions (and the overflow-checks Cargo ties to it), bindgen's
+# macro evaluator silently drops libspa's casted macros -- SPA_ID_INVALID,
+# SPA_IDX_INVALID, SPA_TIME_INVALID, SPA_CPU_FORCE_AUTODETECT -- and libspa then
+# fails to compile with E0425. Measured: 0/6 release builds succeed without this,
+# 3/3 with it.
+[profile.release.build-override]
+debug-assertions = true
+
 [profile.dev]
 opt-level = 1        # keep the render loop smooth even in debug
 
