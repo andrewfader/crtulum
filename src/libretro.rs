@@ -131,6 +131,7 @@ const ENV_GET_LOG_INTERFACE: c_uint = 27;
 const ENV_GET_PERF_INTERFACE: c_uint = 28;
 
 const DEVICE_JOYPAD: c_uint = 1;
+const DEVICE_ANALOG: c_uint = 5;
 
 /// libretro joypad button ids, which double as the bit positions in an input mask.
 pub const BUTTONS: [(&str, u32); 20] = [
@@ -360,6 +361,7 @@ struct Host {
     got_frame: bool,
     audio: Vec<i16>,
     input: u32,
+    analog: [i16; 2],
     dir: CString,
     /// Set when the core asked for (and got) hardware rendering.
     hw: Option<HwRenderCallback>,
@@ -405,6 +407,7 @@ fn host() -> &'static Mutex<Host> {
             got_frame: false,
             audio: Vec::new(),
             input: 0,
+            analog: [0, 0],
             dir: CString::new(".").unwrap(),
             hw: None,
             hw_fbo: 0,
@@ -666,12 +669,18 @@ unsafe extern "C" fn audio_batch_cb(data: *const i16, frames: usize) -> usize {
 
 unsafe extern "C" fn input_poll_cb() {}
 
-unsafe extern "C" fn input_state_cb(port: c_uint, device: c_uint, _idx: c_uint, id: c_uint) -> i16 {
-    if port != 0 || device != DEVICE_JOYPAD || id > 15 {
+unsafe extern "C" fn input_state_cb(port: c_uint, device: c_uint, idx: c_uint, id: c_uint) -> i16 {
+    if port != 0 {
         return 0;
     }
     let h = host().lock().unwrap();
-    ((h.input >> id) & 1) as i16
+    if device == DEVICE_JOYPAD && id <= 15 {
+        ((h.input >> id) & 1) as i16
+    } else if device == DEVICE_ANALOG && idx == 0 && id < 2 {
+        h.analog[id as usize]
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -953,9 +962,14 @@ impl Core {
     /// The mask is the libretro joypad bit layout (see `BUTTONS`), so frame N of a
     /// script is frame N of the emulation — no timing slop.
     pub fn run_frame(&mut self, input: u32) -> Result<(Vec<u8>, u32, u32)> {
+        self.run_frame_with_analog(input, [0, 0])
+    }
+
+    pub fn run_frame_with_analog(&mut self, input: u32, analog: [i16; 2]) -> Result<(Vec<u8>, u32, u32)> {
         {
             let mut h = host().lock().unwrap();
             h.input = input;
+            h.analog = analog;
             h.got_frame = false;
             h.hw_frame_pending = false;
         }

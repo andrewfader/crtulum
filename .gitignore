@@ -1,8 +1,26 @@
-# Rust build artifacts
-/target
-
-# Backup files
+# Rust build artifacts.
+# Nested crate build dirs (crates/*/target, etc.) are ignored outright.
+# The root target/ is ignored too, except for the shipped release binary --
+# git can't re-include a path whose parent dir is excluded, so each level
+# down to target/release/crtulum has to be re-included in turn.
+**/*/target/
+/target/*
+!/target/release/
+/target/release/*
+!/target/release/crtulum
+# (vendor/wgpu-hal is a tracked source patch, not a build dir.)
 **/*.rs.bk
 
 # Environment
 .env
+
+# Logs and capture output
+*.log
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+
+# Claude Code local state
+.claude/scheduled_tasks.lock
+.claude/settings.local.json

@@ -168,6 +168,8 @@ pub enum Action {
     /// Press and leave down until a matching `release`.
     Hold { buttons: u32 },
     Release { buttons: u32 },
+    /// Set the left analog stick. Values use the conventional -1..1 range.
+    Stick { x: f32, y: f32 },
 
     // --- the character on the screen (only meaningful with an `agent`) ---
     /// One instruction to the Microsoft Agent character. Kept out of [`Timeline`]
@@ -492,6 +494,13 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
         // press a for 18 frames   an exact span — how a TAS is written
         // press a for 0.4         …or in seconds
         // hold right / release right / tap b
+        "stick" => {
+            let p = parse_point(&mut a)?;
+            Ok(Action::Stick { x: p[0].clamp(-1.0, 1.0), y: p[1].clamp(-1.0, 1.0) })
+        }
+        "center" if a.next().is_some_and(|v| v.eq_ignore_ascii_case("stick")) => {
+            Ok(Action::Stick { x: 0.0, y: 0.0 })
+        }
         "press" | "hold" | "release" | "tap" => {
             let mut buttons = 0u32;
             let mut dur = if verb == "tap" { Some(Dur::Frames(1)) } else { None };
@@ -788,7 +797,9 @@ impl Timeline {
                     let d = dur.map(|d| d.frames(fps) as f32 / fps as f32).unwrap_or(0.0);
                     tl.end = tl.end.max(t + d);
                 }
-                Action::Hold { .. } | Action::Release { .. } => tl.end = tl.end.max(t),
+                Action::Hold { .. } | Action::Release { .. } | Action::Stick { .. } => {
+                    tl.end = tl.end.max(t)
+                }
                 // The character is folded frame by frame, not sampled — see
                 // `agent_events`. He still counts toward the end of the script.
                 Action::Agent(_) => tl.end = tl.end.max(t),
@@ -873,12 +884,14 @@ enum InputOp {
     Up(u32),
     /// Held for a fixed number of frames from this one.
     Timed(u32, u64),
+    Stick([i16; 2]),
 }
 
 pub struct InputTrack {
     events: Vec<(u64, InputOp)>,
     cursor: usize,
     held: u32,
+    analog: [i16; 2],
     timed: Vec<(u64, u32)>, // (end frame, exclusive) → mask
     /// Last frame any input happens — used to pick a run length when the script
     /// doesn't give one.
@@ -905,28 +918,40 @@ impl InputTrack {
                     last_frame = last_frame.max(f);
                     InputOp::Up(*buttons)
                 }
+                Action::Stick { x, y } => {
+                    last_frame = last_frame.max(f);
+                    InputOp::Stick([
+                        (x * i16::MAX as f32) as i16,
+                        (y * i16::MAX as f32) as i16,
+                    ])
+                }
                 _ => continue,
             };
             events.push((f, op));
         }
         events.sort_by_key(|(f, _)| *f);
-        InputTrack { events, cursor: 0, held: 0, timed: Vec::new(), last_frame }
+        InputTrack { events, cursor: 0, held: 0, analog: [0, 0], timed: Vec::new(), last_frame }
     }
 
     /// The button mask for `frame`. Must be called with non-decreasing frames — the
     /// render loop walks forward, so this stays O(1) amortized.
     pub fn advance(&mut self, frame: u64) -> u32 {
+        self.advance_state(frame).0
+    }
+
+    pub fn advance_state(&mut self, frame: u64) -> (u32, [i16; 2]) {
         while self.cursor < self.events.len() && self.events[self.cursor].0 <= frame {
             let (at, op) = self.events[self.cursor];
             match op {
                 InputOp::Down(m) => self.held |= m,
                 InputOp::Up(m) => self.held &= !m,
                 InputOp::Timed(m, n) => self.timed.push((at + n, m)),
+                InputOp::Stick(v) => self.analog = v,
             }
             self.cursor += 1;
         }
         self.timed.retain(|(end, _)| *end > frame);
-        self.timed.iter().fold(self.held, |acc, (_, m)| acc | m)
+        (self.timed.iter().fold(self.held, |acc, (_, m)| acc | m), self.analog)
     }
 }
 
@@ -1217,8 +1242,8 @@ impl Emu {
             }
             return Ok(None);
         }
-        let mask = self.inputs.advance(self.frame);
-        let out = self.core.run_frame(mask)?;
+        let (mask, analog) = self.inputs.advance_state(self.frame);
+        let out = self.core.run_frame_with_analog(mask, analog)?;
         // `CRTULUM_DEBUG_INPUT=1` prints the run as it happens — every frame where the
         // held buttons change, which is what you want when a scripted run isn't doing
         // what you meant. (stderr, so it interleaves with the progress line.)
@@ -1683,8 +1708,8 @@ pub fn render(opts: Opts) -> Result<()> {
     // synthesised, since the balloon fills at the rate the voice reads it.
     let mut agent = match opts.agent.as_deref().or(opts.script.agent.as_deref()) {
         Some(name) if !opts.dry_run => {
-            let dir = crate::agent::resolve(name)?;
-            let ch = crate::agent::Character::load(&dir, opts.audio)?;
+            let path = crate::agent::resolve(name)?;
+            let ch = crate::agent::Character::load_path(&path, opts.audio)?;
             eprintln!(
                 "[agent] {} · {}x{} · {} animations",
                 ch.name,
@@ -2174,7 +2199,8 @@ Options:
   --movie FILE       instead, play a pre-authored replay/TAS through RetroArch
   --core NAME        libretro core (guessed from the ROM extension otherwise)
   --option K=V       libretro core option, repeatable (e.g. for a software renderer)
-  --agent NAME       put a Microsoft Agent character on the screen (Clippy, Merlin, …)
+  --agent NAME|ACS   put a Microsoft Agent character on screen (original .acs files
+                     or Clippy, Merlin, … clippy.js asset directories)
                      and drive him from the script: show/say/point/play/move
   --dry-run          print the plan and the ffmpeg commands, then stop
 

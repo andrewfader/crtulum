@@ -220,17 +220,16 @@ cargo run --release -- --fetch-agent Merlin
 cargo run --release -- --render out.mp4 --script examples/agent.crts
 ```
 
-They land in `~/.local/share/crtulum/agents/`; `--agent` also takes a path to any
-directory holding an `agent.js` and a `map.png`, and `$CRTULUM_AGENTS` adds a search
-root. The animation model is the `.acs` one — an image plus overlays, a duration, and
+They land in `~/.local/share/crtulum/agents/`; `--agent` also takes an original
+Microsoft Agent v2 `.acs` file or a directory holding an `agent.js` and a `map.png`,
+and `$CRTULUM_AGENTS` adds a search root. The animation model is the `.acs` one — an image plus overlays, a duration, and
 weighted branches back into the animation — so `agent play <name>` reaches anything
 the character can do. Branch choices come from a seeded generator advanced only by
 the frame loop, so a scripted run animates identically every time you render it.
 
-One thing these assets can't do: the original `.acs` carries mouth shapes for
-viseme-accurate lip-sync, and clippy.js baked its overlays into the frames. What you
-get is a speaking animation held for the length of the line. Real lip-sync needs an
-`.acs` reader.
+Native ACS characters retain their palette art, frame layers, embedded sound effects,
+and mouth-shape overlays. The overlays follow the synthesised speech amplitude for
+lip-sync. clippy.js exports use their pre-baked speaking animations.
 
 ### Which systems
 

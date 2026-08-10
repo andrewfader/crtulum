@@ -5,10 +5,8 @@
 //! optional weighted branches back into the same animation. That is the whole model,
 //! and it is reproduced here.
 //!
-//! The assets are the ones [clippy.js](https://github.com/clippyjs/clippy.js) extracted
-//! from the original `.acs` files: a `map.png` sprite sheet plus an `agent.js` holding
-//! the frame table as JSON. We ship the *loader*, not the characters — point `--agent`
-//! at a directory, or let `--fetch-agent` pull one down.
+//! Original Microsoft Agent v2 `.acs` files are parsed and rendered directly. The
+//! clippy.js `map.png` + `agent.js` export remains supported as a fallback.
 //!
 //! ## Where the character is drawn
 //!
@@ -18,14 +16,12 @@
 //! the glass at the corners. Compositing him over the finished 3D render instead would
 //! have made him a sticker on a photograph.
 //!
-//! ## What these assets can't do
-//!
-//! The original `.acs` carries `ACSOVERLAYINFO` mouth shapes (0x00–0x06) for real
-//! viseme lip-sync. clippy.js baked overlays into the frame images, so what we have is
-//! a speaking *animation*, looped for the length of the utterance — which is what
-//! clippy.js itself does. Phoneme-accurate mouths need the `.acs` reader.
+//! Native ACS characters use their `ACSOVERLAYINFO` mouth shapes (0x00–0x06), driven
+//! by the synthesised speech envelope. Exported clippy.js assets use their pre-baked
+//! speaking animation because the overlay data is no longer present.
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -66,6 +62,8 @@ pub struct Frame {
     pub exit_branch: Option<usize>,
     /// Weighted jumps, as percentages. Empty means "advance to the next frame".
     pub branches: Vec<(usize, u32)>,
+    /// Native ACS animation/frame indices. Exported clippy.js frames leave this unset.
+    native: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +85,12 @@ pub struct Character {
     /// Lowercased name → the key in `anims`, so scripts needn't match case.
     index: HashMap<String, String>,
     sounds: HashMap<String, Vec<i16>>,
+    native: Option<NativeCharacter>,
+}
+
+struct NativeCharacter {
+    character: acs::Character,
+    cache: RefCell<acs::ImageCache>,
 }
 
 impl Character {
@@ -129,7 +133,13 @@ impl Character {
                 .collect::<Result<Vec<_>>>()
                 .with_context(|| format!("in animation `{aname}`"))?;
             index.insert(aname.to_ascii_lowercase(), aname.clone());
-            anims.insert(aname.clone(), Animation { name: aname.clone(), frames });
+            anims.insert(
+                aname.clone(),
+                Animation {
+                    name: aname.clone(),
+                    frames,
+                },
+            );
         }
         if anims.is_empty() {
             bail!("{name} has no animations");
@@ -154,6 +164,103 @@ impl Character {
             anims,
             index,
             sounds,
+            native: None,
+        })
+    }
+
+    /// Load either an original Microsoft Agent v2 `.acs` file or a clippy.js
+    /// export directory. ACS images, overlays and embedded WAVE clips stay native.
+    pub fn load_path(path: &Path, with_sounds: bool) -> Result<Character> {
+        if path.is_file() {
+            return Self::load_acs(path, with_sounds);
+        }
+        Self::load(path, with_sounds)
+    }
+
+    fn load_acs(path: &Path, with_sounds: bool) -> Result<Character> {
+        let native = acs::load(path).with_context(|| format!("reading ACS character {path:?}"))?;
+        let frame_w = native.info.width as u32;
+        let frame_h = native.info.height as u32;
+        let locale = std::env::var("LC_ALL")
+            .ok()
+            .or_else(|| std::env::var("LANG").ok());
+        let primary = locale
+            .as_deref()
+            .and_then(acs::types::primary_language_from_locale);
+        let name = native
+            .info
+            .name_for(primary)
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Microsoft Agent")
+            })
+            .to_string();
+
+        let mut anims = HashMap::new();
+        let mut index = HashMap::new();
+        for (ai, animation) in native.animations.iter().enumerate() {
+            let frames = animation
+                .frames
+                .iter()
+                .enumerate()
+                .map(|(fi, frame)| Frame {
+                    duration_ms: frame.duration_ms() as f32,
+                    images: if frame.images.is_empty() {
+                        vec![]
+                    } else {
+                        vec![(0, 0)]
+                    },
+                    sound: frame.audio_index.map(|i| format!("acs:{i}")),
+                    exit_branch: usize::try_from(frame.exit_frame).ok(),
+                    branches: frame
+                        .branches
+                        .iter()
+                        .map(|b| (b.frame_index as usize, b.probability as u32))
+                        .collect(),
+                    native: Some((ai, fi)),
+                })
+                .collect();
+            index.insert(animation.name.to_ascii_lowercase(), animation.name.clone());
+            anims.insert(
+                animation.name.clone(),
+                Animation {
+                    name: animation.name.clone(),
+                    frames,
+                },
+            );
+        }
+        if anims.is_empty() {
+            bail!("{} has no animations", name);
+        }
+
+        let mut sounds = HashMap::new();
+        if with_sounds {
+            for i in 0..native.audio_count() {
+                if let Some(wav) = native.audio(i) {
+                    match wav_to_stereo(wav) {
+                        Ok(pcm) => {
+                            sounds.insert(format!("acs:{i}"), pcm);
+                        }
+                        Err(e) => eprintln!("[agent] ignoring ACS audio {i}: {e:#}"),
+                    }
+                }
+            }
+        }
+        Ok(Character {
+            name,
+            frame_w,
+            frame_h,
+            sheet_w: 0,
+            sheet_h: 0,
+            sheet: vec![],
+            anims,
+            index,
+            sounds,
+            native: Some(NativeCharacter {
+                character: native,
+                cache: RefCell::new(acs::ImageCache::new()),
+            }),
         })
     }
 
@@ -178,7 +285,26 @@ impl Character {
     }
 
     /// Composite one frame's images into a `frame_w * frame_h` RGBA buffer.
-    fn compose(&self, frame: &Frame, out: &mut Vec<u8>) {
+    fn compose(&self, frame: &Frame, mouth: Option<acs::MouthShape>, out: &mut Vec<u8>) {
+        if let (Some(native), Some((ai, fi))) = (&self.native, frame.native) {
+            if let Some(frame) = native
+                .character
+                .animations
+                .get(ai)
+                .and_then(|a| a.frames.get(fi))
+            {
+                match native
+                    .character
+                    .render_frame(frame, mouth, &mut native.cache.borrow_mut())
+                {
+                    Ok(image) => {
+                        *out = image.data;
+                        return;
+                    }
+                    Err(e) => eprintln!("[agent] could not render ACS frame: {e}"),
+                }
+            }
+        }
         out.clear();
         out.resize((self.frame_w * self.frame_h * 4) as usize, 0);
         for &(sx, sy) in &frame.images {
@@ -235,8 +361,11 @@ fn parse_frame(f: &serde_json::Value) -> Result<Frame> {
         duration_ms: f["duration"].as_f64().unwrap_or(100.0) as f32,
         images,
         sound: f["sound"].as_str().map(|s| s.to_string()),
-        exit_branch: f["exitBranch"].as_i64().and_then(|v| usize::try_from(v).ok()),
+        exit_branch: f["exitBranch"]
+            .as_i64()
+            .and_then(|v| usize::try_from(v).ok()),
         branches,
+        native: None,
     })
 }
 
@@ -271,14 +400,18 @@ fn load_sounds(dir: &Path) -> Result<HashMap<String, Vec<i16>>> {
     // one, so the swap is safe here in a way it wouldn't be for arbitrary text.
     let (_, json) = unwrap_callback(&js)?;
     let v: serde_json::Value = serde_json::from_str(&json.replace('\'', "\""))?;
-    let obj = v.as_object().ok_or_else(|| anyhow!("sounds are not an object"))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| anyhow!("sounds are not an object"))?;
 
     let mut out = HashMap::new();
     for (id, data) in obj {
         let Some(b64) = data.as_str().and_then(|s| s.split(",").nth(1)) else {
             continue;
         };
-        let Ok(mp3) = base64_decode(b64) else { continue };
+        let Ok(mp3) = base64_decode(b64) else {
+            continue;
+        };
         match decode_mp3(&mp3) {
             Ok(pcm) => {
                 out.insert(id.clone(), pcm);
@@ -293,8 +426,20 @@ fn load_sounds(dir: &Path) -> Result<HashMap<String, Vec<i16>>> {
 fn decode_mp3(mp3: &[u8]) -> Result<Vec<i16>> {
     let mut child = Command::new("ffmpeg")
         .args([
-            "-hide_banner", "-v", "error", "-f", "mp3", "-i", "pipe:0", "-f", "s16le", "-ar",
-            &AUDIO_RATE.to_string(), "-ac", "2", "pipe:1",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-f",
+            "mp3",
+            "-i",
+            "pipe:0",
+            "-f",
+            "s16le",
+            "-ar",
+            &AUDIO_RATE.to_string(),
+            "-ac",
+            "2",
+            "pipe:1",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -441,7 +586,10 @@ pub struct AudioBed {
 
 impl AudioBed {
     fn new() -> AudioBed {
-        AudioBed { data: Vec::new(), used: false }
+        AudioBed {
+            data: Vec::new(),
+            used: false,
+        }
     }
 
     /// Add `pcm` starting at `t` seconds, saturating rather than wrapping.
@@ -516,7 +664,11 @@ impl Rng {
         (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
     }
     fn below(&mut self, n: u32) -> u32 {
-        if n == 0 { 0 } else { self.next() % n }
+        if n == 0 {
+            0
+        } else {
+            self.next() % n
+        }
     }
 }
 
@@ -640,7 +792,10 @@ impl Agent {
             // Smoothstep: the Move animations are hops, and a linear glide under a
             // hop reads as sliding.
             let k = k * k * (3.0 - 2.0 * k);
-            self.pos = [from[0] + (to[0] - from[0]) * k, from[1] + (to[1] - from[1]) * k];
+            self.pos = [
+                from[0] + (to[0] - from[0]) * k,
+                from[1] + (to[1] - from[1]) * k,
+            ];
             if t >= t1 {
                 self.walk = None;
             }
@@ -659,7 +814,10 @@ impl Agent {
         match cmd {
             Cmd::Show => {
                 self.visible = true;
-                if let Some(a) = self.character.first_of(&["Show", "Greeting", "Greet", "Alert"]) {
+                if let Some(a) = self
+                    .character
+                    .first_of(&["Show", "Greeting", "Greet", "Alert"])
+                {
                     self.start(a, at);
                 }
             }
@@ -700,7 +858,8 @@ impl Agent {
                 self.visible = true;
                 let dir = [target[0] - self.pos[0], target[1] - self.pos[1]];
                 if let Some(a) = self.directional("Gesture", dir).or_else(|| {
-                    self.character.first_of(&["Alert", "GetAttention", "RestPose"])
+                    self.character
+                        .first_of(&["Alert", "GetAttention", "RestPose"])
                 }) {
                     self.start(a, at);
                 }
@@ -714,7 +873,10 @@ impl Agent {
                 };
                 // Take the samples out rather than cloning: an utterance is only ever
                 // spoken once, and `dur` (which `end()` still needs) stays behind.
-                let pcm = self.speech.get_mut(&idx).map(|u| std::mem::take(&mut u.pcm));
+                let pcm = self
+                    .speech
+                    .get_mut(&idx)
+                    .map(|u| std::mem::take(&mut u.pcm));
                 if let Some(pcm) = pcm {
                     self.audio.mix(at, &pcm, 0.9);
                 }
@@ -724,10 +886,13 @@ impl Agent {
                     reveal: dur,
                     until: at + dur + BALLOON_HANG,
                 });
-                if let Some(a) =
-                    self.character
-                        .first_of(&["Explain", "Announce", "Alert", "GestureRight", "RestPose"])
-                {
+                if let Some(a) = self.character.first_of(&[
+                    "Explain",
+                    "Announce",
+                    "Alert",
+                    "GestureRight",
+                    "RestPose",
+                ]) {
                     self.start(a, at);
                 }
             }
@@ -740,17 +905,28 @@ impl Agent {
     fn directional(&self, prefix: &str, dir: [f32; 2]) -> Option<String> {
         let (dx, dy) = (dir[0] * 0.75, dir[1]);
         let name = if dx.abs() >= dy.abs() {
-            if dx < 0.0 { "Left" } else { "Right" }
+            if dx < 0.0 {
+                "Left"
+            } else {
+                "Right"
+            }
         } else if dy < 0.0 {
             "Up"
         } else {
             "Down"
         };
-        self.character.animation(&format!("{prefix}{name}")).map(|a| a.name.clone())
+        self.character
+            .animation(&format!("{prefix}{name}"))
+            .map(|a| a.name.clone())
     }
 
     fn start(&mut self, anim: String, t: f32) {
-        self.playing = Some(Playing { anim, frame: 0, held_ms: 0.0, exiting: false });
+        self.playing = Some(Playing {
+            anim,
+            frame: 0,
+            held_ms: 0.0,
+            exiting: false,
+        });
         self.sounded = false;
         self.idle_since = t;
     }
@@ -838,7 +1014,12 @@ impl Agent {
     fn current_frame(&self) -> Option<&Frame> {
         match &self.playing {
             Some(p) => self.character.anims.get(&p.anim)?.frames.get(p.frame),
-            None => self.character.anims.get(self.rest.as_ref()?)?.frames.first(),
+            None => self
+                .character
+                .anims
+                .get(self.rest.as_ref()?)?
+                .frames
+                .first(),
         }
     }
 
@@ -863,7 +1044,8 @@ impl Agent {
             if !frame.images.is_empty() {
                 let frame = frame.clone();
                 let mut buf = std::mem::take(&mut self.composed);
-                self.character.compose(&frame, &mut buf);
+                let mouth = self.mouth_shape();
+                self.character.compose(&frame, mouth, &mut buf);
                 blit_scaled(
                     &buf,
                     self.character.frame_w,
@@ -882,6 +1064,36 @@ impl Agent {
         if let Some(b) = &self.balloon {
             draw_balloon(dst, w, h, b, (x, y, bw, bh), self.now);
         }
+    }
+
+    /// Pick an ACS mouth overlay from the actual mixed speech amplitude near now.
+    fn mouth_shape(&self) -> Option<acs::MouthShape> {
+        let b = self.balloon.as_ref()?;
+        if self.now < b.start || self.now >= b.start + b.reveal {
+            return Some(acs::MouthShape::Closed);
+        }
+        let center = (self.now * AUDIO_RATE as f32) as usize * 2;
+        let radius = (AUDIO_RATE / 100) as usize * 2;
+        let lo = center.saturating_sub(radius);
+        let hi = (center + radius).min(self.audio.data.len());
+        let peak = self
+            .audio
+            .data
+            .get(lo..hi)
+            .unwrap_or(&[])
+            .iter()
+            .map(|s| s.unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        Some(match peak {
+            0..=500 => acs::MouthShape::Closed,
+            501..=1800 => acs::MouthShape::Narrow,
+            1801..=4200 => acs::MouthShape::Medium,
+            4201..=8000 => acs::MouthShape::WideOpen1,
+            8001..=13000 => acs::MouthShape::WideOpen2,
+            13001..=20000 => acs::MouthShape::WideOpen3,
+            _ => acs::MouthShape::WideOpen4,
+        })
     }
 
     /// Time of the last scripted event — how long the run has to be for the agent to
@@ -919,14 +1131,22 @@ fn srgb_lut() -> &'static [f32; 256] {
         let mut t = [0.0f32; 256];
         for (i, v) in t.iter_mut().enumerate() {
             let c = i as f32 / 255.0;
-            *v = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+            *v = if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            };
         }
         t
     })
 }
 
 fn linear_to_srgb(v: f32) -> u8 {
-    let c = if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+    let c = if v <= 0.0031308 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
     (c.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
@@ -1055,7 +1275,12 @@ fn draw_balloon(dst: &mut [u8], w: u32, h: u32, b: &Balloon, ch: (i32, i32, u32,
     // game rather than commenting on it, and the real ones were never full-bleed.
     let max_cols = (((w as f32 * 0.62) as u32).saturating_sub(2 * pad) / cw).clamp(8, 32) as usize;
     let lines = wrap(&b.text, max_cols);
-    let cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1) as u32;
+    let cols = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(1)
+        .max(1) as u32;
 
     let bw = cols * cw + pad * 2;
     let bh = lines.len() as u32 * cell_h + pad * 2;
@@ -1065,7 +1290,11 @@ fn draw_balloon(dst: &mut [u8], w: u32, h: u32, b: &Balloon, ch: (i32, i32, u32,
     let (cx, cy, cbw, _cbh) = ch;
     let mut bx = cx + cbw as i32 / 2 - bw as i32 / 2;
     let above = cy - tail - bh as i32 >= 0;
-    let by = if above { cy - tail - bh as i32 } else { cy + _cbh as i32 + tail };
+    let by = if above {
+        cy - tail - bh as i32
+    } else {
+        cy + _cbh as i32 + tail
+    };
     // Keep the balloon inside the safe area. A consumer set scans the raster larger
     // than the visible faceplate, and the tube models that (`focus.y`, ~3.5–5% a side
     // depending on the signal) — a balloon flush to the raster edge falls off the
@@ -1081,7 +1310,14 @@ fn draw_balloon(dst: &mut [u8], w: u32, h: u32, b: &Balloon, ch: (i32, i32, u32,
                 continue;
             }
             let edge = x == 0 || y == 0 || x == bw as i32 - 1 || y == bh as i32 - 1;
-            put(dst, w, h, bx + x, by + y, if edge { BALLOON_INK } else { BALLOON_FILL });
+            put(
+                dst,
+                w,
+                h,
+                bx + x,
+                by + y,
+                if edge { BALLOON_INK } else { BALLOON_FILL },
+            );
         }
     }
 
@@ -1095,7 +1331,14 @@ fn draw_balloon(dst: &mut [u8], w: u32, h: u32, b: &Balloon, ch: (i32, i32, u32,
         };
         for x in (tip_x - half)..=(tip_x + half) {
             let edge = x == tip_x - half || x == tip_x + half || i == tail - 1;
-            put(dst, w, h, x, yy, if edge { BALLOON_INK } else { BALLOON_FILL });
+            put(
+                dst,
+                w,
+                h,
+                x,
+                yy,
+                if edge { BALLOON_INK } else { BALLOON_FILL },
+            );
         }
     }
 
@@ -1131,6 +1374,9 @@ fn draw_balloon(dst: &mut [u8], w: u32, h: u32, b: &Balloon, ch: (i32, i32, u32,
 /// then the per-user data directory `--fetch-agent` writes to, then `./agents`.
 pub fn resolve(name_or_path: &str) -> Result<PathBuf> {
     let direct = Path::new(name_or_path);
+    if direct.is_file() {
+        return Ok(direct.to_path_buf());
+    }
     if direct.join("agent.js").is_file() {
         return Ok(direct.to_path_buf());
     }
@@ -1139,10 +1385,19 @@ pub fn resolve(name_or_path: &str) -> Result<PathBuf> {
         // Match case-insensitively: scripts say `merlin`, the directory says `Merlin`.
         if let Ok(entries) = std::fs::read_dir(&base) {
             for e in entries.flatten() {
-                if e.file_name().to_string_lossy().eq_ignore_ascii_case(name_or_path)
-                    && e.path().join("agent.js").is_file()
+                let path = e.path();
+                let stem_matches = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().eq_ignore_ascii_case(name_or_path))
+                    .unwrap_or(false);
+                if (e
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(name_or_path)
+                    && path.join("agent.js").is_file())
+                    || (stem_matches && path.is_file())
                 {
-                    return Ok(e.path());
+                    return Ok(path);
                 }
             }
         }
@@ -1151,7 +1406,11 @@ pub fn resolve(name_or_path: &str) -> Result<PathBuf> {
     bail!(
         "no character `{name_or_path}` (looked in {}). `crtulum --fetch-agent {name_or_path}` \
          downloads one; known characters: {}",
-        tried.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>().join(", "),
+        tried
+            .iter()
+            .map(|p| format!("{p:?}"))
+            .collect::<Vec<_>>()
+            .join(", "),
         KNOWN.join(", ")
     )
 }
@@ -1198,7 +1457,10 @@ pub fn fetch(name: &str) -> Result<PathBuf> {
             std::fs::remove_file(&out).ok();
             // Only the sound bank is optional.
             if file != "sounds-mp3.js" {
-                bail!("could not download {url} — is `{canonical}` a real character? ({})", KNOWN.join(", "));
+                bail!(
+                    "could not download {url} — is `{canonical}` a real character? ({})",
+                    KNOWN.join(", ")
+                );
             }
         }
     }
@@ -1226,9 +1488,24 @@ mod tests {
                         sound: None,
                         exit_branch: Some(2),
                         branches: vec![(0, 100)],
+                        native: None,
                     },
-                    Frame { duration_ms: 100.0, images: vec![(0, 0)], sound: None, exit_branch: None, branches: vec![] },
-                    Frame { duration_ms: 100.0, images: vec![(0, 0)], sound: None, exit_branch: None, branches: vec![] },
+                    Frame {
+                        duration_ms: 100.0,
+                        images: vec![(0, 0)],
+                        sound: None,
+                        exit_branch: None,
+                        branches: vec![],
+                        native: None,
+                    },
+                    Frame {
+                        duration_ms: 100.0,
+                        images: vec![(0, 0)],
+                        sound: None,
+                        exit_branch: None,
+                        branches: vec![],
+                        native: None,
+                    },
                 ],
             },
         );
@@ -1243,6 +1520,7 @@ mod tests {
             anims,
             index,
             sounds: HashMap::new(),
+            native: None,
         }
     }
 
@@ -1263,7 +1541,15 @@ mod tests {
         assert_eq!((c.frame_w, c.frame_h), (128, 128));
         // The four directional gestures are what `agent point` compiles down to, and
         // RestPose is what he falls back to between animations.
-        for want in ["GestureLeft", "GestureRight", "GestureUp", "GestureDown", "RestPose", "Show", "Hide"] {
+        for want in [
+            "GestureLeft",
+            "GestureRight",
+            "GestureUp",
+            "GestureDown",
+            "RestPose",
+            "Show",
+            "Hide",
+        ] {
             assert!(c.animation(want).is_some(), "Merlin should have {want}");
         }
         // Lookup is case-insensitive so scripts can say `agent play restpose`.
@@ -1329,7 +1615,9 @@ mod tests {
         );
         let ink = |dst: &[u8]| {
             dst.chunks_exact(4)
-                .filter(|p| p[0] == BALLOON_FILL[0] && p[1] == BALLOON_FILL[1] && p[2] == BALLOON_FILL[2])
+                .filter(|p| {
+                    p[0] == BALLOON_FILL[0] && p[1] == BALLOON_FILL[1] && p[2] == BALLOON_FILL[2]
+                })
                 .count()
         };
         let mut text = Vec::new();
@@ -1342,7 +1630,10 @@ mod tests {
                 text.push(ink(&dst));
             }
         }
-        assert!(text[0] > 0, "the balloon should appear as soon as he speaks");
+        assert!(
+            text[0] > 0,
+            "the balloon should appear as soon as he speaks"
+        );
         assert!(
             text[0] > text[1] && text[1] > text[2],
             "text should fill in progressively, saw {text:?} balloon-fill pixels"
@@ -1401,24 +1692,34 @@ mod tests {
             }
             trace
         };
-        assert_eq!(run(), run(), "branch selection must not depend on anything but the frame index");
+        assert_eq!(
+            run(),
+            run(),
+            "branch selection must not depend on anything but the frame index"
+        );
     }
 
     #[test]
     fn wraps_on_word_boundaries_and_cuts_long_words() {
-        assert_eq!(wrap("the quick brown fox", 9), vec!["the quick", "brown fox"]);
-        assert_eq!(wrap("supercalifragilistic", 8), vec!["supercal", "ifragili", "stic"]);
+        assert_eq!(
+            wrap("the quick brown fox", 9),
+            vec!["the quick", "brown fox"]
+        );
+        assert_eq!(
+            wrap("supercalifragilistic", 8),
+            vec!["supercal", "ifragili", "stic"]
+        );
     }
 
     #[test]
     fn a_transparent_source_pixel_leaves_the_raster_alone() {
         let c = sheet_char();
         let mut frame_buf = Vec::new();
-        c.compose(&c.anims["Wave"].frames[0], &mut frame_buf);
+        c.compose(&c.anims["Wave"].frames[0], None, &mut frame_buf);
         assert_eq!(frame_buf, vec![255, 0, 0, 255]);
 
         let mut dst = vec![0u8, 0, 255, 255]; // one blue pixel
-        // Blit the transparent half of the sheet: nothing should change.
+                                              // Blit the transparent half of the sheet: nothing should change.
         let clear = vec![0u8, 0, 0, 0];
         blit_scaled(&clear, 1, 1, &mut dst, 1, 1, 0, 0, 1, 1);
         assert_eq!(dst, vec![0, 0, 255, 255]);
