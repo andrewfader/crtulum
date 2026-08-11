@@ -24,6 +24,7 @@ jobs:
       # with bindgen (needs libclang); ashpd/winit pull in dbus/wayland at build.
       # mesa-vulkan-drivers ships lavapipe, a software Vulkan device so the
       # headless GPU test (waterfall_melts) can actually run on the runner.
+      # gilrs needs libudev (gamepad enumeration) and libasound2 (force feedback).
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
@@ -34,6 +35,7 @@ jobs:
           libdbus-1-dev \
           libwayland-dev \
           libasound2-dev \
+          libudev-dev \
           mesa-vulkan-drivers \
           libvulkan1 \
           vulkan-tools
