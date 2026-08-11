@@ -9,8 +9,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CRTULUM_REQUIRE_GPU: "1"
-  VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-  VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
 
 jobs:
   build:
@@ -39,13 +37,32 @@ jobs:
           mesa-vulkan-drivers \
           libvulkan1 \
           vulkan-tools
+    - name: Point Vulkan at lavapipe
+      # Pin the loader to lavapipe so the GPU test never depends on a runner GPU
+      # being present — but *find* the ICD manifest rather than hardcoding it:
+      # the filename is packaging-dependent (mesa 25.2 on noble ships
+      # lvp_icd.json, older/other distros lvp_icd.x86_64.json) and a path that
+      # does not exist leaves the loader with zero drivers, which looks exactly
+      # like "this runner has no GPU".
+      run: |
+        icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json \
+                 /usr/lib/*/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1)
+        if [ -z "$icd" ]; then
+          echo "no lavapipe ICD found; mesa-vulkan-drivers ships:"
+          find / -name 'lvp_icd*.json' 2>/dev/null
+          exit 1
+        fi
+        echo "using $icd"
+        echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+        echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
     - name: Show Vulkan device
-      run: vulkaninfo --summary | grep -iE "deviceName|driverName" || true
+      # No `|| true`: if the loader cannot bring up lavapipe, fail here with the
+      # loader's own diagnostics rather than six minutes later inside the tests.
+      run: vulkaninfo --summary | grep -iE "deviceName|driverName"
     - name: Build
       run: cargo build --verbose
     - name: Run tests
       # CRTULUM_REQUIRE_GPU makes the melt test fail (not skip) if no adapter is
       # found — proving CI genuinely exercised the phosphor-persistence path.
-      # Force lavapipe so we don't depend on any runner GPU being present.
       run: cargo test --verbose
 

@@ -3207,16 +3207,16 @@ mod tests {
 
     // Headless device, or None on a machine with no usable GPU adapter (CI
     // software-render runners): the caller skips rather than fails.
+    //
+    // Vulkan first, and only then the rest. The tube's fragment shader goes
+    // through naga's GLSL backend on the GL path, which emits a `gl_`-prefixed
+    // temporary that mesa's compiler rejects outright — so a machine with both
+    // backends must not be allowed to pick GL and fail a shading test for
+    // reasons that have nothing to do with shading. Enumerating GL is also what
+    // panics (rather than reporting "no adapter") when EGL has no usable vendor.
     fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY | wgpu::Backends::SECONDARY,
-            ..Default::default()
-        });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))?;
+        let adapter = adapter_on(wgpu::Backends::VULKAN)
+            .or_else(|| adapter_on(wgpu::Backends::all() - wgpu::Backends::VULKAN))?;
         pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("test-device"),
@@ -3226,6 +3226,18 @@ mod tests {
             None,
         ))
         .ok()
+    }
+
+    fn adapter_on(backends: wgpu::Backends) -> Option<wgpu::Adapter> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            ..Default::default()
+        });
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
     }
 
     // Feed a sequence of source frames through the tube (phosphor history carried
