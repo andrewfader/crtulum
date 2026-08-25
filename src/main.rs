@@ -30,7 +30,7 @@ use winit::{
     event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::EventLoop,
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowBuilder},
+    window::{Fullscreen, Window, WindowBuilder},
 };
 
 // ---------------------------------------------------------------------------
@@ -310,8 +310,10 @@ fn build_mesh(bulge: f32, cx: f32, cy: f32, cab: Cabinet) -> (Vec<Vertex>, Vec<u
             let p1 = [kx + kc * a1.cos(), ky + kc * a1.sin(), base_z];
             let q0 = [kx + kc * a0.cos(), ky + kc * a0.sin(), zk];
             let q1 = [kx + kc * a1.cos(), ky + kc * a1.sin(), zk];
-            quad(v, ix, [p0, p1, q1, q0], pl); // knob wall
-            quad(v, ix, [q0, q1, [kx, ky, zk], [kx, ky, zk]], pl); // knob top
+            // Fractional material tag preserves the cabinet colour family while letting
+            // the shader give frequently-handled knobs a slightly smoother finish.
+            quad(v, ix, [p0, p1, q1, q0], pl + 0.15); // knob wall
+            quad(v, ix, [q0, q1, [kx, ky, zk], [kx, ky, zk]], pl + 0.15); // knob top
         }
     };
 
@@ -514,10 +516,10 @@ struct Uniforms {
     cmat0: [f32; 4],  // CRT-phosphor → sRGB colour matrix, row 0 (real gamut + white pt)
     cmat1: [f32; 4],  // row 1
     cmat2: [f32; 4],  // row 2
-    pwr: [f32; 4],    // power state: warmup(0..1), collapse(0..1), degauss(0..1), _
+    pwr: [f32; 4],    // power state: warmup, collapse, degauss, specular-glare enabled
     focus: [f32; 4],  // x=edge defocus (deflection spot growth), y=overscan (per side), z=roll rate, w=roll amp
     fx: [f32; 4],     // x=svm (scan-velocity crispen), y=diffusion (wide glass glow), z=subpixel mask flag, w=bfi screen mult
-    beam2: [f32; 4],  // x=spot profile exponent p, y=1/(2*gamma(1+1/p)) profile normalizer,
+    beam2: [f32; 4],  // x=spot profile exponent p, y=window-reflection enabled,
                       // z=ambient diffuse wash through the tinted faceplate, w=scatter redistribution
 }
 
@@ -1634,6 +1636,8 @@ fn write_uniforms(
     exposure: f32,
     subpixel: bool,
     bfi_mul: f32,
+    glare: bool,
+    window_reflection: bool,
 ) {
     let (view_proj, eye) = orbit.view_proj(aspect);
     let cmat = preset_color_matrix(preset);
@@ -1828,7 +1832,7 @@ fn write_uniforms(
         cmat1: cmat[1],
         cmat2: cmat[2],
         // Power-on warmup / power-off collapse / degauss animation state.
-        pwr,
+        pwr: [pwr[0], pwr[1], pwr[2], if glare { 1.0 } else { 0.0 }],
         // Deflection defocus + overscan, derived from the tube's character (below).
         focus: {
             // Edge/corner defocus (physics: off-axis the beam path lengthens and the
@@ -1926,8 +1930,8 @@ fn write_uniforms(
             // Scattering redistributes light rather than adding it, so halation/diffusion
             // take their share out of the direct term. Kept partial (not the full 1.0) —
             // some of what scatters forward still reaches the eye inside the same pixel.
-            // .y is reserved (was the CPU-side spot-area normaliser).
-            [p, 0.0, wash, 0.55]
+            // .y independently gates the recognisable mullioned-window reflection.
+            [p, if window_reflection { 1.0 } else { 0.0 }, wash, 0.55]
         },
     };
     queue.write_buffer(&res.ubuf, 0, bytemuck::bytes_of(&uniforms));
@@ -2054,6 +2058,8 @@ struct State {
     subpixel: bool,   // subpixel-accurate (Megatron) mask vs the resolution-independent one (M key)
     bfi: bool,        // black-frame insertion for CRT-impulse motion clarity (B key; needs a high-refresh panel)
     refresh_hz: f32,  // detected panel refresh (for the BFI safety gate / message)
+    glare: bool,      // tight ceiling-light specular on the faceplate (L key)
+    window_reflection: bool, // mullioned daylight reflection in the environment (R key)
 }
 
 // Best-effort panel refresh detection. On Wayland current_monitor() is often None
@@ -2158,9 +2164,12 @@ impl State {
             res,
             depth_view,
             orbit: Orbit {
-                yaw: 0.0,
-                pitch: 0.15,
-                distance: 2.6,
+                // A restrained three-quarter product view exposes the tube's real depth,
+                // curved faceplate and cabinet edge highlights. Dead-front framing made
+                // even the deep mesh read like a flat shader preview.
+                yaw: 0.24,
+                pitch: 0.18,
+                distance: 2.65,
             },
             start: std::time::Instant::now(),
             last_frame: std::time::Instant::now(),
@@ -2172,6 +2181,8 @@ impl State {
             exposure: 1.0,
             subpixel: false,
             bfi: false,
+            glare: true,
+            window_reflection: true,
             // Panel refresh, for the BFI gate: strobing only helps at ≥100 Hz (at 60 Hz
             // it just flickers at 30). Best effort — re-detected on the first BFI toggle
             // once the Wayland surface has entered an output.
@@ -2360,6 +2371,8 @@ impl State {
             self.exposure,
             self.subpixel,
             bfi_mul,
+            self.glare,
+            self.window_reflection,
         );
 
         let frame = self.surface.get_current_texture()?;
@@ -2456,7 +2469,13 @@ fn save_shot(path: &str, width: u32, height: u32, preset: Preset) {
     // default; CRTULUM_SUBPIXEL=1 forces it for structural checks. BFI is a live-only
     // motion effect (a still can't show a strobe), so the shot always renders lit.
     let subpixel = envf("CRTULUM_SUBPIXEL", 0.0) > 0.5;
-    write_uniforms(&queue, &res, &orbit, width as f32 / height as f32, shot_t, &preset, SS as f32, false, dt, pwr, interlace, field, exposure, subpixel, 1.0);
+    let glare = envf("CRTULUM_GLARE", 1.0) > 0.5;
+    let window_reflection = envf("CRTULUM_WINDOW_REFLECTION", 1.0) > 0.5;
+    write_uniforms(
+        &queue, &res, &orbit, width as f32 / height as f32, shot_t, &preset, SS as f32,
+        false, dt, pwr, interlace, field, exposure, subpixel, 1.0, glare,
+        window_reflection,
+    );
 
     // Warm up the phosphor plane. A single headless frame has no history, so run
     // the accumulation a few fields to reach steady state. CRTULUM_MOTION=1 instead
@@ -2685,7 +2704,7 @@ fn save_clip(in_dir: &str, out_dir: &str, width: u32, height: u32, preset: Prese
         // fields, so moving water leaves a decaying trail across output frames.
         write_uniforms(
             &queue, &res, &orbit, width as f32 / height as f32, t, &preset, SS as f32,
-            false, dt, pwr, 0.0, field, exposure, false, 1.0,
+            false, dt, pwr, 0.0, field, exposure, false, 1.0, true, true,
         );
         let mut enc = device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("clip-accum") });
@@ -2901,7 +2920,35 @@ fn main() {
                             };
                             if !consumed && event.state == ElementState::Pressed {
                                 match event.physical_key {
-                                    PhysicalKey::Code(KeyCode::Escape) => elwt.exit(),
+                                    PhysicalKey::Code(KeyCode::Escape) => {
+                                        if state.window.fullscreen().is_some() {
+                                            state.window.set_fullscreen(None);
+                                            eprintln!("[fullscreen] off");
+                                        } else {
+                                            elwt.exit();
+                                        }
+                                    }
+                                    // F11 = borderless fullscreen; Escape leaves it first.
+                                    PhysicalKey::Code(KeyCode::F11) => {
+                                        let fullscreen = state.window.fullscreen().is_none();
+                                        state.window.set_fullscreen(if fullscreen {
+                                            Some(Fullscreen::Borderless(
+                                                state.window.current_monitor(),
+                                            ))
+                                        } else {
+                                            None
+                                        });
+                                        eprintln!("[fullscreen] {}", if fullscreen { "on" } else { "off" });
+                                    }
+                                    // L and R isolate the two strongest photographic glass cues.
+                                    PhysicalKey::Code(KeyCode::KeyL) => {
+                                        state.glare = !state.glare;
+                                        eprintln!("[glare] {}", if state.glare { "on" } else { "off" });
+                                    }
+                                    PhysicalKey::Code(KeyCode::KeyR) => {
+                                        state.window_reflection = !state.window_reflection;
+                                        eprintln!("[window reflection] {}", if state.window_reflection { "on" } else { "off" });
+                                    }
                                     // 1..9,0 pick a preset directly; Tab cycles through all.
                                     PhysicalKey::Code(KeyCode::Digit1) => state.set_preset(ALL_PRESETS[0]),
                                     PhysicalKey::Code(KeyCode::Digit2) => state.set_preset(ALL_PRESETS[1]),
@@ -3278,7 +3325,7 @@ mod tests {
             res.set_source(device, queue, sw, sh, format, frame);
             write_uniforms(
                 queue, &res, &orbit, ow as f32 / oh as f32, t, &TRINITRON, 1.0, false, dt, pwr,
-                0.0, field, 1.0, false, 1.0,
+                0.0, field, 1.0, false, 1.0, true, true,
             );
             let mut enc = device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test-accum") });

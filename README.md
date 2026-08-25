@@ -54,6 +54,13 @@ Every CRT control still works while you play — orbit the tube with the mouse, 
 presets with the number keys, cut the power with **P**. The game's buttons take
 priority, so they can't also change the television.
 
+The live window also has presentation controls: **F11** toggles borderless fullscreen
+(**Esc** leaves fullscreen before quitting), **L** toggles the tight glass glare, and
+**R** toggles the daylight-window reflection. The latter two are independent, so the
+tube can be viewed under neutral glass lighting without adding a visible room cue.
+Headless shots expose the same switches as `CRTULUM_GLARE=0` and
+`CRTULUM_WINDOW_REFLECTION=0`.
+
 Sound comes from the core, resampled to whatever your audio device wanted.
 `CRTULUM_PLAY_STATS=1` prints the emulated rate and how much audio is buffered, which
 is what to look at if it ever feels off.

@@ -35,6 +35,8 @@ acs = { path = "crates/acs" }
 # (maps BT.2020-linear surfaces to Rgba16Float so an HDR swapchain is reachable).
 [patch.crates-io]
 wgpu-hal = { path = "vendor/wgpu-hal" }
+libspa-sys = { path = "vendor/libspa-sys" }
+pipewire-sys = { path = "vendor/pipewire-sys" }
 
 # Build scripts only -- does not affect codegen of the shipped binary.
 # Without debug-assertions (and the overflow-checks Cargo ties to it), bindgen's

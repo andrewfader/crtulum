@@ -2043,7 +2043,7 @@ pub fn render(opts: Opts) -> Result<()> {
             write_uniforms(
                 &queue, &res, &shot.orbit, ow as f32 / oh as f32, ft, &cur_preset, ss as f32,
                 false, field_dt, shot.pwr, shot.interlace, field_parity, shot.exposure,
-                shot.subpixel, bfi_mul,
+                shot.subpixel, bfi_mul, true, true,
             );
             accum_step(&mut enc, &mut res);
             field_parity = 1.0 - field_parity;

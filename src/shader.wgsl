@@ -24,11 +24,11 @@ struct Uniforms {
     cmat0: vec4<f32>,   // CRT-phosphor → sRGB colour matrix rows (real gamut + white pt)
     cmat1: vec4<f32>,
     cmat2: vec4<f32>,
-    pwr: vec4<f32>,     // power: x=warmup(0..1), y=collapse(0..1), z=degauss(0..1), w unused
+    pwr: vec4<f32>,     // power: x=warmup, y=collapse, z=degauss, w=specular glare enabled
     focus: vec4<f32>,   // x=edge defocus (deflection spot growth), y=overscan(per side), z=roll rate, w=roll amp
     fx: vec4<f32>,      // x=svm (scan-velocity crispening), y=diffusion (wide glass glow), z=subpixel-mask flag, w=bfi screen multiplier
     beam2: vec4<f32>,   // x=spot profile exponent p at low beam current,
-                        // y=reserved, z=ambient diffuse wash through the tinted faceplate, w=scatter redistribution
+                        // y=window reflection enabled, z=ambient diffuse wash, w=scatter redistribution
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -75,6 +75,28 @@ fn hash21(p: vec2<f32>) -> f32 {
     var q = fract(p * vec2<f32>(123.34, 345.45));
     q = q + dot(q, q + 34.345);
     return fract(q.x * q.y);
+}
+
+// Smooth, object-space value noise for molded materials. Unlike the old per-cell hash,
+// this has no square pixel boundaries and does not swim with the camera. Triplanar
+// projection keeps the pebble scale continuous across front, side and chamfer faces.
+fn value_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let s = f * f * (3.0 - 2.0 * f);
+    let a = hash21(i);
+    let b = hash21(i + vec2<f32>(1.0, 0.0));
+    let c = hash21(i + vec2<f32>(0.0, 1.0));
+    let d = hash21(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, s.x), mix(c, d, s.x), s.y);
+}
+
+fn molded_noise(p: vec3<f32>, n: vec3<f32>, scale: f32) -> f32 {
+    let an = pow(abs(n), vec3<f32>(4.0));
+    let w = an / max(an.x + an.y + an.z, 1e-4);
+    return value_noise(p.yz * scale + vec2<f32>(17.0, 41.0)) * w.x
+         + value_noise(p.zx * scale + vec2<f32>(53.0, 11.0)) * w.y
+         + value_noise(p.xy * scale + vec2<f32>(29.0, 67.0)) * w.z;
 }
 
 // Three phosphor stripes (R,G,B) across a triad, evaluated periodically so the
@@ -210,7 +232,7 @@ fn room(r: vec3<f32>) -> vec3<f32> {
     let inwin = smoothstep(0.52, 0.42, abs(wx)) * smoothstep(0.52, 0.42, abs(wy));
     let barx = smoothstep(0.05, 0.11, abs(fract(wx * 1.6) - 0.5));
     let bary = smoothstep(0.05, 0.11, abs(fract(wy * 1.6) - 0.5));
-    c = c + vec3<f32>(1.6, 1.78, 2.15) * inwin * mix(0.18, 1.0, min(barx, bary)) * 0.9;
+    c = c + vec3<f32>(1.6, 1.78, 2.15) * inwin * mix(0.18, 1.0, min(barx, bary)) * 0.9 * u.beam2.y;
     // Soft rectangular ceiling softbox (broad area highlight on the gloss).
     let win = smoothstep(0.45, 0.97, r.y) * smoothstep(0.66, 0.06, abs(r.x - 0.35));
     c = c + vec3<f32>(1.2, 1.25, 1.42) * win * 1.7;
@@ -792,10 +814,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             metal = 1.0;
         } else if (in.material > 3.5 && in.material < 4.5) {
             // Speaker grille (material 4): near-black woven cloth — matte, light-drinking,
-            // with a fine weave mottle. Low, broken specular (fabric, not plastic).
-            let weave = hash21(floor(in.world_pos.xy * 90.0)) * hash21(floor(in.world_pos.yx * 80.0));
-            base = vec3<f32>(0.010, 0.010, 0.012) * (0.55 + 0.7 * weave);
-            rough = 0.93;
+            // with interlaced warp/weft catching different amounts of light. The weave is
+            // low contrast so it resolves nearby and integrates to cloth from a distance.
+            let warp = 0.5 + 0.5 * sin(in.world_pos.x * 760.0);
+            let weft = 0.5 + 0.5 * sin(in.world_pos.y * 690.0 + warp * 0.7);
+            let weave = mix(warp, weft, 0.48);
+            base = vec3<f32>(0.010, 0.010, 0.012) * (0.82 + 0.20 * weave);
+            rough = 0.96 - weave * 0.025;
             metal = 0.0;
         } else {
             // Molded cabinet plastic. The base tone + finish are per-brand (the vertex
@@ -812,21 +837,40 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             } else if (in.material < 6.5) {
                 pbase = vec3<f32>(0.145, 0.150, 0.160); // cool silver-grey (Panasonic / PC)
                 prough_lo = 0.34; prough_hi = 0.66;     // a touch glossier than TV charcoal
-                metal = 0.25;                           // faint metallic-silver sheen
+                // Silver-painted ABS remains a dielectric; treating it as partially metal
+                // tinted every reflection grey and made the cabinet look like cast alloy.
+                metal = 0.0;
             } else {
                 pbase = vec3<f32>(0.235, 0.210, 0.165); // warm beige (terminal case)
                 prough_lo = 0.55; prough_hi = 0.88;     // chalky matte
             }
             base = pbase;
-            // Injection-molded pebble finish: mottle the albedo, perturb roughness and
-            // the normal so the specular breaks into a fine matte sparkle, not a mirror.
-            let tx = hash21(floor(in.world_pos.xy * 140.0)) + hash21(floor(in.world_pos.yz * 130.0));
-            rough = clamp(0.62 + (tx - 1.0) * 0.12, prough_lo, prough_hi); // matte molded plastic
-            base = base * (0.78 + 0.40 * hash21(floor(in.world_pos.xy * 70.0))); // stronger mottle
-            let jit = vec3<f32>(hash21(in.world_pos.xy * 95.0) - 0.5,
-                                hash21(in.world_pos.yz * 95.0) - 0.5,
-                                (hash21(in.world_pos.zx * 95.0) - 0.5) * 0.4) * 0.05;
-            nn = normalize(nn + jit);
+            // Real injection-molded ABS is nearly uniform in colour. Its visible texture
+            // is mostly a sub-millimetre roughness/normal variation, with only faint,
+            // broad pigment clouds. The previous 40% albedo cells read as camouflage-like
+            // CG noise and exposed every projection seam.
+            let pigment = molded_noise(in.world_pos, nn, 34.0);
+            let pebble = molded_noise(in.world_pos, nn, 310.0);
+            let micro = molded_noise(in.world_pos + vec3<f32>(0.37, 0.19, 0.71), nn, 620.0);
+            base = base * (0.985 + 0.030 * pigment);
+            rough = clamp(0.61 + (pebble - 0.5) * 0.11 + (micro - 0.5) * 0.035,
+                          prough_lo, prough_hi);
+
+            // Project a tiny isotropic perturbation into the geometric tangent plane.
+            // It breaks a highlight without changing the cabinet silhouette or turning
+            // the material into hammered metal. Raised knobs are subtly smoother where
+            // years of handling polish the molded texture.
+            let rvec = vec3<f32>(
+                molded_noise(in.world_pos + vec3<f32>(0.13, 0.31, 0.07), nn, 430.0) - 0.5,
+                molded_noise(in.world_pos + vec3<f32>(0.47, 0.17, 0.59), nn, 430.0) - 0.5,
+                molded_noise(in.world_pos + vec3<f32>(0.73, 0.61, 0.23), nn, 430.0) - 0.5,
+            );
+            let tangent_jit = rvec - nn * dot(rvec, nn);
+            nn = normalize(nn + tangent_jit * 0.022);
+            if (fract(in.material) > 0.10) {
+                rough = max(prough_lo, rough - 0.10);
+                base = base * 1.015;
+            }
             // Ventilation slots: real sets vent heat through fine louvres across the TOP
             // toward the rear. Thin dark grooves (darker albedo + a normal tilt so they
             // self-shade) where the face points up and we're behind the front box.
@@ -1313,7 +1357,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // old × 2.0 put it at ~1.6 — four times over, a mirror-finish sheen no faceplate has.
     let light_dir = normalize(vec3<f32>(-0.35, 0.55, 0.95));
     let glare = pow(max(dot(refl, light_dir), 0.0), 130.0);
-    col = col + vec3<f32>(1.0, 0.98, 0.92) * glare * (0.3 + u.glass.y) * 0.5;
+    col = col + vec3<f32>(1.0, 0.98, 0.92) * glare * (0.3 + u.glass.y) * 0.5 * u.pwr.w;
 
     // Output. col is HDR (linear light, BT.709/sRGB primaries, highlights >1.0).
     if (u.tone.x > 0.5) {

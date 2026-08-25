@@ -1,0 +1,28 @@
+[package]
+name = "pipewire-sys"
+version.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+links = "pipewire-0.3"
+categories.workspace = true
+description = "Rust FFI bindings for PipeWire"
+repository.workspace = true
+license.workspace = true
+readme = "README.md"
+homepage.workspace = true
+documentation = "https://pipewire.pages.freedesktop.org/pipewire-rs/pipewire_sys/"
+keywords = ["ffi", "pipewire", "multimedia", "audio", "video"]
+
+[dependencies]
+spa_sys.workspace = true
+
+[build-dependencies]
+bindgen = { workspace = true, features = ["runtime"] }
+system-deps.workspace = true
+
+[package.metadata.system-deps]
+libpipewire = { name = "libpipewire-0.3", version = "0.3" }
+
+[lib]
+doctest = false # https://github.com/rust-lang/rust-bindgen/issues/1313
