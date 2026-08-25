@@ -215,6 +215,37 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// Unified HDR tonemapping and colorimetry pipeline for both chassis and screen.
+fn output_color(col: vec3<f32>) -> vec4<f32> {
+    // Output. col is HDR (linear light, BT.709/sRGB primaries, highlights >1.0).
+    if (u.tone.x > 0.5) {
+        // HDR swapchain: emit linear light where 1.0 = SDR white and values above
+        // 1.0 drive the panel's extra nits. The surface is BT.2020 linear, so
+        // rotate our BT.709 primaries into BT.2020 (else colors read oversaturated).
+        let bt2020 = mat3x3<f32>(
+            0.6274, 0.0691, 0.0164,
+            0.3293, 0.9195, 0.0880,
+            0.0433, 0.0114, 0.8956,
+        ) * col;
+        // tone.y = HDR exposure (scales SDR-white → the compositor's reference
+        // white; bump if the picture looks dim, drop if it's blinding).
+        return vec4<f32>(bt2020 * u.tone.y, 1.0);
+    }
+    // SDR display: filmic-tonemap HDR highlights back into range (ACES). Target is
+    // sRGB, so return linear — the swapchain encodes the transfer function. The small
+    // exposure lift keeps midtones from darkening under the ACES toe.
+    let toned = aces(col * u.tone.y);
+    // ACES desaturates bright colours as it rolls them off — that is the RRT's film
+    // "path to white", a print-stock emulation. A CRT has no such behaviour: the guns clip
+    // per-channel at maximum beam current, so a saturated primary stays saturated right up
+    // to clipping and never bleaches toward white. Undoing that desaturation is therefore a
+    // correction, not a look. But it has to be applied WHERE ACES actually does it: the
+    // shoulder. Gate it on luminance so only the rolled-off highlights get their chroma back.
+    let l = dot(toned, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let shoulder = smoothstep(0.45, 1.0, l);
+    return vec4<f32>(clamp(toned + (toned - vec3<f32>(l)) * 0.22 * shoulder, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+
 // Synthetic HDR room reflected in the glass and the plastic. Values run well above
 // 1.0 so the light sources bloom in the reflections — a dark room with a soft
 // ceiling area-light, a warm lamp to the right, and a faint cool fill to the left.
@@ -266,25 +297,50 @@ fn ggx_spec(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32, f0: vec3<f32>)
     return d * (gv * gl) * f * ndl;
 }
 
-// Physically-based shade for the tube body / bezel: two lights, hemispheric ambient,
-// roughness-blurred HDR environment reflection with Fresnel.
+// Physically-based shade for the tube body / bezel: three matching HDR room lights,
+// hemispheric ambient, energy-conserving Cook-Torrance specular, and roughness-blurred
+// HDR environment reflection with Fresnel.
 fn shade_body(base: vec3<f32>, rough: f32, metal: f32, n: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
-    let l0 = normalize(vec3<f32>(0.30, 0.75, 0.55)); // key (ceiling light direction)
-    let l1 = normalize(vec3<f32>(-0.60, 0.10, 0.50)); // warm fill
+    // 1. Matching room lights:
+    // l0: Ceiling softbox (key light from upper-front)
+    let l0 = normalize(vec3<f32>(0.35, 0.85, 0.40));
+    let rad0 = vec3<f32>(1.30, 1.32, 1.38) * 1.35;
+
+    // l1: Daylight window from upper-left (gated by u.beam2.y / R key)
+    let l1 = normalize(vec3<f32>(-0.75, 0.25, 0.50));
+    let rad1 = vec3<f32>(1.25, 1.40, 1.65) * 0.70 * u.beam2.y;
+
+    // l2: Warm practical lamp from lower-right
+    let l2 = normalize(vec3<f32>(0.78, 0.05, 0.55));
+    let rad2 = vec3<f32>(1.15, 0.80, 0.48) * 0.55;
+
     let f0 = mix(vec3<f32>(0.04), base, metal);
-    let kd = base * (1.0 - metal);
-    // Very low hemispheric ambient so shadowed faces fall to a true charcoal, not grey.
-    let amb = mix(vec3<f32>(0.006, 0.007, 0.009), vec3<f32>(0.026, 0.029, 0.037), n.y * 0.5 + 0.5);
-    var col = kd * (amb
-        + vec3<f32>(1.0, 0.99, 0.96) * max(dot(n, l0), 0.0) * 1.05  // warm key → directional contrast
-        + vec3<f32>(1.0, 0.78, 0.55) * max(dot(n, l1), 0.0) * 0.28);
-    // Specular kept physical (no ×3 over-brightening that washed the plastic to grey).
-    col = col + ggx_spec(n, v, l0, rough, f0) * 0.8 + ggx_spec(n, v, l1, rough, f0) * 0.4;
+    let fres_v = f_schlick(max(dot(n, v), 0.0), f0);
+    // Strict energy conservation: diffuse fraction is reduced by Fresnel reflection
+    let kd = base * (vec3<f32>(1.0) - fres_v) * (1.0 - metal);
+
+    // Hemispheric ambient from the lit room interior
+    let amb_sky = vec3<f32>(0.024, 0.026, 0.033);
+    let amb_ground = vec3<f32>(0.008, 0.007, 0.006);
+    let amb = mix(amb_ground, amb_sky, n.y * 0.5 + 0.5);
+
+    // Direct lighting accumulation (diffuse + GGX specular)
+    var col = kd * amb;
+
+    let ndl0 = max(dot(n, l0), 0.0);
+    col = col + kd * rad0 * ndl0 + ggx_spec(n, v, l0, rough, f0) * rad0;
+
+    let ndl1 = max(dot(n, l1), 0.0);
+    col = col + kd * rad1 * ndl1 + ggx_spec(n, v, l1, rough, f0) * rad1;
+
+    let ndl2 = max(dot(n, l2), 0.0);
+    col = col + kd * rad2 * ndl2 + ggx_spec(n, v, l2, rough, f0) * rad2;
+
+    // Roughness-filtered HDR environment reflection
     let refl = reflect(-v, n);
-    let env = mix(room(refl), amb * 2.0, rough); // rougher → duller reflection
-    let fres = f_schlick(max(dot(n, v), 0.0), f0);
-    // Env reflection mostly an edge-sheen on matte plastic (halved so it doesn't grey the faces).
-    col = col + env * fres * (1.0 - rough * 0.7) * 0.30;
+    let env_spec = mix(room(refl), amb * 2.5, rough * rough);
+    col = col + env_spec * fres_v * (1.0 - rough * 0.65) * 0.35;
+
     return col;
 }
 
@@ -888,24 +944,44 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             }
         }
 
-        var col = shade_body(base, rough, metal, nn, v);
-        // HDR bounce: the phosphor screen is an area light. Fragments near the front
-        // (world z ~ 0 — the bezel and faceplate block) catch the picture's average
-        // colour and brightness; it falls off down the funnel. This is what makes a
-        // real set — and its bezel — glow with the on-screen colour in a dark room.
-        // Irradiance from an area light falls off with distance from it, and this one is
-        // only ~1 unit across, so its reach is ~1 unit — not the 1.55 the old ramp spanned,
-        // which spread the bezel's glow evenly over the entire front box and lit parts of
-        // the cabinet the screen cannot really see. Squared, so it concentrates on the
-        // bezel immediately around the faceplate and fades quickly down the funnel.
+        // Micro-ambient occlusion: contact shadowing for louvres, parting seam, and floor contact
+        var ao = 1.0;
+        let ground_ao = clamp(in.world_pos.y * 1.1 + 1.15, 0.35, 1.0);
+        ao = ao * ground_ao;
+
+        if (abs(nn.z) < 0.6) {
+            let s = abs(in.world_pos.z + 0.5);
+            ao = ao * mix(0.55, 1.0, smoothstep(0.0, 0.016, s));
+        }
+        if (nn.y > 0.6 && in.world_pos.z < -0.35) {
+            let g = abs(fract(in.world_pos.z * 6.5) - 0.5) * 2.0;
+            ao = ao * mix(0.40, 1.0, smoothstep(0.08, 0.30, g));
+        }
+
+        var col = shade_body(base, rough, metal, nn, v) * ao;
+
+        // HDR Screen Area Light Bounce onto Front Bezel
+        // The active phosphor screen faceplate emits light forward (centered at z ~ 0, within [-HALF_W, HALF_W] x [-HALF_H, HALF_H]).
+        // Front fragments catch this emission with directional inverse-square falloff and inner-bevel specular glints.
         let fz = smoothstep(-0.75, -0.02, in.world_pos.z);
         let front = fz * fz;
         var glow_col = u.env.rgb;
         if (u.mono.w > 0.5) { glow_col = dot(u.env.rgb, vec3<f32>(0.299, 0.587, 0.114)) * u.mono.rgb; }
-        // Screen-off / warming tubes don't light the bezel: gate the bounce by power.
         let son = min(u.pwr.x, 1.0 - u.pwr.y);
-        col = col + glow_col * u.env.w * u.phys.z * front * (0.30 + 0.70 * max(dot(nn, v), 0.0)) * son;
-        return vec4<f32>(col, 1.0);
+
+        let screen_pt = vec3<f32>(clamp(in.world_pos.x, -HALF_W, HALF_W), clamp(in.world_pos.y, -HALF_H, HALF_H), 0.0);
+        let to_screen = screen_pt - in.world_pos;
+        let screen_dist = max(length(to_screen), 0.12);
+        let screen_dir = to_screen / screen_dist;
+        let screen_ndl = max(dot(nn, screen_dir), 0.0);
+        let f0 = mix(vec3<f32>(0.04), base, metal);
+        let screen_spec = ggx_spec(nn, v, screen_dir, rough, f0);
+
+        let screen_falloff = 1.0 / (1.0 + screen_dist * screen_dist * 2.8);
+        let screen_spill = glow_col * u.env.w * u.phys.z * front * (screen_ndl * 0.90 + 0.18 * max(dot(nn, v), 0.0) + screen_spec * 0.45) * screen_falloff * son;
+        col = col + screen_spill;
+
+        return output_color(col);
     }
 
     // ---- Screen ----
@@ -1359,34 +1435,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let glare = pow(max(dot(refl, light_dir), 0.0), 130.0);
     col = col + vec3<f32>(1.0, 0.98, 0.92) * glare * (0.3 + u.glass.y) * 0.5 * u.pwr.w;
 
-    // Output. col is HDR (linear light, BT.709/sRGB primaries, highlights >1.0).
-    if (u.tone.x > 0.5) {
-        // HDR swapchain: emit linear light where 1.0 = SDR white and values above
-        // 1.0 drive the panel's extra nits. The surface is BT.2020 linear, so
-        // rotate our BT.709 primaries into BT.2020 (else colors read oversaturated).
-        let bt2020 = mat3x3<f32>(
-            0.6274, 0.0691, 0.0164,
-            0.3293, 0.9195, 0.0880,
-            0.0433, 0.0114, 0.8956,
-        ) * col;
-        // tone.y = HDR exposure (scales SDR-white → the compositor's reference
-        // white; bump if the picture looks dim, drop if it's blinding).
-        return vec4<f32>(bt2020 * u.tone.y, 1.0);
-    }
-    // SDR display: filmic-tonemap HDR highlights back into range (ACES). Target is
-    // sRGB, so return linear — the swapchain encodes the transfer function. The small
-    // exposure lift keeps midtones from darkening under the ACES toe.
-    let toned = aces(col * u.tone.y);
-    // ACES desaturates bright colours as it rolls them off — that is the RRT's film
-    // "path to white", a print-stock emulation. A CRT has no such behaviour: the guns clip
-    // per-channel at maximum beam current, so a saturated primary stays saturated right up
-    // to clipping and never bleaches toward white. Undoing that desaturation is therefore a
-    // correction, not a look. But it has to be applied WHERE ACES actually does it: the
-    // shoulder. The old flat +14% saturated the entire picture including shadows and
-    // midtones, where the RRT is essentially linear and there is nothing to correct — that
-    // part was pure punch. Gate it on luminance so only the rolled-off highlights get their
-    // chroma back.
-    let l = dot(toned, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let shoulder = smoothstep(0.45, 1.0, l);
-    return vec4<f32>(clamp(toned + (toned - vec3<f32>(l)) * 0.22 * shoulder, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    return output_color(col);
 }
