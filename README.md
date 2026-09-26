@@ -10,7 +10,7 @@ you can spin around with the mouse. Not a fullscreen filter. An actual tube, sit
 in your compositor, that you can orbit and zoom until the glare slides across the
 glass the right way.
 
-![Sonic Advance gameplay with Merlin, a Microsoft Agent character, rendered inside crtulum's modeled CRT](scratchpad/rom-agent-merlin-sonic.png)
+![Donkey Kong Country gameplay with Merlin, a Microsoft Agent character, rendered inside crtulum's modeled CRT](scratchpad/rom-agent-merlin-dkc.png)
 
 ## Build & run
 
