@@ -10,7 +10,7 @@ you can spin around with the mouse. Not a fullscreen filter. An actual tube, sit
 in your compositor, that you can orbit and zoom until the glare slides across the
 glass the right way.
 
-![A color test pattern displayed on crtulum's modeled CRT](scratchpad/m17_refl3.png)
+![A NES ROM run with Merlin, a Microsoft Agent character, rendered inside crtulum's modeled CRT](scratchpad/rom-agent-merlin.png)
 
 ## Build & run
 
