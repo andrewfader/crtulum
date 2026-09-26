@@ -2086,14 +2086,18 @@ impl State {
         window: Arc<Window>,
         capture: Option<capture::SharedFrame>,
         preset: Preset,
-    ) -> State {
+    ) -> anyhow::Result<State> {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY, // Vulkan on Linux
             ..Default::default()
         });
-        let surface = instance.create_surface(window.clone()).unwrap();
+        let surface = instance.create_surface(window.clone()).map_err(|error| {
+            anyhow::anyhow!(
+                "could not create a GPU surface: {error}. Install or repair a Vulkan/OpenGL driver"
+            )
+        })?;
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -2102,7 +2106,11 @@ impl State {
                 force_fallback_adapter: false,
             })
             .await
-            .expect("no suitable GPU adapter found");
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no suitable GPU adapter found. Install or repair a Vulkan/OpenGL driver"
+                )
+            })?;
 
         let (device, queue) = adapter
             .request_device(
@@ -2114,7 +2122,7 @@ impl State {
                 None,
             )
             .await
-            .expect("failed to create device");
+            .map_err(|error| anyhow::anyhow!("failed to create GPU device: {error}"))?;
 
         let caps = surface.get_capabilities(&adapter);
         eprintln!("[surface] offered formats: {:?}", caps.formats);
@@ -2155,7 +2163,7 @@ impl State {
         let res = build_resources(&device, &queue, format, preset);
         let depth_view = create_depth(&device, config.width, config.height);
 
-        State {
+        Ok(State {
             surface,
             device,
             queue,
@@ -2195,7 +2203,7 @@ impl State {
             player: None,
             preset,
             hdr,
-        }
+        })
     }
 
     // Upload the latest captured frame, if any, before drawing.
@@ -2899,7 +2907,13 @@ fn main() {
             .unwrap(),
     );
 
-    let mut state = pollster::block_on(State::new(window.clone(), capture, preset));
+    let mut state = match pollster::block_on(State::new(window.clone(), capture, preset)) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("[gpu] startup failed: {error:#}");
+            std::process::exit(1);
+        }
+    };
     state.player = player;
 
     event_loop
