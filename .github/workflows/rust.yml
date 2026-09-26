@@ -65,4 +65,11 @@ jobs:
       # CRTULUM_REQUIRE_GPU makes the melt test fail (not skip) if no adapter is
       # found — proving CI genuinely exercised the phosphor-persistence path.
       run: cargo test --verbose
-
+    - name: Enforce coverage floor
+      # Keep the test suite from losing the exercised behavior above. The floor is
+      # intentionally below the current baseline so it can only ratchet upward in
+      # subsequent changes without turning this first enforcement into a false gate.
+      run: |
+        rustup component add llvm-tools-preview
+        cargo install cargo-llvm-cov --locked
+        cargo llvm-cov --all --no-fail-fast --fail-under-lines 34 -- --test-threads=1

@@ -2777,6 +2777,10 @@ fn main() {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{}", video::USAGE);
+        return;
+    }
 
     // `--preset trinitron|panasonic|slotmask` (default trinitron)
     let preset = args
@@ -2838,10 +2842,6 @@ fn main() {
     // Runs a whole source (file / URL / stills / a TAS through RetroArch) through the
     // tube and pipes the result into ffmpeg. See src/video.rs.
     if args.iter().any(|a| a == "--render") {
-        if args.iter().any(|a| a == "--help" || a == "-h") {
-            print!("{}", video::USAGE);
-            return;
-        }
         let result = video::opts_from_args(&args, preset).and_then(video::render);
         if let Err(e) = result {
             eprintln!("[render] error: {e:#}");
@@ -3262,8 +3262,9 @@ mod tests {
     // reasons that have nothing to do with shading. Enumerating GL is also what
     // panics (rather than reporting "no adapter") when EGL has no usable vendor.
     fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let adapter = adapter_on(wgpu::Backends::VULKAN)
-            .or_else(|| adapter_on(wgpu::Backends::all() - wgpu::Backends::VULKAN))?;
+        // Naga 0.20's GLSL backend can emit `gl_`-prefixed temporaries that Mesa
+        // rejects, so this GPU regression test needs Vulkan rather than a GL fallback.
+        let adapter = adapter_on(wgpu::Backends::VULKAN)?;
         pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("test-device"),

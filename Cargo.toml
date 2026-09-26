@@ -8,14 +8,14 @@ license-file = "LICENSE"
 [dependencies]
 winit = "0.29"
 wgpu = "0.20"
-pollster = "0.3"
+pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
-glam = "0.27"
+glam = "0.33"
 env_logger = "0.11"
 log = "0.4"
 
 # Offscreen PNG capture for headless verification (`--shot out.png`).
-image = { version = "0.24", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # M2: live source capture via the ScreenCast portal + PipeWire (the OBS path).
 # async-io (not the default tokio) so a plain pollster::block_on drives the portal.

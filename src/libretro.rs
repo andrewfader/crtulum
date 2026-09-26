@@ -716,6 +716,27 @@ pub struct Core {
     pub geometry: (u32, u32),
 }
 
+/// Tears down a partially loaded core and releases the process-wide frontend slot
+/// when loading fails before a `Core` takes ownership of it.
+struct LoadGuard {
+    unload: Option<unsafe extern "C" fn()>,
+    deinit: Option<unsafe extern "C" fn()>,
+}
+
+impl Drop for LoadGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(unload) = self.unload {
+                unload();
+            }
+            if let Some(deinit) = self.deinit {
+                deinit();
+            }
+        }
+        LOADED.store(false, Ordering::SeqCst);
+    }
+}
+
 macro_rules! sym {
     ($lib:expr, $t:ty, $name:literal) => {
         // The pointer is copied out of the Symbol, so it doesn't borrow the Library —
@@ -736,8 +757,19 @@ impl Core {
         if LOADED.swap(true, Ordering::SeqCst) {
             bail!("a libretro core is already loaded (the API is a process-wide singleton)");
         }
-        let lib = unsafe { Library::new(core_path) }
-            .with_context(|| format!("loading core {}", core_path.display()))?;
+        let lib = match unsafe { Library::new(core_path) } {
+            Ok(lib) => lib,
+            Err(error) => {
+                LOADED.store(false, Ordering::SeqCst);
+                return Err(error).with_context(|| format!("loading core {}", core_path.display()));
+            }
+        };
+        // `lib` must outlive the guard: failed initialization invokes core entry
+        // points, which are valid only while the shared library remains loaded.
+        let mut load_guard = LoadGuard {
+            unload: None,
+            deinit: None,
+        };
 
         let api: unsafe extern "C" fn() -> c_uint = sym!(lib, unsafe extern "C" fn() -> c_uint, "retro_api_version");
         let version = unsafe { api() };
@@ -758,6 +790,7 @@ impl Core {
         let run: unsafe extern "C" fn() = sym!(lib, unsafe extern "C" fn(), "retro_run");
         let unload: unsafe extern "C" fn() = sym!(lib, unsafe extern "C" fn(), "retro_unload_game");
         let deinit: unsafe extern "C" fn() = sym!(lib, unsafe extern "C" fn(), "retro_deinit");
+        load_guard.deinit = Some(deinit);
 
         // Cores read the system directory during retro_init/load_game, so set it first.
         {
@@ -836,14 +869,13 @@ impl Core {
             None => unsafe { load_game(std::ptr::null()) },
         };
         if !ok {
-            unsafe { deinit() };
-            LOADED.store(false, Ordering::SeqCst);
             bail!(
                 "core `{}` refused to load {}",
                 name,
                 rom.map(|p| p.display().to_string()).unwrap_or_else(|| "(no content)".into())
             );
         }
+        load_guard.unload = Some(unload);
 
         // A mistyped option would otherwise just sit there doing nothing.
         {
@@ -937,7 +969,7 @@ impl Core {
         let fps = if av.timing.fps > 1.0 { av.timing.fps } else { 60.0 };
         let sample_rate = if av.timing.sample_rate > 1.0 { av.timing.sample_rate } else { 48000.0 };
 
-        Ok(Core {
+        let core = Core {
             run,
             unload,
             deinit,
@@ -954,7 +986,9 @@ impl Core {
             fps,
             sample_rate,
             geometry: (av.geometry.base_width.max(1), av.geometry.base_height.max(1)),
-        })
+        };
+        std::mem::forget(load_guard);
+        Ok(core)
     }
 
     /// Run exactly one frame with `input` held, and return the frame as RGBA8.
@@ -1172,6 +1206,28 @@ static CORE_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_load_releases_the_process_wide_core_slot() {
+        let _serialize = super::CORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        LOADED.store(false, Ordering::SeqCst);
+
+        let error = match Core::load(
+            Path::new("/definitely/not/a/libretro/core.so"),
+            None,
+            Path::new("."),
+            &[],
+        ) {
+            Ok(_) => panic!("a nonexistent core must fail to load"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("loading core"));
+        assert!(
+            !LOADED.load(Ordering::SeqCst),
+            "a failed load must not block the next core in this process"
+        );
+    }
 
 
     /// Probe: load every core named in CRTULUM_PROBE_CORES (no content) and report
@@ -1465,6 +1521,7 @@ mod real_roms {
         exts: &'static [&'static str],
         core: Option<&'static str>,
         options: &'static [(&'static str, &'static str)],
+        requires_vulkan: bool,
         /// How long to wait for the game to come up. Games differ wildly — some are
         /// drawing within a second, some sit on a near-blank logo for ten — so this is
         /// a ceiling, not a target: the run stops as soon as the picture is alive.
@@ -1472,25 +1529,29 @@ mod real_roms {
     }
 
     const SYSTEMS: &[System] = &[
-        System { name: "NES",         dir: "nes",       exts: &["nes"],        core: None, options: &[], max_frames: 1500 },
-        System { name: "SNES",        dir: "snes",      exts: &["sfc", "smc"], core: None, options: &[], max_frames: 1500 },
-        System { name: "Game Boy",    dir: "gb",        exts: &["gb", "gbc"],  core: None, options: &[], max_frames: 1500 },
-        System { name: "Mega Drive",  dir: "megadrive", exts: &["md", "gen", "bin"], core: Some("genesis_plus_gx"), options: &[], max_frames: 1500 },
+        System { name: "NES",         dir: "nes",       exts: &["nes"],        core: None, options: &[], requires_vulkan: false, max_frames: 1500 },
+        System { name: "SNES",        dir: "snes",      exts: &["sfc", "smc"], core: None, options: &[], requires_vulkan: false, max_frames: 1500 },
+        System { name: "Game Boy",    dir: "gb",        exts: &["gb", "gbc"],  core: None, options: &[], requires_vulkan: false, max_frames: 1500 },
+        System { name: "Mega Drive",  dir: "megadrive", exts: &["md", "gen", "bin"], core: Some("genesis_plus_gx"), options: &[], requires_vulkan: false, max_frames: 1500 },
         // N64 on the software rasteriser: the GL core wants its own thread (see the
         // README), and angrylion is the deterministic path anyway.
         System { name: "N64",         dir: "n64",       exts: &["z64", "n64", "v64"], core: Some("parallel_n64"),
-                 options: &[("parallel-n64-gfxplugin", "angrylion")], max_frames: 2000 },
+                 options: &[("parallel-n64-gfxplugin", "angrylion")], requires_vulkan: false, max_frames: 2000 },
         // PlayStation twice over — this is what keeps both GPU backends honest.
         System { name: "PSX/Vulkan",  dir: "psx",       exts: &["cue"], core: Some("swanstation"),
-                 options: &[("swanstation_GPU_Renderer", "Vulkan")], max_frames: 1500 },
+                 options: &[("swanstation_GPU_Renderer", "Vulkan")], requires_vulkan: true, max_frames: 1500 },
         System { name: "PSX/OpenGL",  dir: "psx",       exts: &["cue"], core: Some("swanstation"),
-                 options: &[("swanstation_GPU_Renderer", "OpenGL")], max_frames: 1500 },
+                 options: &[("swanstation_GPU_Renderer", "OpenGL")], requires_vulkan: false, max_frames: 1500 },
     ];
 
     fn library() -> Option<std::path::PathBuf> {
         let root = std::env::var("CRTULUM_ROMS").unwrap_or_else(|_| "/mnt/crucial/roms".into());
         let root = std::path::PathBuf::from(root);
         root.is_dir().then_some(root)
+    }
+
+    fn vulkan_available() -> bool {
+        crate::vkctx::VkHost::new(None).is_ok()
     }
 
     /// First game of a system, alphabetically, so a run picks the same one each time.
@@ -1571,9 +1632,14 @@ mod real_roms {
 
         // `CRTULUM_TEST_SYSTEMS=SNES,N64` narrows the run when chasing one of them.
         let only = std::env::var("CRTULUM_TEST_SYSTEMS").unwrap_or_default();
+        let has_vulkan = vulkan_available();
         let mut checked = 0;
         for sys in SYSTEMS {
             if !only.is_empty() && !only.split(',').any(|w| sys.name.starts_with(w.trim())) {
+                continue;
+            }
+            if sys.requires_vulkan && !has_vulkan {
+                eprintln!("{:12} — no usable Vulkan device, skipped", sys.name);
                 continue;
             }
             let Some(rom) = pick_rom(&root, sys) else {
