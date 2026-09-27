@@ -3135,6 +3135,12 @@ mod tests {
         let mut res = build_resources(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb, PVM);
         let orbit = Orbit { yaw: 0.0, pitch: 0.0, distance: 3.0 };
         let period = 1.0 / FIELD_HZ;
+        // Isolate phosphor integration from the adapter's approximate sRGB
+        // texture decode. Linear UNORM 55 is close to decoded sRGB 128; apply
+        // the shader's OETF and tube gamma analytically for the reference.
+        let level = 55_u8;
+        let voltage = 1.055 * (level as f64 / 255.).powf(1. / 2.4) - 0.055;
+        let excitation = voltage.powf(2.4);
         let read = |res: &Resources| -> Vec<[f32; 3]> {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256 * 8,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
@@ -3157,8 +3163,8 @@ mod tests {
             })).collect()
         };
         for field in 0..3 {
-            let level = if field == 1 { 128 } else { 0 };
-            res.set_source(&device, &queue, 8, 8, wgpu::TextureFormat::Rgba8UnormSrgb, &vec![level; 256]);
+            let source_level = if field == 1 { level } else { 0 };
+            res.set_source(&device, &queue, 8, 8, wgpu::TextureFormat::Rgba8Unorm, &vec![source_level; 256]);
             res.exposure_group = field + 1;
             write_uniforms(&queue, &res, &orbit, 1.0, field as f32 * period as f32, &PVM, 1.0,
                 false, period as f32, [1.0, 0.0, 0.0, 0.0], 0.0, field as f32, 1.0, false, 1.0, false, false);
@@ -3174,7 +3180,7 @@ mod tests {
                 for c in 0..3 {
                     let expected = if field == 0 { 0. } else {
                         let end = field as f64 * period - arrival;
-                        (128_f64 / 255.).powf(2.4) * phosphor::energy(c, (end - period).max(0.), end)
+                        excitation * phosphor::energy(c, (end - period).max(0.), end)
                     };
                     assert!((rgb[c] as f64 - expected).abs() < 0.0005,
                         "field {field}, pixel {pixel}, channel {c}: {} vs {expected}", rgb[c]);
@@ -3184,14 +3190,14 @@ mod tests {
         // A warm, static tube must preserve a neutral field's mean radiance;
         // short measured decay constants must not darken it or tint it red.
         let mut warm = build_resources(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb, PVM);
-        warm.set_source(&device, &queue, 8, 8, wgpu::TextureFormat::Rgba8UnormSrgb, &vec![128; 256]);
+        warm.set_source(&device, &queue, 8, 8, wgpu::TextureFormat::Rgba8Unorm, &vec![level; 256]);
         write_uniforms(&queue, &warm, &orbit, 1.0, 0.0, &PVM, 1.0, false, period as f32,
             [1.0, 0.0, 0.0, 0.0], 0.0, 0.0, 1.0, false, 1.0, false, false);
         queue.write_buffer(&warm.ubuf, (std::mem::offset_of!(Uniforms, look) + 8) as u64, bytemuck::bytes_of(&0.0_f32));
         let mut enc = device.create_command_encoder(&Default::default());
         accum_step(&mut enc, &mut warm); queue.submit(Some(enc.finish()));
         for pixel in read(&warm) { for value in pixel {
-            assert!((value - (128_f32/255.).powf(2.4)).abs() < 0.0005, "warm field changed: {value}");
+            assert!((value - excitation as f32).abs() < 0.0005, "warm field changed: {value}");
         }}
         // A short shutter resolves the moving raster instead of dimming every
         // row uniformly. Compare red against exact impulse-response integrals.
@@ -3212,7 +3218,7 @@ mod tests {
                 let end = (age + 1) as f64 * period - arrival;
                 phosphor::energy(0, (end - period * 0.25).max(0.), end)
             }).sum();
-            let expected = 4. * (128_f64/255.).powf(2.4) * energy;
+            let expected = 4. * excitation * energy;
             assert!((rgb[0] as f64 - expected).abs() < 0.001, "short shutter at {pixel}: {} vs {expected}", rgb[0]);
         }
         assert!(short[0][0] < 0.001 && short[63][0] > 0.1, "short shutter did not resolve scanout");
