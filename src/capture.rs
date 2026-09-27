@@ -75,7 +75,7 @@ async fn portal() -> anyhow::Result<(OwnedFd, u32)> {
 
 // SPA chunk offsets need not be zero, and the last row need not include padding.
 // Invalid/inaccessible chunks are dropped before touching or allocating frame data.
-fn pack_frame(src: &[u8], offset: usize, size: usize, stride: i32, width: u32, height: u32) -> Option<Vec<u8>> {
+fn pack_frame(src: &[u8], offset: usize, size: usize, stride: i32, width: u32, height: u32, has_alpha: bool) -> Option<Vec<u8>> {
     let row = (width as usize).checked_mul(4)?;
     let stride = usize::try_from(stride).ok()?;
     if row == 0 || height == 0 || stride < row { return None; }
@@ -86,6 +86,19 @@ fn pack_frame(src: &[u8], offset: usize, size: usize, stride: i32, width: u32, h
     for (y, dst) in packed.chunks_exact_mut(row).enumerate() {
         dst.copy_from_slice(&source[y * stride..y * stride + row]);
     }
+    if has_alpha {
+        for px in packed.chunks_exact_mut(4) {
+            let a = px[3] as u16;
+            px[0] = ((px[0] as u16 * a) / 255) as u8;
+            px[1] = ((px[1] as u16 * a) / 255) as u8;
+            px[2] = ((px[2] as u16 * a) / 255) as u8;
+            px[3] = 255;
+        }
+    } else {
+        for px in packed.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+    }
     Some(packed)
 }
 
@@ -94,6 +107,7 @@ struct UserData {
     width: u32,
     height: u32,
     is_bgra: bool,
+    has_alpha: bool,
     seq: u64,
     shared: SharedFrame,
 }
@@ -118,6 +132,7 @@ fn pipewire_loop(fd: OwnedFd, node_id: u32, shared: SharedFrame) -> anyhow::Resu
         width: 0,
         height: 0,
         is_bgra: true,
+        has_alpha: false,
         seq: 0,
         shared,
     };
@@ -146,10 +161,16 @@ fn pipewire_loop(fd: OwnedFd, node_id: u32, shared: SharedFrame) -> anyhow::Resu
             }
             ud.width = info.size().width;
             ud.height = info.size().height;
+            let format = info.format();
             ud.is_bgra = matches!(
-                info.format(),
+                format,
                 pw::spa::param::video::VideoFormat::BGRx
                     | pw::spa::param::video::VideoFormat::BGRA
+            );
+            ud.has_alpha = matches!(
+                format,
+                pw::spa::param::video::VideoFormat::BGRA
+                    | pw::spa::param::video::VideoFormat::RGBA
             );
             eprintln!(
                 "[capture] negotiated {}x{} {:?}",
@@ -169,7 +190,7 @@ fn pipewire_loop(fd: OwnedFd, node_id: u32, shared: SharedFrame) -> anyhow::Resu
             let (offset, size, stride) = (d.chunk().offset() as usize,
                 d.chunk().size() as usize, d.chunk().stride());
             let Some(src) = d.data() else { return; };
-            let Some(packed) = pack_frame(src, offset, size, stride, ud.width, ud.height) else { return; };
+            let Some(packed) = pack_frame(src, offset, size, stride, ud.width, ud.height, ud.has_alpha) else { return; };
             ud.seq += 1;
             let frame = Frame {
                 width: ud.width,
@@ -222,8 +243,8 @@ fn pipewire_loop(fd: OwnedFd, node_id: u32, shared: SharedFrame) -> anyhow::Resu
                 height: 1
             },
             pw::spa::utils::Rectangle {
-                width: 8192,
-                height: 8192
+                width: 16384,
+                height: 16384
             }
         ),
         pw::spa::pod::property!(
@@ -266,10 +287,17 @@ mod tests {
     #[test]
     fn capture_honors_offset_padding_and_chunk_bounds() {
         let src = [99, 99, 1, 2, 3, 4, 88, 88, 5, 6, 7, 8];
-        assert_eq!(pack_frame(&src, 2, 10, 6, 1, 2), Some(vec![1, 2, 3, 4, 5, 6, 7, 8]));
-        assert!(pack_frame(&src, 2, 9, 6, 1, 2).is_none());
-        assert!(pack_frame(&src, 3, 10, 6, 1, 2).is_none());
-        assert!(pack_frame(&src, 0, 12, -4, 1, 2).is_none());
-        assert!(pack_frame(&src, 0, 12, 3, 1, 2).is_none());
+        // Opaque source with has_alpha: true
+        let src_opaque = [99, 99, 10, 20, 30, 255, 88, 88, 40, 50, 60, 255];
+        assert_eq!(pack_frame(&src_opaque, 2, 10, 6, 1, 2, true), Some(vec![10, 20, 30, 255, 40, 50, 60, 255]));
+        // Transparent margins (a = 0) become black (0, 0, 0, 255)
+        let src_trans = [99, 99, 100, 200, 50, 0, 88, 88, 40, 50, 60, 255];
+        assert_eq!(pack_frame(&src_trans, 2, 10, 6, 1, 2, true), Some(vec![0, 0, 0, 255, 40, 50, 60, 255]));
+        // has_alpha: false forces alpha = 255
+        assert_eq!(pack_frame(&src, 2, 10, 6, 1, 2, false), Some(vec![1, 2, 3, 255, 5, 6, 7, 255]));
+        assert!(pack_frame(&src, 2, 9, 6, 1, 2, true).is_none());
+        assert!(pack_frame(&src, 3, 10, 6, 1, 2, true).is_none());
+        assert!(pack_frame(&src, 0, 12, -4, 1, 2, true).is_none());
+        assert!(pack_frame(&src, 0, 12, 3, 1, 2, true).is_none());
     }
 }

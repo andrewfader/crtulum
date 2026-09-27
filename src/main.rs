@@ -1239,15 +1239,21 @@ struct Resources {
 const PHOSPHOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 // Independent positive reservoirs retain all decay components and their energy.
-fn make_phosphor_state(device: &wgpu::Device, w: u32, h: u32) -> [wgpu::Buffer; 3] {
+fn make_phosphor_state(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32) -> [wgpu::Buffer; 3] {
     // Split the reservoirs across bindings so native 4K capture does not exceed
     // Vulkan's per-buffer range. No source pixels or decay components are lost.
     let size = w as u64 * h as u64 * 11 * 16;
     assert!(size <= device.limits().max_storage_buffer_binding_size as u64,
         "source raster exceeds this GPU's phosphor-history capacity");
-    std::array::from_fn(|_| device.create_buffer(&wgpu::BufferDescriptor {
+    let buffers = std::array::from_fn(|_| device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("phosphor reservoir bank"), size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }));
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("clear phosphor state") });
+    for b in &buffers {
+        enc.clear_buffer(b, 0, None);
+    }
+    queue.submit(Some(enc.finish()));
+    buffers
 }
 
 // An HDR phosphor plane (render target + sampleable) at the source's resolution.
@@ -1380,7 +1386,7 @@ impl Resources {
             if (width, height) != self.source_size {
                 let (t0, v0) = make_phosphor(device, width, height);
                 let (t1, v1) = make_phosphor(device, width, height);
-                self.phosphor_state = make_phosphor_state(device, width, height);
+                self.phosphor_state = make_phosphor_state(device, queue, width, height);
                 self.phosphor = [t0, t1];
                 self.phosphor_view = [v0, v1];
                 self.phos_cur = 0;
@@ -1467,7 +1473,7 @@ fn build_resources(
         // Phosphor persistence planes (ping-pong), sized to the source.
         let (p0t, p0v) = make_phosphor(device, tw, th);
         let (p1t, p1v) = make_phosphor(device, tw, th);
-        let phosphor_state = make_phosphor_state(device, tw, th);
+        let phosphor_state = make_phosphor_state(device, queue, tw, th);
         let phosphor = [p0t, p1t];
         let phosphor_view = [p0v, p1v];
 
@@ -3139,6 +3145,10 @@ fn main() {
                                 presented_frames += 1;
                                 if verify_frames.is_some_and(|limit| presented_frames >= limit) {
                                     eprintln!("[verify] presented {} frames; {}", presented_frames, output_mode_label(state.res.hdr_output));
+                                    eprintln!("[verify] surface {}x{}; monitor {:?}; refresh {:.3} Hz",
+                                        state.config.width, state.config.height,
+                                        state.window.current_monitor().and_then(|m| m.name()),
+                                        detect_refresh_hz(&state.window));
                                     elwt.exit();
                                 }
                             }
@@ -4017,5 +4027,142 @@ mod tests {
         // blur: red must clearly lead green and blue.
         assert!(dr > 1.2 * dg, "trail not red-dominant (R={dr:.3} vs G={dg:.3})");
         assert!(dr > 1.2 * db, "trail not red-dominant (R={dr:.3} vs B={db:.3})");
+    }
+
+    #[test]
+    fn multi_monitor_geometry_and_buffer_init_e2e() {
+        let (device, queue) = headless_device();
+        let (ow, oh) = (640u32, 480u32);
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let orbit = Orbit { yaw: 0.0, pitch: 0.0, distance: 1.45 };
+        let dt = (1.0 / FIELD_HZ) as f32;
+        let pwr = [1.0, 0.0, 0.0, 0.0];
+
+        // 1. Prove buffer clean-initialization: make_phosphor_state zeroing
+        let state_buffers = make_phosphor_state(&device, &queue, 32, 32);
+        for buf in &state_buffers {
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("zero-check"),
+                size: 32 * 32 * 11 * 16,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(buf, 0, &readback, 0, 32 * 32 * 11 * 16);
+            queue.submit(Some(enc.finish()));
+            let slice = readback.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
+            device.poll(wgpu::Maintain::Wait);
+            let data = slice.get_mapped_range();
+            assert!(data.iter().all(|&b| b == 0), "phosphor state buffer contained non-zero garbage on allocation");
+        }
+
+        // Helper to render one full frame through the complete 3D CRT pipeline
+        let render_crt = |sw: u32, sh: u32, frame: &[u8]| -> Vec<u8> {
+            let mut res = build_resources(&device, &queue, format, PVM);
+            res.physical_phosphor = false;
+            res.set_source(&device, &queue, sw, sh, format, frame);
+            write_uniforms(
+                &queue, &res, &orbit, ow as f32 / oh as f32, 0.0, &PVM, 1.0, false, dt, pwr,
+                0.0, 0.0, 1.0, false, 1.0, false, false,
+            );
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("accum") });
+            accum_step(&mut enc, &mut res);
+            queue.submit(Some(enc.finish()));
+            device.poll(wgpu::Maintain::Wait);
+
+            let color = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("e2e-color"),
+                size: wgpu::Extent3d { width: ow, height: oh, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+            let depth_view = create_depth(&device, ow, oh);
+            let unpadded = ow * 4;
+            let padded = ((unpadded + 255) / 256) * 256;
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("e2e-readback"),
+                size: (padded * oh) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("draw") });
+            draw_tube(&mut enc, &res, &color_view, &depth_view);
+            enc.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture: &color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyBuffer {
+                    buffer: &readback,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(oh),
+                    },
+                },
+                wgpu::Extent3d { width: ow, height: oh, depth_or_array_layers: 1 },
+            );
+            queue.submit(Some(enc.finish()));
+            let slice = readback.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+            device.poll(wgpu::Maintain::Wait);
+            let data = slice.get_mapped_range();
+            let mut px = Vec::with_capacity((ow * oh * 4) as usize);
+            for row in 0..oh {
+                let start = (row * padded) as usize;
+                px.extend_from_slice(&data[start..start + unpadded as usize]);
+            }
+            px
+        };
+
+        let sample = |px: &[u8], x: u32, y: u32| -> u8 {
+            let idx = ((y * ow + x) * 4) as usize;
+            px[idx] // Red channel
+        };
+
+        // 2. Test 16:9 Landscape Source (e.g. DP-2 2560x1440 or HDMI-1 3840x2160)
+        let white_16_9 = vec![255u8; 320 * 180 * 4];
+        let px_16_9 = render_crt(320, 180, &white_16_9);
+        let center_16_9 = sample(&px_16_9, 320, 240);
+        let top_bar_16_9 = sample(&px_16_9, 320, 50);
+        let bottom_bar_16_9 = sample(&px_16_9, 320, 430);
+        eprintln!("16:9 - Center: {center_16_9}, Top bar: {top_bar_16_9}, Bottom bar: {bottom_bar_16_9}");
+        assert!(center_16_9 > 80, "16:9 center not lit: {center_16_9}");
+        assert!(top_bar_16_9 < 35, "16:9 top letterbox bar leaked light: {top_bar_16_9}");
+        assert!(bottom_bar_16_9 < 35, "16:9 bottom letterbox bar leaked light: {bottom_bar_16_9}");
+
+        // 3. Test 9:16 Portrait Source (e.g. DP-3 1440x2560)
+        let white_9_16 = vec![255u8; 180 * 320 * 4];
+        let px_9_16 = render_crt(180, 320, &white_9_16);
+        let center_9_16 = sample(&px_9_16, 320, 240);
+        let left_bar_9_16 = sample(&px_9_16, 100, 240);
+        let right_bar_9_16 = sample(&px_9_16, 540, 240);
+        eprintln!("9:16 - Center: {center_9_16}, Left bar: {left_bar_9_16}, Right bar: {right_bar_9_16}");
+        assert!(center_9_16 > 80, "9:16 center not lit: {center_9_16}");
+        assert!(left_bar_9_16 < 35, "9:16 left pillarbox bar leaked light: {left_bar_9_16}");
+        assert!(right_bar_9_16 < 35, "9:16 right pillarbox bar leaked light: {right_bar_9_16}");
+
+        // 4. Test 4:3 Native Source (e.g. 320x240 or 640x480)
+        let white_4_3 = vec![255u8; 320 * 240 * 4];
+        let px_4_3 = render_crt(320, 240, &white_4_3);
+        let center_4_3 = sample(&px_4_3, 320, 240);
+        let mid_top_4_3 = sample(&px_4_3, 320, 100);
+        let mid_left_4_3 = sample(&px_4_3, 160, 240);
+        eprintln!("4:3 - Center: {center_4_3}, Mid-top: {mid_top_4_3}, Mid-left: {mid_left_4_3}");
+        assert!(center_4_3 > 80, "4:3 center not lit: {center_4_3}");
+        assert!(mid_top_4_3 > 60, "4:3 top raster missing: {mid_top_4_3}");
+        assert!(mid_left_4_3 > 60, "4:3 left raster missing: {mid_left_4_3}");
+
+        // Confirm letterboxed/pillarboxed regions in non-4:3 are significantly dimmer than in 4:3
+        assert!(sample(&px_16_9, 320, 75) < sample(&px_4_3, 320, 75) / 2, "16:9 vertical letterbox did not darken outer area relative to 4:3");
+        assert!(sample(&px_9_16, 140, 240) < sample(&px_4_3, 140, 240) / 2, "9:16 horizontal pillarbox did not darken outer area relative to 4:3");
     }
 }

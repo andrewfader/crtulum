@@ -2361,6 +2361,11 @@ crtulum                       live test pattern
 crtulum --capture             pick a window/screen through the desktop portal
 crtulum --play ROM [--core NAME] [--option K=V]
 crtulum --shot FILE.png [WxH]  headless screenshot (default 1000x800)
+crtulum --benchmark WxH       deterministic native-resolution HDR GPU pass timings (JSON)
+  --benchmark-source WxH      source raster (default 320x240 test pattern)
+  --benchmark-frames N        measured frames after 30 warmup frames (default 120)
+  --benchmark-output FILE     final raw little-endian RGBA16Float pixels
+  CRTULUM_PROFILE=1           log live CPU/wait timing every 240 frames
 
 Live/shot: --preset NAME, --input MODE. Live controls:
   drag/scroll orbit/zoom; 1-9,0/Tab presets; F2 pause game; F3 input; F4 webcam;

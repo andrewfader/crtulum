@@ -621,6 +621,35 @@ python3 scripts/verify_display.py --binary target/debug/crtulum
 The export checks generate temporary test media and inspect the resulting files
 with ffprobe: codecs, frame counts, audio, PNG output, seeking, and cache behavior.
 Optional core and character checks report skips when their assets are unavailable.
+For performance measurements, use a release build. `CRTULUM_PROFILE=1` logs live
+frame intervals and CPU stage durations every 240 frames, including time waiting
+for a swapchain image. It works with capture and games as well as the test pattern:
+
+```sh
+CRTULUM_PROFILE=1 cargo run --release -- --require-hdr --verify-frames 960
+target/release/crtulum --benchmark 3840x2160 --benchmark-source 1920x1080
+```
+
+The headless benchmark reports GPU timestamps for phosphor simulation and tube
+drawing separately, with median/p95 milliseconds after 30 warmup frames. It uses
+the live camera, native resolution, linear BT.2020 HDR, and a fixed field timeline.
+`--preset` and `--input` apply. The source is a resized test pattern; this does not
+measure capture, emulation, or compositor performance. Synchronized wall timings
+include readback waits and are not live FPS. GPU timestamp support is required.
+
+Save a benchmark-enabled baseline binary before changing the renderer, then compare:
+
+```sh
+cp target/release/crtulum target/perf-baseline
+# Make changes and rebuild with cargo build --release, then:
+python3 scripts/benchmark.py target/perf-baseline target/release/crtulum \
+  --size 1920x1080 --source 1920x1080 --presets trinitron pvm \
+  --output /tmp/crtulum-performance.json
+```
+
+The comparison alternates build order across three paired runs and requires
+byte-identical final HDR pixels. Keep other GPU workloads idle while measuring.
+
 For the headless software-Vulkan checks used in CI, add
 `--features ci-software-vulkan` to the root `cargo test` and `cargo build` commands;
 this does not enable software rendering for the live window.

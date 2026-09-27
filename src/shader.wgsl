@@ -888,7 +888,12 @@ fn measured_phosphor(uv: vec2<f32>, scan_uv: vec2<f32>, sig: vec3<f32>, lit: f32
     let remaining = max(dt - arrival, 0.0);
     let shutter = dt * clamp(u.raster.y, 0.000001, 1.0);
     let begin = dt - shutter;
-    let index = (u32(uv.y * u.params.y) * u32(u.params.x) + u32(uv.x * u.params.x)) * 33u;
+    let px = min(u32(uv.x * u.params.x), u32(u.params.x) - 1u);
+    let py = min(u32(uv.y * u.params.y), u32(u.params.y) - 1u);
+    let index = (py * u32(u.params.x) + px) * 33u;
+    // Reservoir writes below never touch this pixel's metadata until the end.
+    // Load it once instead of reloading from storage for all 31 components.
+    let metadata = history_load(index + 32u);
     let deposited = sig * lit * period * (1.0 + u.temporal.z) * select(0.0, 1.0, arrival <= dt);
     var integral = vec3<f32>(0.0);
     let mono = u.mono.w > 0.5;
@@ -901,26 +906,28 @@ fn measured_phosphor(uv: vec2<f32>, scan_uv: vec2<f32>, sig: vec3<f32>, lit: f32
             weight = select(vec3<f32>(0.0), vec3<f32>(1.0), k == 0u);
         }
         var previous = history_load(index + k).rgb;
+        let min_decay = select(2.5, 0.0, u.raster.z == 0.0);
+        let decay_rate = max(rate, vec3<f32>(min_decay));
         // A newly opened, already-warm tube starts at the periodic steady state
         // of its initial signal. Power-up from a blank signal still starts dark.
-        if (history_load(index + 32u).w == 0.0 || history_load(index + 32u).y != material) {
+        if (metadata.w == 0.0 || metadata.y != material) {
             let cycle = period * (1.0 + u.temporal.z);
             previous = deposited * weight * rate * exp(-rate * max(cycle - arrival, 0.0))
-                / max(released(rate * cycle), vec3<f32>(1e-12));
+                / max(released(decay_rate * cycle), vec3<f32>(1e-12));
         }
         integral = integral + previous * exp(-rate * begin) * released(rate * shutter) / rate;
         // Integrate the new impulse only over the open shutter interval.
         let age_begin = max(begin - arrival, 0.0);
         integral = integral + deposited * weight * exp(-rate * age_begin)
             * released(rate * max(remaining - age_begin, 0.0));
-        let next = previous * exp(-rate * dt) + deposited * weight * rate * exp(-rate * remaining);
+        let next = previous * exp(-decay_rate * dt) + deposited * weight * rate * exp(-rate * remaining);
         history_store(index + k, vec4<f32>(next, 0.0));
         if (mono) { break; }
     }
     // Accumulate all field exposures belonging to one output frame. A 30 fps
     // frame must include both fields' light, not just the final field snapshot.
     var exposure = history_load(index + 31u);
-    if (history_load(index + 32u).x != u.raster.z) { exposure = vec4<f32>(0.0); }
+    if (metadata.x != u.raster.z) { exposure = vec4<f32>(0.0); }
     exposure = exposure + vec4<f32>(integral, shutter);
     history_store(index + 31u, exposure);
     history_store(index + 32u, vec4<f32>(u.raster.z, material, 0.0, 1.0));
@@ -1167,10 +1174,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // horizontal line (vertical deflection dies), then to a fading phosphor dot
     // (horizontal dies). Warmup runs the same in reverse.
     let open = min(u.pwr.x, 1.0 - u.pwr.y);
-    // Overscan: a consumer set scans the raster larger than the visible faceplate, so
-    // the picture's outer edges fall off the tube. Sample the centre (1 - 2*os) of the
-    // image across the full screen; PC monitors / mono terminals run os≈0 (full raster).
-    var base_uv = vec2<f32>(0.5) + (in.uv - vec2<f32>(0.5)) * (1.0 - 2.0 * u.focus.y);
+    // Preserve source aspect ratio on the 4:3 tube face (HALF_W / HALF_H).
+    // Widescreen (e.g. 16:9) is letterboxed top/bottom; portrait (e.g. 9:16) is
+    // pillarboxed left/right, preventing distortion. Standard 4:3 is unchanged.
+    var fit_uv = in.uv;
+    let tube_ar = HALF_W / HALF_H;
+    let src_ar = res.x / res.y;
+    if (abs(src_ar - tube_ar) > 0.02) {
+        if (src_ar > tube_ar) {
+            fit_uv.y = (fit_uv.y - 0.5) * (src_ar / tube_ar) + 0.5;
+        } else {
+            fit_uv.x = (fit_uv.x - 0.5) * (tube_ar / src_ar) + 0.5;
+        }
+    }
+    var base_uv = vec2<f32>(0.5) + (fit_uv - vec2<f32>(0.5)) * (1.0 - 2.0 * u.focus.y);
     if (u.pwr.z > 0.001) {
         // Degauss: a decaying AC wobble as the coil demagnetises the shadow mask.
         let tt = u.params.z;
