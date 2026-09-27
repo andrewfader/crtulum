@@ -659,6 +659,7 @@ impl super::Device {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(super::Swapchain {
+            color_space,
             raw,
             raw_flags,
             functor,

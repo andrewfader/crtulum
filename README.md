@@ -10,7 +10,7 @@ you can spin around with the mouse. Not a fullscreen filter. An actual tube, sit
 in your compositor, that you can orbit and zoom until the glare slides across the
 glass the right way.
 
-![Donkey Kong Country gameplay with Merlin, a Microsoft Agent character, rendered inside crtulum's modeled CRT](scratchpad/rom-agent-merlin-dkc.png)
+![Donkey Kong Country gameplay with Merlin, a Microsoft Agent character, rendered with crtulum's Panasonic preset](scratchpad/rom-agent-merlin-dkc.png)
 
 ## Build & run
 
@@ -19,6 +19,18 @@ Current Rust toolchain (system rustup, stable). Then:
 ```sh
 cargo run -- --capture
 ```
+
+A physical GPU with a Vulkan driver is required, including for headless rendering
+and GPU tests. The app automatically enumerates Vulkan devices, prefers a discrete
+card, and otherwise uses an integrated GPU. It logs the selected card and driver;
+software adapters are rejected. No GPU-enabling switch is needed. If detection
+fails, check device permissions and stale `VK_DRIVER_FILES`/`VK_ICD_FILENAMES`
+overrides that can hide installed drivers.
+
+CI runs on GitHub-hosted `ubuntu-latest`. Its separate `ci-software-vulkan` test
+build executes headless shader and export checks on Mesa lavapipe. Normal builds
+still require physical hardware; CI software results do not certify hardware
+performance or display behavior.
 
 That pops the screencast picker. Point it at something. It lands on the tube.
 
@@ -41,7 +53,8 @@ cargo run --release -- --play game.cue --core swanstation --option swanstation_G
 A libretro core runs in-process, one emulated frame per tick of the clock — not per
 monitor refresh, so a 59.727 Hz Game Boy and a 60.099 Hz SNES each run at their own
 speed whatever your display is doing. A gamepad is picked up automatically if one is
-plugged in; otherwise the keyboard stands in:
+plugged in; its left stick is passed through as analog input as well as supplying
+directional buttons. Stick clicks supply L3/R3. Otherwise the keyboard stands in:
 
 | | |
 | --- | --- |
@@ -87,16 +100,28 @@ cargo run --release -- --render frames/ out.mp4 --fps 30
 cargo run --release -- --render --rom smb.nes out.mp4 --script run.crts
 ```
 
-Audio comes along from the source. The tube is driven at 60 fields/sec no matter
-what frame rate you export at, so a 30 fps export still scans every frame twice and
-480i still twitters. Signal resolution defaults to 480 lines (`--lines 240` for the
-real thing — a CRT never saw a 1080p signal, and feeding it one dissolves the
-scanline structure).
+For lossless PNG sequences, use `--render frames/ out/ --codec png --fps 30`.
+`--clip frames/ out/ [WxH]` is another spelling for PNG output through that same
+renderer, defaulting to 60000/1001 fps and 1000×800. Both commands share the field
+clock, phosphor history, scripts, signal processing, and GPU supersampling.
+Use `--fps` to set the output cadence.
+PNG sequences include a synchronized `audio.wav` alongside the frames, mixing
+source, emulator, and character audio into lossless floating-point PCM. `--no-audio`
+disables it; short audio tracks are padded to the rendered duration.
+
+Audio comes along from the source. The tube advances at 60000/1001 (about 59.94)
+fields/sec independently of export or monitor refresh rate. Interlaced fields excite
+alternate source rows. Video taller than 576 lines is reduced to 480 by default;
+smaller sources retain their resolution. Still sequences preserve each image’s
+native dimensions unless `--lines`/`--source-size` is supplied (`--lines 240` selects a low-resolution
+console raster). Higher line counts are appropriate for PC and HD
+CRTs, but make scanline structure harder to resolve. Set `interlace on` in a script
+for alternating fields.
 
 `--help` for the rest: `--size`, `--fps`, `--ssaa` (3 by default, `1` for a fast
-preview), `--start`/`--duration`, `--codec x264|x265|vp9|ffv1`, `--crf`, `--no-audio`.
-Roughly 500 fps at 640×480/ssaa 2 on an RX 9070 — most clips render faster than they
-play.
+preview), `--start`/`--duration`, `--codec x264|x265|vp9|ffv1|png`, `--crf`, `--no-audio`.
+Export runs without a real-time pacing limit. Throughput depends on the source,
+GPU, resolution, preset, and supersampling.
 
 ### Scripts
 
@@ -126,7 +151,8 @@ ease by default (`linear` if you'd rather). Actions: `preset`, `camera`, `spin`,
 `exposure`, `power on|off`, `degauss`, `interlace`, `subpixel`, `bfi`, `wait`. Set
 `source` in the script and it's self-contained — `--render out.mp4 --script run.crts`.
 Command-line flags override the script's setup lines, so one script works across
-different sources and sizes. Typos are errors with a line number, not silent no-ops.
+different sources and sizes. Two positional paths override a script's media source;
+`--out` explicitly names the output. Typos are errors with a line number, not silent no-ops.
 
 Downloads and emulator recordings are staged in `.crtulum/` next to the output, and
 reused on the next run — so iterating on a script doesn't re-download or re-record.
@@ -136,7 +162,8 @@ reused on the next run — so iterating on a script doesn't re-download or re-re
 Point the script at a ROM instead of a video and the same timeline drives the *run*
 as well as the camera. crtulum loads a libretro core in-process and calls it one
 frame at a time with the exact buttons that frame is scripted to hold — so it's
-frame-exact, headless, deterministic, and faster than real time:
+frame-exact, headless, deterministic, and unconstrained by real-time pacing
+(actual throughput depends on the core, GPU, resolution, and supersampling):
 
 ```
 rom      smb.nes
@@ -160,7 +187,8 @@ cargo run --release -- --render run.mp4 --script examples/tas.crts
 
 `at <time>` is wall clock; `frame <n>` is exact — write the run in frames, write the
 camera in seconds. Verbs: `press`, `hold`, `release`, `tap`, with `for <n> frames`
-or `for <seconds>`. Buttons are the libretro names (`a b x y l r l2 r2 l3 r3 start
+or `for <seconds>`. `stick x,y` sets the left analog stick in −1..1 (positive Y
+is down); `center stick` releases it. Buttons are the libretro names (`a b x y l r l2 r2 l3 r3 start
 select up down left right`), several per line: `press a right`. Audio comes from the
 core and is muxed in at the end. `CRTULUM_DEBUG_INPUT=1` prints the run as it plays,
 one line per change, which is how you find out why a jump missed.
@@ -284,8 +312,8 @@ machines, so those need `--core`.
 
 ## Presets
 
-Ten tubes, each one measured off real hardware — actual stripe pitch, actual TVL,
-actual white point. `--preset <name>` (default `trinitron`), or keys **1–9,0** live,
+Ten tubes, with hardware-specific stripe pitch, TVL, phosphor gamut, and white
+point. `--preset <name>` (default `trinitron`), or keys **1–9,0** live,
 **Tab** to cycle.
 
 | Key | Name          | What it is                                           |
@@ -298,8 +326,17 @@ actual white point. `--preset <name>` (default `trinitron`), or keys **1–9,0**
 | 6   | `arcade`      | coarse 15 kHz mask, scanlines you can count          |
 | 7   | `vga`         | fine-pitch PC monitor, flatter, colder               |
 | 8   | `diamondtron` | dead-flat aperture grille, blindingly bright         |
-| 9   | `green`       | P1 green phosphor, long afterglow, terminal vibes    |
+| 9   | `green`       | long-persistence green phosphor, terminal vibes    |
 | 0   | `amber`       | P3 amber, same energy, warmer                        |
+
+The same gameplay frame and camera on each tube. Click a preview for the full-size
+screenshot.
+
+| Trinitron | Panasonic | Slot mask | RCA | PVM |
+| :---: | :---: | :---: | :---: | :---: |
+| [<img src="docs/screenshots/trinitron.png" alt="Donkey Kong Country and Merlin on the Trinitron preset" width="160">](docs/screenshots/trinitron.png) | [<img src="docs/screenshots/panasonic.png" alt="Donkey Kong Country and Merlin on the Panasonic preset" width="160">](docs/screenshots/panasonic.png) | [<img src="docs/screenshots/slotmask.png" alt="Donkey Kong Country and Merlin on the slot mask preset" width="160">](docs/screenshots/slotmask.png) | [<img src="docs/screenshots/rca.png" alt="Donkey Kong Country and Merlin on the RCA preset" width="160">](docs/screenshots/rca.png) | [<img src="docs/screenshots/pvm.png" alt="Donkey Kong Country and Merlin on the PVM preset" width="160">](docs/screenshots/pvm.png) |
+| **Arcade** | **VGA** | **Diamondtron** | **Green** | **Amber** |
+| [<img src="docs/screenshots/arcade.png" alt="Donkey Kong Country and Merlin on the arcade preset" width="160">](docs/screenshots/arcade.png) | [<img src="docs/screenshots/vga.png" alt="Donkey Kong Country and Merlin on the VGA preset" width="160">](docs/screenshots/vga.png) | [<img src="docs/screenshots/diamondtron.png" alt="Donkey Kong Country and Merlin on the Diamondtron preset" width="160">](docs/screenshots/diamondtron.png) | [<img src="docs/screenshots/green.png" alt="Donkey Kong Country and Merlin on the green phosphor preset" width="160">](docs/screenshots/green.png) | [<img src="docs/screenshots/amber.png" alt="Donkey Kong Country and Merlin on the amber phosphor preset" width="160">](docs/screenshots/amber.png) |
 
 The Trinitron even has its damper wires — those two faint horizontal shadows across
 the screen that drove people nuts and that nobody could explain.
@@ -313,7 +350,7 @@ the screen that drove people nuts and that nobody could explain.
 | 1–9,0 / Tab  | pick / cycle preset                     |
 | P            | power (warm-up, or collapse to a dot)   |
 | G            | degauss                                 |
-| I            | 480i / 240p                             |
+| I            | interlaced / progressive scanning        |
 | M            | subpixel mask (Megatron) / gaussian     |
 | B            | black-frame insertion (needs 100 Hz+)   |
 | `[` / `]`    | exposure trim (for HDR panels)          |
@@ -323,20 +360,25 @@ the screen that drove people nuts and that nobody could explain.
 
 Short version: it's not a texture with a scanline overlay. The light is simulated.
 
-**Color is real.** Each tube runs its measured phosphor gamut (SMPTE-C, P22, sRGB)
+**Color is real.** Each tube runs its phosphor gamut (SMPTE-C, P22, sRGB)
 and native white point through a CRT→sRGB matrix computed on the CPU. 9300K reads
 blue the way a cheap TV did; D65 stays neutral. The greens desaturate exactly as
 much as SMPTE-C says they should.
 
 **The beam scans.** Two render passes: one integrates the picture into an HDR
 phosphor plane with real per-channel decay, the other reconstructs the electron beam
-from the source scanlines. The decay is per-phosphor and the gap is bigger than you'd
-guess: EIA classes P22's red a whole persistence step above its green and blue, because
-red emits on a forbidden europium transition that takes about a millisecond while the
-two sulfides recombine in tens of microseconds. So a bright object in motion drags a
-distinctly *red* tail, and it doesn't fade as a clean exponential either — sulfide
-phosphors drop fast and then linger on a slow power-law tail, which is the part your eye
-actually reads as afterglow.
+from the source scanlines. Each primary has its own decay time, so a bright object
+in motion drags a distinctly *red* tail as green and blue fade first. The decay
+slows as the stored light dims, giving highlights a lingering afterglow.
+Monochrome tubes carry their own longer persistence: green fades to 10% in 50 ms,
+amber in 13 ms.
+The default color response uses published P22 measurements, with separate decay
+reservoirs retaining both rapid emission and long afterglow. Beam arrival is timed
+across each line and field, including blanking, and emitted light is integrated
+analytically over the exposure. `--shutter 0.25` exports a quarter-field exposure;
+`1` integrates the whole field. Multiple fields contributing to an output frame
+are integrated together. `CRTULUM_PHOSPHOR=legacy` retains the previous extended
+motion-trail response. [Measurement sources and reproduction](docs/calibration-sources.md).
 
 The beam itself is energy-conserving, which is the whole game. Light out of a phosphor is
 linear in beam current — a CRT's ~2.4 gamma comes from the gun's grid, not the phosphor —
@@ -353,18 +395,19 @@ the signal is continuous, the DAC *holds* each source pixel for its whole dwell,
 beam paints that staircase blurred by the spot. Hand that axis to the GPU's bilinear filter
 and every pixel becomes a ramp between its neighbours' centres, so nothing ever reaches a
 flat top and the tube's focus gets no say at all: a razor PVM and a fuzzy console set come
-out identically soft sideways. Here the sampling ramp is set to the spot width instead, so
+out identically soft sideways. Here each held pixel interval is integrated through a per-channel Gaussian spot, so
 a sharp tube resolves single pixels with hard edges and a soft one melts them together.
 
-**The mask is glued to the tube, not to your monitor.** A 20" Trinitron has 583 stripe
-triads across its face, a PVM-20L5 has 1235, a 0.24 mm Diamondtron 1467 — measured pitch
-over measured screen width, and the shader draws them on the faceplate itself. So the
+**The mask is glued to the tube, not to your monitor.** The modeled 20" Trinitron has about 606 stripe
+triads across its face (400/0.66 mm), the PVM about 1253 (388.4/0.31 mm), and
+the Diamondtron 1525 (366/0.24 mm) — screen width divided by horizontal pitch, and the shader draws them on the faceplate itself. So the
 grille curves with the glass, foreshortens as the tube turns, and *magnifies when you lean
 in*. It also band-limits itself: unless your display is putting more than about two pixels
 on each triad, the stripes integrate to their own mean and vanish, exactly as they do when
 you look at a real TV from across the room and exactly as they don't in a macro photo of
-one. Nothing is faded by hand — the pattern's own pixel footprint does it, and because the
-mask is normalised to unit mean, the picture doesn't change brightness when it goes.
+one. The stripe filter evaluates the periodic Gaussian in the frequency domain,
+integrates its pixel footprint, and applies a nonnegative reconstruction filter
+with a Nyquist cutoff. Its DC term stays constant, preserving mean brightness.
 
 Scanline depth works the same way, and for the same reason there's no knob for it: how deep
 the gaps run is decided by the spot width against the line pitch, both of which the beam
@@ -385,14 +428,14 @@ once, but room light that gets in, scatters off the phosphor and comes back out 
 twice. Halve the transmission and you lose half your brightness but quarter the ambient
 wash, so contrast doubles and you buy it back with beam current. That wash is modeled, and
 it's diffuse rather than mirrored, so it lifts blacks evenly however you're looking at the
-tube — which is why the presets land between about 40:1 and 90:1 in-room contrast, ordered
-exactly by how dark and how well-coated each tube's glass is, instead of the several
-hundred to one a datasheet quotes from a dark room.
+tube. Darker glass and better coatings lower that black floor, giving each preset
+its own in-room contrast.
 
 Bright content gets two separate glows: a tight warm halation off the phosphor and a
 wider, softer diffusion haze scattering through the thick glass — which is where CRT
-light gets its density. Both *redistribute* light rather than adding it, so a flat white
-field comes through untouched and only an isolated highlight actually blooms — added on
+light gets its density. Both *redistribute* light rather than adding it: the scatter
+kernels preserve a spatially uniform field per channel and only an isolated
+highlight actually blooms — added on
 top, as a glow usually is, it's just a brightness offset wearing a blur.
 
 **The consumer sets cheat, on purpose.** Composite and S-video tubes run scan
@@ -400,14 +443,13 @@ velocity modulation — the old Sony trick of goosing the beam speed at edges to
 sharpness, complete with the bright overshoot halo videophiles complained about for
 twenty years. The broadcast PVM, fed clean RGB, doesn't bother, so it stays honest
 and razor-flat. Hit **M** for subpixel mask mapping, which lands each simulated
-phosphor on a real panel subpixel for maximum density at native resolution, or **B**
+phosphor on an RGB panel subpixel at native resolution, or **B**
 for black-frame insertion, which strobes the tube dark between frames so motion snaps
 like an actual CRT instead of smearing like an LCD (you'll want a 120 Hz panel).
 
 **The signal path is period-correct.** RGB and component stay clean (PVM, arcade,
 PC monitors). S-video keeps sharp luma but band-limits color. Composite gets the
-full indignity — dot crawl, cross-color, bleed — and all of it is pinned to one measured
-number: 320 active pixels across NTSC's 52.6 µs line is a 6.0837 MHz pixel rate, so the
+full indignity — dot crawl, cross-color, bleed — and the bandwidths use a fixed NTSC timing model: 320 active pixels across NTSC's 52.6 µs line is a 6.0837 MHz pixel rate, so the
 3.579545 MHz subcarrier lands at 0.588 cycles per pixel, a 1.70-px period. That ratio, not
 a taste knob, is what decides which detail turns into false color — cross-color peaks on
 1.7-px features and is gone by 4 px, which is why fine dither shimmers rainbow and a plain
@@ -416,27 +458,30 @@ a taste knob, is what decides which detail turns into false color — cross-colo
 consumer RCA or Panasonic never paid for wideband-I. Cascading them keeps the encoder's
 green–magenta-vs-orange–cyan asymmetry but compresses it from 3.25:1 to 1.49:1. Luma is the
 set's video amp at 3.0 MHz with a real 3.58 trap (Q ≈ 10, 20 dB) sitting in it rather than
-one filter doing both jobs — so the dot crawl is 3.7% on a flat field and only rises where
-it should, at color edges, where the trap's estimate of the local subcarrier goes wrong. So
+one filter doing both jobs — modeled with Gaussian kernels calibrated at −3 dB. The trap leaves about 6.1%
+of the carrier amplitude after the luma filter on a uniform field in this model;
+residuals also appear at color edges where the carrier estimate changes. So
 the Panasonic smears its reds the way composite did and the PVM doesn't.
 
 **Plus the small stuff nobody asked for.** Deflection geometry errors (pincushion,
 keystone, corner defocus that only the cheap tubes show), convergence drift toward
 the edges, purity blotches a degauss actually clears, overscan eating the picture
-edges, a hum bar creeping down the picture once every eight seconds — mains ripple at
-120 Hz beating the field rate at 2×59.94, which is a 0.12 Hz drift and nothing faster —
+edges, a hum bar creeping down the picture once every eight seconds — full-wave
+120 Hz mains ripple beating against twice the 60000/1001 Hz field clock, giving
+a 0.11988 Hz drift —
 analog grain, halation, and
 a power switch that collapses the raster to a bright line, then a dot, then nothing
 — and runs it backward with a degauss burst on the way up.
 
-The cabinet's a real one too: a deep, near-cubic charcoal consumer set modeled on a
+The cabinet’s a real one too: a deep, near-cubic charcoal consumer set modeled on a
 Sony KV-20TS20, chin grille and knobs and all, lit by a small HDR room so the plastic
 and glass catch highlights instead of looking like a screensaver from 1999.
 
 ## HDR
 
-If you've got the panel for it, it'll drive true HDR — BT.2020 linear, compositor
-does the transfer, beam cores and speculars pushed past 1.0 so they actually glow.
+If you've got the panel for it, it'll drive true HDR — linear sRGB (scRGB) or BT.2020,
+matching the configured swapchain. The compositor does the transfer, with beam
+cores and speculars above 1.0.
 This is the fussiest part on Linux and it took a vendored wgpu-hal patch to get the
 colorspace mapping right. Use `[` / `]` to trim exposure to taste.
 

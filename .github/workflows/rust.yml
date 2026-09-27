@@ -8,7 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  CRTULUM_REQUIRE_GPU: "1"
 
 jobs:
   build:
@@ -20,13 +19,13 @@ jobs:
     - name: Install system dependencies
       # pipewire-sys probes libpipewire via pkg-config and generates bindings
       # with bindgen (needs libclang); ashpd/winit pull in dbus/wayland at build.
-      # mesa-vulkan-drivers ships lavapipe, a software Vulkan device so the
-      # headless GPU test (waterfall_melts) can actually run on the runner.
+      # Lavapipe executes numerical Vulkan checks on this hosted CPU runner.
       # gilrs needs libudev (gamepad enumeration) and libasound2 (force feedback).
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           pkg-config \
+          ffmpeg \
           clang \
           libclang-dev \
           libpipewire-0.3-dev \
@@ -37,34 +36,33 @@ jobs:
           mesa-vulkan-drivers \
           libvulkan1 \
           vulkan-tools
-    - name: Point Vulkan at lavapipe
-      # Pin the loader to lavapipe so the GPU test never depends on a runner GPU
-      # being present — but *find* the ICD manifest rather than hardcoding it:
-      # the filename is packaging-dependent (mesa 25.2 on noble ships
-      # lvp_icd.json, older/other distros lvp_icd.x86_64.json) and a path that
-      # does not exist leaves the loader with zero drivers, which looks exactly
-      # like "this runner has no GPU".
+    - name: Select CI software Vulkan driver
       run: |
-        icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json \
-                 /usr/lib/*/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1)
-        if [ -z "$icd" ]; then
-          echo "no lavapipe ICD found; mesa-vulkan-drivers ships:"
-          find / -name 'lvp_icd*.json' 2>/dev/null
-          exit 1
-        fi
-        echo "using $icd"
+        icd=$(find /usr/share/vulkan/icd.d /usr/lib -name 'lvp_icd*.json' -print -quit 2>/dev/null)
+        test -n "$icd" || { echo "Mesa lavapipe ICD not found"; exit 1; }
         echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
         echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
-    - name: Show Vulkan device
-      # No `|| true`: if the loader cannot bring up lavapipe, fail here with the
-      # loader's own diagnostics rather than six minutes later inside the tests.
-      run: vulkaninfo --summary | grep -iE "deviceName|driverName"
+    - name: Show CI Vulkan device
+      run: vulkaninfo --summary
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --verbose --target-dir target/ci-vulkan
+    - name: Confirm normal build rejects software rendering
+      run: |
+        if target/ci-vulkan/debug/crtulum --shot /tmp/should-not-render.png 80x60 > /tmp/gpu-policy.log 2>&1; then
+          echo "Normal build unexpectedly accepted a software adapter"
+          exit 1
+        fi
+        cat /tmp/gpu-policy.log
+        grep -q "a physical Vulkan GPU is required" /tmp/gpu-policy.log
+    - name: Build headless CI renderer
+      run: cargo build --verbose --features ci-software-vulkan --target-dir target/ci-vulkan
     - name: Run tests
-      # CRTULUM_REQUIRE_GPU makes the melt test fail (not skip) if no adapter is
-      # found — proving CI genuinely exercised the phosphor-persistence path.
-      run: cargo test --verbose
+      # Run the actual shaders; a missing Vulkan adapter still fails the tests.
+      run: cargo test --verbose --features ci-software-vulkan --target-dir target/ci-vulkan
+    - name: Native ACS reader tests
+      run: cargo test --manifest-path crates/acs/Cargo.toml
+    - name: Verify encoded media
+      run: python3 scripts/verify_exports.py --binary target/ci-vulkan/debug/crtulum
     - name: Enforce coverage floor
       # Keep the test suite from losing the exercised behavior above. The floor is
       # intentionally below the current baseline so it can only ratchet upward in
@@ -72,4 +70,4 @@ jobs:
       run: |
         rustup component add llvm-tools-preview
         cargo install cargo-llvm-cov --locked
-        cargo llvm-cov --all --no-fail-fast --fail-under-lines 34 -- --test-threads=1
+        CARGO_TARGET_DIR=target/ci-vulkan cargo llvm-cov --all --features ci-software-vulkan --no-fail-fast --fail-under-lines 34 -- --test-threads=1

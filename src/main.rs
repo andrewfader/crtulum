@@ -4,7 +4,7 @@
 //   cargo run -- --capture : live source via the ScreenCast portal + PipeWire (M2)
 //   cargo run -- --shot out.png 1000x800 : headless PNG render
 //   cargo run -- --clip frames/ out/ 800x600 : run a frame sequence through the
-//                                              tube (phosphor melts across fields)
+//                                              tube, writing PNGs through the shared export renderer
 //   cargo run -- --render clip.mp4 out.mp4 --script run.crts : scripted video
 //                                              export (source → CRT → ffmpeg)
 //   cargo run -- --render out.mp4 --script tas.crts : ditto, but the script also
@@ -17,10 +17,13 @@ mod agent;
 mod capture;
 mod font8x8;
 mod glctx;
+mod gpu;
 mod vkctx;
 mod libretro;
 mod play;
 mod video;
+mod rom_cache;
+mod phosphor;
 
 use std::sync::Arc;
 
@@ -508,8 +511,9 @@ struct Uniforms {
     scan: [f32; 4],   // beam math: beam_min, beam_max, beam_shape, beam_range
     env: [f32; 4],    // avg_r, avg_g, avg_b, apl  (screen-as-area-light bounce)
     look: [f32; 4],   // convergence, corner_radius, grain, ghost
-    phys: [f32; 4],   // crt_gamma, warmth, glow_bounce, bloom
+    phys: [f32; 4],   // crt_gamma, reserved, glow_bounce, HV sag
     temporal: [f32; 4], // dt(sec), persist_mult, interlace, field_parity
+    raster: [f32; 4], // measured response, shutter fraction, exposure group, reserved
     ptau: [f32; 4],   // per-phosphor decay tau: R, G, B (sec), w=power-law tail exponent
     geom: [f32; 4],   // raster geometry errors: pincushion, trapezoid, corner_pin, purity
     mono: [f32; 4],   // monochrome phosphor tint (rgb) + flag (w>0.5 = single-gun tube)
@@ -578,7 +582,7 @@ struct Preset {
     parallax: f32,
     reflection: f32,
     vignette: f32,
-    // Phosphor mask geometry, as measured: stripe/dot pitch in mm and the tube's visible
+    // Phosphor mask geometry, from specifications, measurements or estimates: stripe/dot pitch in mm and the tube's visible
     // picture width in mm. The shader wants the triad count across the face (screen_mm /
     // pitch_mm), which is the scale-free quantity — it is what decides whether the mask is
     // resolvable at a given zoom, and it is the number that differs between tubes. This
@@ -617,10 +621,8 @@ struct Preset {
     // room light reflected off the phosphor crosses it TWICE — so the ambient wash that
     // greys out a CRT's blacks in a lit room goes as T², which is why tinting works.
     glass_t: f32,
-    // phosphor white point warmth (0 = cool/bright PC monitor, 1 = warm/aged TV).
-    warmth: f32,
     // Phosphor persistence. A colour tube has three different phosphors, so this is a
-    // multiplier on the measured per-primary P22 decay constants (1.0 = stock P22). A
+    // multiplier on representative per-primary P22 decay constants (1.0 = baseline). A
     // single-gun mono tube has exactly ONE phosphor, so there is nothing to scale — this
     // is its absolute decay time in seconds and all three stored channels use it.
     persist: f32,
@@ -637,7 +639,9 @@ struct Preset {
 // Real phosphor primaries (CIE 1931 xy). SMPTE-C is the standardized NTSC CRT set
 // (a tightened P22); P22 is the looser consumer set; sRGB/709 for PC monitors.
 const PHOS_SMPTE_C: [[f32; 2]; 3] = [[0.630, 0.340], [0.310, 0.595], [0.155, 0.070]];
-const PHOS_P22: [[f32; 2]; 3] = [[0.625, 0.340], [0.280, 0.605], [0.155, 0.070]];
+// Phosphor Technology Ltd CRT material specifications, grades QKL63/N-C1,
+// GL29A/N-C1 and GL47/N-C2 (manufacturer CIE 1931 coordinates).
+const PHOS_P22: [[f32; 2]; 3] = [[0.647, 0.343], [0.310, 0.594], [0.148, 0.062]];
 const PHOS_SRGB: [[f32; 2]; 3] = [[0.640, 0.330], [0.300, 0.600], [0.150, 0.060]];
 
 // Build the 3x3 that maps CRT-phosphor drive RGB (linear) → linear sRGB (D65 display),
@@ -700,7 +704,7 @@ const TRINITRON: Preset = Preset {
     parallax: 0.045,
     reflection: 0.50,
     vignette: 0.22,
-    // 20" consumer Trinitron TV, aperture grille. THE ONE ESTIMATED PITCH HERE — crtdatabase
+    // 20" consumer Trinitron TV, aperture grille. Estimated pitch — crtdatabase
     // lists the KV-20TS20's tube (A51JUH50X) as an aperture grille but publishes no pitch, and
     // Sony did not spec it on consumer sets the way they did on monitors, because a TV runs one
     // scan rate and only has to resolve ~330 TVL. It is bounded from both sides though. The
@@ -718,7 +722,6 @@ const TRINITRON: Preset = Preset {
     beam: [0.34, 0.74, 0.75, 1.0],
     spot: 3.0,      // well-focused consumer Sony: flat-topped scanline
     glass_t: 0.50,  // tinted consumer panel
-    warmth: 0.5,
     persist: 1.0,
     phos: 0,
     white_xy: [0.2831, 0.2971],
@@ -751,8 +754,9 @@ const PANASONIC: Preset = Preset {
     parallax: 0.048,
     reflection: 0.45,
     vignette: 0.38,
-    // Consumer dot mask at 0.75 mm — repairfaq's own machinist's-scale measurement of a 19"
-    // Samsung, over that tube's 386 mm picture width → 515 triads.
+    // Consumer dot-mask model borrowing the 0.75 mm horizontal pitch measured by
+    // repairfaq on a 19" Samsung SLOT mask; not a Panasonic dot-pitch measurement.
+    // The assumed 386 mm picture width gives 515 horizontal periods.
     pitch_mm: 0.75,
     screen_mm: 386.0,
     // consumer set: looser convergence, rounder tube corners.
@@ -763,7 +767,6 @@ const PANASONIC: Preset = Preset {
     beam: [0.36, 0.78, 0.75, 1.0],
     spot: 2.4,      // ordinary consumer focus: nearly a plain bell
     glass_t: 0.52,
-    warmth: 0.5,
     persist: 1.0,
     phos: 0,
     white_xy: [0.2831, 0.2971],
@@ -804,7 +807,6 @@ const SLOTMASK: Preset = Preset {
     beam: [0.35, 0.76, 0.75, 1.0],
     spot: 2.4,
     glass_t: 0.52,
-    warmth: 0.5,
     persist: 1.0,
     phos: 0,
     white_xy: [0.2831, 0.2971],
@@ -847,7 +849,6 @@ const RCA: Preset = Preset {
     beam: [0.48, 0.98, 0.65, 1.0], // WIDE, unfocused beam = fuzzy / low TVL
     spot: 2.0,      // soft gun: aberration blur dominates → pure gaussian bell
     glass_t: 0.58,  // older, lighter-tinted console panel
-    warmth: 0.72, // warm, aged/yellowed white point
     persist: 1.0,
     phos: 0,
     white_xy: [0.305, 0.322],
@@ -880,17 +881,15 @@ const PVM: Preset = Preset {
     parallax: 0.045,
     reflection: 0.34,
     vignette: 0.14,
-    // Sony PVM-20L5: 0.31 mm aperture grille (crtdatabase; the 14L5 is 0.25 mm) over a
-    // 386 mm picture (19" viewable) → 1245 triads, more than twice a consumer set's.
+    // Sony PVM-20L5 brochure: 0.31 mm grille, 388.4 mm effective picture width.
     pitch_mm: 0.31,
-    screen_mm: 386.0,
+    screen_mm: 388.4,
     convergence: 0.008, // tight
     corner_radius: 0.04, // squarish pro face
     geom: [0.006, 0.0, 0.008, 0.02], // near-perfect
     beam: [0.26, 0.56, 0.85, 1.0], // TIGHT beam = sharp / high TVL
     spot: 4.0,      // razor focus: a real plateau with steep walls
     glass_t: 0.44,  // high-contrast tinted + AR-coated broadcast panel
-    warmth: 0.34, // calibrated, slightly warm of D65
     persist: 1.0,
     phos: 0,
     white_xy: [0.3127, 0.329],
@@ -934,7 +933,6 @@ const ARCADE: Preset = Preset {
     beam: [0.40, 0.90, 0.70, 1.0], // wide, strong scanline gaps
     spot: 2.6,
     glass_t: 0.62,  // bare consumer-grade tube, only lightly tinted
-    warmth: 0.50,
     persist: 1.0,
     phos: 0,
     white_xy: [0.2831, 0.2971],
@@ -976,7 +974,6 @@ const VGA: Preset = Preset {
     beam: [0.28, 0.60, 0.85, 1.0], // sharp
     spot: 3.6,
     glass_t: 0.60,
-    warmth: 0.15, // cool / bright
     persist: 1.0,
     phos: 2,
     white_xy: [0.2831, 0.2971],
@@ -1008,17 +1005,16 @@ const DIAMONDTRON: Preset = Preset {
     parallax: 0.036,
     reflection: 0.30, // AR coated
     vignette: 0.12,
-    // 19" Diamondtron FE: 0.24 mm aperture grille over 352 mm → 1467 triads, the
-    // finest mask here — below even repairfaq's "as low as .22 mm" note on commercial monitors.
+    // Mitsubishi Diamond Pro 930SB service manual: 0.24 mm grille and a
+    // 366 mm full-scan display width (356 mm factory underscan setting).
     pitch_mm: 0.24,
-    screen_mm: 360.0,
+    screen_mm: 366.0,
     convergence: 0.010,
     corner_radius: 0.03,
     geom: [0.010, 0.0, 0.010, 0.02], // flat, well-corrected
     beam: [0.26, 0.55, 0.88, 1.0], // very sharp / bright
     spot: 4.2,      // the flattest-topped, best-focused gun here
     glass_t: 0.50,  // AR-coated, tinted for contrast
-    warmth: 0.10, // cool superbright
     persist: 1.0,
     phos: 2,
     white_xy: [0.2831, 0.2971],
@@ -1026,7 +1022,7 @@ const DIAMONDTRON: Preset = Preset {
     mono: [0.0, 0.0, 0.0, 0.0],
 };
 
-// Monochrome green terminal (P1/P39 green phosphor): a single electron gun, no
+// Monochrome green terminal model: P1-like tint with long persistence, a single gun, no
 // colour mask, and long persistence — the lingering green afterglow of a VT-style
 // text terminal / IBM 5151. Crisp text beam, warm glow, gently curved small tube.
 const GREEN: Preset = Preset {
@@ -1060,8 +1056,7 @@ const GREEN: Preset = Preset {
     beam: [0.30, 0.62, 0.85, 1.0],  // fairly tight for readable text
     spot: 3.2,
     glass_t: 0.40,                  // terminals wore a dark contrast filter over the face
-    warmth: 0.0,                    // colour comes from `mono`, not the warm tint
-    persist: 0.050,                 // P39: EIA class L, ~50 ms on an IBM 5151
+    persist: 0.021715,              // representative 50 ms to 10% / ln(10)
     phos: 3,
     white_xy: [0.3127, 0.329],
     signal: 0,
@@ -1101,8 +1096,7 @@ const AMBER: Preset = Preset {
     beam: [0.30, 0.62, 0.85, 1.0],
     spot: 3.2,
     glass_t: 0.40,
-    warmth: 0.0,
-    persist: 0.013,                // P3 amber: EIA class M, ~13 ms to 10%
+    persist: 0.005646,             // representative 13 ms to 10% / ln(10)
     phos: 3,
     white_xy: [0.3127, 0.329],
     signal: 0,
@@ -1134,6 +1128,11 @@ const ALL_PRESETS: [Preset; 10] =
 // ---------------------------------------------------------------------------
 
 struct Resources {
+    hdr_bt2020: bool,
+    physical_phosphor: bool,
+    shutter_fraction: f32,
+    exposure_group: u32,
+    phosphor_state: [wgpu::Buffer; 3],
     pipeline: wgpu::RenderPipeline,
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
@@ -1168,6 +1167,18 @@ struct Resources {
 
 const PHOSPHOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+// Independent positive reservoirs retain all decay components and their energy.
+fn make_phosphor_state(device: &wgpu::Device, w: u32, h: u32) -> [wgpu::Buffer; 3] {
+    // Split the reservoirs across bindings so native 4K capture does not exceed
+    // Vulkan's per-buffer range. No source pixels or decay components are lost.
+    let size = w as u64 * h as u64 * 11 * 16;
+    assert!(size <= device.limits().max_storage_buffer_binding_size as u64,
+        "source raster exceeds this GPU's phosphor-history capacity");
+    std::array::from_fn(|_| device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("phosphor reservoir bank"), size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
+}
+
 // An HDR phosphor plane (render target + sampleable) at the source's resolution.
 fn make_phosphor(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -1177,7 +1188,7 @@ fn make_phosphor(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu:
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: PHOSPHOR_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1204,18 +1215,19 @@ fn source_stats(data: &[u8], w: u32, h: u32, bgra: bool) -> [f32; 4] {
         } else {
             (data[o], data[o + 1], data[o + 2])
         };
-        ar += r as f64;
-        ag += g as f64;
-        ab += b as f64;
+        // Average emitted light/current, not gamma-encoded voltage.
+        ar += (r as f64 / 255.0).powf(2.4);
+        ag += (g as f64 / 255.0).powf(2.4);
+        ab += (b as f64 / 255.0).powf(2.4);
         n += 1.0;
         i += step;
     }
     if n == 0.0 {
         return [0.0, 0.0, 0.0, 0.0];
     }
-    let r = (ar / n / 255.0) as f32;
-    let g = (ag / n / 255.0) as f32;
-    let b = (ab / n / 255.0) as f32;
+    let r = (ar / n) as f32;
+    let g = (ag / n) as f32;
+    let b = (ab / n) as f32;
     [r, g, b, 0.299 * r + 0.587 * g + 0.114 * b]
 }
 
@@ -1258,6 +1270,9 @@ impl Resources {
                         binding: 3,
                         resource: wgpu::BindingResource::TextureView(&self.phosphor_view[i]),
                     },
+                    wgpu::BindGroupEntry { binding: 4, resource: self.phosphor_state[0].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: self.phosphor_state[1].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: self.phosphor_state[2].as_entire_binding() },
                 ],
             });
         }
@@ -1292,6 +1307,7 @@ impl Resources {
             if (width, height) != self.source_size {
                 let (t0, v0) = make_phosphor(device, width, height);
                 let (t1, v1) = make_phosphor(device, width, height);
+                self.phosphor_state = make_phosphor_state(device, width, height);
                 self.phosphor = [t0, t1];
                 self.phosphor_view = [v0, v1];
                 self.phos_cur = 0;
@@ -1378,6 +1394,7 @@ fn build_resources(
         // Phosphor persistence planes (ping-pong), sized to the source.
         let (p0t, p0v) = make_phosphor(device, tw, th);
         let (p1t, p1v) = make_phosphor(device, tw, th);
+        let phosphor_state = make_phosphor_state(device, tw, th);
         let phosphor = [p0t, p1t];
         let phosphor_view = [p0v, p1v];
 
@@ -1460,13 +1477,28 @@ fn build_resources(
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
             ],
         });
 
         // --- pipeline ---
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(concat!(include_str!("phosphor.wgsl"), "\n", include_str!("shader.wgsl")).into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline_layout"),
@@ -1560,6 +1592,9 @@ fn build_resources(
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&source_view) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(pv) },
+                    wgpu::BindGroupEntry { binding: 4, resource: phosphor_state[0].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: phosphor_state[1].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: phosphor_state[2].as_entire_binding() },
                 ],
             })
         };
@@ -1580,6 +1615,11 @@ fn build_resources(
     });
 
     Resources {
+        hdr_bt2020: false,
+        physical_phosphor: std::env::var("CRTULUM_PHOSPHOR").as_deref() != Ok("legacy"),
+        shutter_fraction: 1.0,
+        exposure_group: 0,
+        phosphor_state,
         pipeline,
         vbuf,
         ibuf,
@@ -1618,6 +1658,28 @@ fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture
         view_formats: &[],
     });
     tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+// NTSC fields advance independently of presentation (including non-integer exports).
+const FIELD_HZ: f64 = 60_000.0 / 1001.0;
+// Full-wave 60 Hz supply ripple sampled by the field clock. Keep the signed
+// difference: it determines the direction of the drifting interference pattern.
+const HUM_BEAT_HZ: f64 = 2.0 * 60.0 - 2.0 * FIELD_HZ;
+#[derive(Default)]
+struct FieldClock { next: u64 }
+impl FieldClock {
+    fn through(&mut self, seconds: f64) -> std::ops::Range<u64> {
+        let end = (seconds.max(0.0) * FIELD_HZ + 1e-7).floor() as u64 + 1;
+        let start = self.next;
+        self.next = self.next.max(end);
+        start..self.next
+    }
+}
+
+// Uniform noise in ±amplitude/2 has RMS amplitude/sqrt(12). SNR is relative
+// to unit video voltage, before clipping and gun transfer; targets are model choices.
+fn noise_peak_to_peak(snr_db: f32) -> f32 {
+    12.0_f32.sqrt() * 10.0_f32.powf(-snr_db / 20.0)
 }
 
 fn write_uniforms(
@@ -1695,7 +1757,7 @@ fn write_uniforms(
         // luminance at 0.245 against the pre-audit 0.246 — the same picture brightness,
         // arrived at without the two fudges.
         tone: if hdr {
-            [1.0, exposure, 1.43, preset.signal as f32]
+            [if res.hdr_bt2020 { 2.0 } else { 1.0 }, exposure, 1.43, preset.signal as f32]
         } else {
             [0.0, 1.08 * exposure, 1.30, preset.signal as f32] // ACES exposure (was Reinhard white pt)
         },
@@ -1706,60 +1768,26 @@ fn write_uniforms(
         scan: preset.beam,
         // The screen radiates its average color/brightness onto the tube body.
         env: res.avg,
-        // convergence + corner rounding come from the preset; ghost (secondary internal
-        // glass reflection) is global; grain is the analog noise floor and belongs to the
-        // SIGNAL, not the tube — a flat global value put broadcast-grade snow on an RGB-fed
-        // PVM and on a TTL-driven mono terminal, neither of which has a noisy path to be
-        // noisy about. RS-250B short-haul spec is ~40 dB weighted SNR for a broadcast feed;
-        // off-air consumer RF is worse (~35-40 dB) and an RGB/component studio link better
-        // (>50 dB). dB → rms = 10^(-dB/20), and this grain is uniform in ±amt/2 (rms =
-        // amt/√12), so amt ≈ 3.46 × rms. It is applied after the tube drive (~2×), so halve
-        // again to land in signal terms. Caveat kept honest: because it is added at the end
-        // of fs_main rather than to `sig` in the accum pass, it does not decay with the
-        // phosphor or go through the transfer curve — it reads as display noise rather than
-        // signal noise. The magnitudes below are right; the placement is a simplification.
+        // Signal noise is injected in voltage space before gun transfer/decay.
         look: [
             preset.convergence,
             preset.corner_radius,
             if preset.mono[3] > 0.5 || preset.phos >= 2 {
-                0.002 // TTL/VGA-driven terminal or PC monitor: essentially a clean path
+                noise_peak_to_peak(64.0) // representative clean TTL/VGA path
             } else {
                 match preset.signal {
-                    2 => 0.020, // composite RF off-air, ~36 dB unweighted
-                    1 => 0.010, // S-video baseband, ~42 dB
-                    _ => 0.003, // RGB/component studio feed, >50 dB
+                    2 => noise_peak_to_peak(36.0), // representative noisy consumer feed
+                    1 => noise_peak_to_peak(42.0), // representative S-video baseband
+                    _ => noise_peak_to_peak(52.0), // representative RGB/component feed
                 }
             },
             0.012,
         ],
-        // CRT gamma (deepens blacks), per-tube warm/cool phosphor white point,
-        // screen→tube glow bounce strength, and highlight bloom gain.
-        //
-        // phys.x = 1.12 is NOT a look control: the source is an sRGB texture the hardware
-        // already decoded at ~2.2, and a real tube's EOTF is ~2.4 (BT.1886), so 2.2 × 1.12
-        // = 2.46 lands the end-to-end transfer where a measured tube sits. Leave it.
-        //
-        // phys.w USED to be an additive highlight bloom set to 0.5 — a straight energy ADD
-        // on everything above 0.72, worth up to +70% on a highlight. Every mechanism it
-        // stood in for is already modelled, and modelled conservatively: the spot grows with
-        // beam current in the reconstruction (beam_min → beam_max more than doubles the
-        // half-width), halation redistributes the glass back-reflection, and diffusion
-        // redistributes the panel scatter. Stacking a fourth, non-conserving term on top
-        // double-counted the first and manufactured light the tube never emitted — the
-        // source is clipped at 1.0, so there is no above-white drive for it to represent.
-        // Deleted; the three physical terms carry the glow and the drive above absorbs the
-        // mean change.
-        //
-        // The slot now carries the HV sag coefficient, which used to be hardcoded at a flat
-        // 0.06 for every tube. Sag is a power-supply property, so it separates exactly along
-        // build class: a studio monitor regulates the final anode hard and loses only a few
-        // percent between a 10% window and full field, while a consumer chassis on a cost
-        // budget gives up 10-15% — that visible dimming when a scene cuts to white is one of
-        // the things that most reads as "a real TV". Signal path is the proxy for build
-        // class here, the same way it already is for SVM and overscan.
+        // Gun voltage → current exponent, native white handled once by cmat.
+        // phys.w approximates supply regulation from average picture level.
         phys: [
-            1.12,
-            preset.warmth,
+            2.4,
+            0.0,
             0.42,
             if preset.mono[3] > 0.5 || preset.phos >= 2 {
                 0.05 // terminal / PC monitor: modest, steady raster, decent regulation
@@ -1782,49 +1810,21 @@ fn write_uniforms(
             interlace,
             field,
         ],
-        // Per-phosphor decay constants (seconds) + the tail exponent in .w.
-        //
-        // Nichia's EIA-registered CRT phosphor table classes the three P22 components
-        // separately: P22B ZnS:Ag,Cl = MS, P22G ZnS:Cu,Al = MS, but P22R Y2O2S:Eu = M —
-        // red sits a whole persistence class above the other two, because Eu³⁺ emits on a
-        // forbidden f–f transition with a ~1 ms lifetime while the sulfides recombine in
-        // tens of µs. ePanorama agrees: blue and green well under 100 µs to 10%, red a few
-        // hundred µs up to ~1 ms. So the real ratio is ~20 : 1.5 : 1, not the ~5 : 1.3 : 1
-        // used before, which had red only a little ahead of a pack it is really a decade
-        // clear of. Green keeps a modest lead over blue: ZnS:Cu,Al is the glow-in-the-dark
-        // sulfide and carries a long power-law tail, while ZnS:Ag,Cl has "no emission at
-        // long times". Absolute scale stays exaggerated so the trail survives being resampled
-        // to 60 Hz on a hold-type LCD — but the RATIO cannot be exaggerated with it. Real red
-        // is ~1 ms to 10%, i.e. ~16 time constants inside ONE 60 Hz frame: on a real tube the
-        // afterglow is an intra-frame effect, gone before the next field is drawn, and what
-        // the eye reads is a warm glow behind the beam, not a coloured ghost of the previous
-        // frame. Stretch the whole curve to frame scale at the physical 20:1.5:1 and that
-        // intensity effect turns into a chroma effect: red survives the frame boundary at 74%
-        // while green and blue die inside it, so motion drags a saturated red ghost that no
-        // tube has ever produced. So: red still leads (the signature is real and it is warm),
-        // but by ~3-4× rather than a decade, and the absolute scale is ~18× rather than ~50×.
-        // Red now falls to 40% across a frame instead of 74% — visible melt, not a smear.
-        //
-        // A single-gun mono tube has ONE phosphor: give all three stored channels the same
-        // tau, or the luma sum below decays at three different rates and a green terminal
-        // trails red. Real numbers: P39 Zn2SiO4:Mn,As is class L (~50 ms on an IBM 5151),
-        // P3 is class M — the amber terminals genuinely were the shorter-persistence tube.
-        //
-        // .w = the decay TAIL exponent. Sulfide phosphors do not decay exponentially: the
-        // measured curve is an abrupt near-exponential drop followed by a slow power-law
-        // tail, I = a/(t+t0)^b with b ≈ 0.2–2 (and the hyperbolic form I₀(1+at)^-n is what
-        // gives these phosphors their "pronounced afterglow"). A pure exponential throws
-        // that tail away, which is exactly the part the eye reads as afterglow. Kept, but
-        // halved (1.4 → 0.7): the tail is level-dependent, so it stretched *dim* charge the
-        // most (tau × 2.4 as prev → 0) and the faint end of a trail decayed slower the fainter
-        // it got — the part that actually read as lingering.
+        // Effective field-scale decay constants preserve the visible color afterglow.
+        // Red carries motion history across fields while green and blue fade first.
+        // Mono presets use their own exponential time-to-10% conversion.
+        raster: [if res.physical_phosphor { 1.0 } else { 0.0 }, res.shutter_fraction,
+            if res.exposure_group == 0 { time } else { res.exposure_group as f32 }, 0.0],
         ptau: if preset.mono[3] > 0.5 {
-            [preset.persist, preset.persist, preset.persist, 0.7]
+            // tau = T10 / ln(10) requires exponential decay. Adding the color
+            // tail here would lengthen T10 and make it depend on brightness and dt.
+            [preset.persist, preset.persist, preset.persist, 0.0]
         } else {
             [0.018, 0.006, 0.004, 0.7]
         },
         // Raster deflection geometry errors, per tube (see Preset.geom).
-        geom: preset.geom,
+        geom: [preset.geom[0], preset.geom[1], preset.geom[2],
+               preset.geom[3] * (1.0 - pwr[3])],
         // Monochrome phosphor tint + flag (single-gun green/amber terminals).
         mono: preset.mono,
         // Real phosphor-gamut + white-point colour matrix (computed on the CPU).
@@ -1856,15 +1856,10 @@ fn write_uniforms(
                     _ => 0.02,
                 }
             };
-            // Rolling refresh band (focus.z = roll rate Hz, focus.w = amplitude): the
-            // "hum bar" is ripple from the mains leaking into the video/HV rails, so it
-            // beats the tube's field rate against full-wave-rectified mains: |120 −
-            // 2×59.94| = 0.12 Hz, i.e. one slow crawl down the screen every ~8 s. That
-            // creep is the whole tell — the old 0.45 Hz was nearly 4× too fast and read as
-            // a deliberate animation rather than a tube that is quietly out of lock. A
-            // 50 Hz mono terminal beats |100 − 2×50| ≈ 0, so it barely drifts at all.
-            // 480i doubles the beat feel via field twitter (handled in the accum pass).
-            let roll_rate = if preset.mono[3] > 0.5 { 0.04 } else { 0.12 };
+            // All presets use FIELD_HZ, including monochrome terminals. Derive
+            // the mains beat from that clock rather than inventing a slower
+            // terminal rate without actually changing its scan timing.
+            let roll_rate = HUM_BEAT_HZ as f32;
             // Amplitude. The hum bar is mains ripple on the video/HV rails getting past the
             // supply's filtering, so its size is set by how much ripple survives — on a set
             // in good health, not much. Measured, a healthy CRT's hum bar is a percent or
@@ -2040,7 +2035,8 @@ struct State {
     depth_view: wgpu::TextureView,
     orbit: Orbit,
     start: std::time::Instant,
-    last_frame: std::time::Instant, // for per-frame dt (phosphor decay)
+    field_clock: FieldClock,
+    degaussed: bool,
     dragging: bool,
     last_cursor: (f64, f64),
     window: Arc<Window>,
@@ -2049,7 +2045,7 @@ struct State {
     /// Live play: a libretro core running a game, driven by the clock and a pad.
     player: Option<play::Player>,
     preset: Preset,
-    hdr: bool, // true = scRGB HDR swapchain, false = SDR (tonemap on output)
+    hdr: bool, // true = linear sRGB or BT.2020 HDR swapchain, false = SDR tone map
     power: PowerState,
     degauss_start: Option<std::time::Instant>,
     frame: u64,       // field counter for 480i interlace
@@ -2060,6 +2056,18 @@ struct State {
     refresh_hz: f32,  // detected panel refresh (for the BFI safety gate / message)
     glare: bool,      // tight ceiling-light specular on the faceplate (L key)
     window_reflection: bool, // mullioned daylight reflection in the environment (R key)
+}
+
+// Read the color space actually selected by the vendored Vulkan swapchain code.
+// Other backends use the usual linear-sRGB float surface contract.
+fn surface_uses_bt2020(surface: &mut wgpu::Surface<'_>) -> bool {
+    // SAFETY: read-only inspection; no raw handle is retained or destroyed.
+    unsafe {
+        surface.as_hal::<wgpu::hal::api::Vulkan, _, _>(|raw| {
+            raw.and_then(|s| s.configured_color_space())
+                == Some(ash::vk::ColorSpaceKHR::BT2020_LINEAR_EXT)
+        }).unwrap_or(false)
+    }
 }
 
 // Best-effort panel refresh detection. On Wayland current_monitor() is often None
@@ -2089,35 +2097,18 @@ impl State {
     ) -> anyhow::Result<State> {
         let size = window.inner_size();
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY, // Vulkan on Linux
-            ..Default::default()
-        });
-        let surface = instance.create_surface(window.clone()).map_err(|error| {
-            anyhow::anyhow!(
-                "could not create a GPU surface: {error}. Install or repair a Vulkan/OpenGL driver"
-            )
+        let instance = gpu::instance();
+        let mut surface = instance.create_surface(window.clone()).map_err(|error| {
+            anyhow::anyhow!("could not create a Vulkan surface: {error}")
         })?;
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no suitable GPU adapter found. Install or repair a Vulkan/OpenGL driver"
-                )
-            })?;
+        let adapter = gpu::adapter(&instance, Some(&surface))?;
 
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: gpu::limits(&adapter),
                 },
                 None,
             )
@@ -2126,11 +2117,10 @@ impl State {
 
         let caps = surface.get_capabilities(&adapter);
         eprintln!("[surface] offered formats: {:?}", caps.formats);
-        // Prefer a true HDR swapchain: Rgba16Float is scRGB (linear, 1.0 = SDR
-        // white, values >1.0 = extra nits). Fall back to sRGB 8-bit otherwise.
-        // NOTE: a compositor must actually advertise the float format for HDR to
-        // engage; many Wayland compositors (mutter, most X11) only expose sRGB,
-        // in which case we render HDR internally and tonemap to SDR for display.
+        // Prefer a true HDR swapchain: Rgba16Float with linear sRGB or BT.2020
+        // negotiated by the Vulkan backend. Match shader primaries after configure.
+        // Surface capabilities determine availability, not Wayland protocol names.
+        // Fall back to sRGB with an SDR presentation tone map when needed.
         let hdr_format = caps
             .formats
             .iter()
@@ -2143,7 +2133,7 @@ impl State {
         eprintln!(
             "[surface] using {:?} — HDR output {}",
             format,
-            if hdr { "ENABLED (Rgba16Float, BT.2020 linear)" } else { "unavailable → SDR tonemap" }
+            if hdr { "ENABLED (Rgba16Float, linear)" } else { "unavailable → SDR tonemap" }
         );
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -2160,7 +2150,9 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let res = build_resources(&device, &queue, format, preset);
+        let mut res = build_resources(&device, &queue, format, preset);
+        res.hdr_bt2020 = surface_uses_bt2020(&mut surface);
+        eprintln!("[surface] output primaries: {}", if res.hdr_bt2020 { "BT.2020" } else { "sRGB/BT.709" });
         let depth_view = create_depth(&device, config.width, config.height);
 
         Ok(State {
@@ -2180,7 +2172,8 @@ impl State {
                 distance: 2.65,
             },
             start: std::time::Instant::now(),
-            last_frame: std::time::Instant::now(),
+            field_clock: FieldClock::default(),
+            degaussed: false,
             // Power up with a warmup + auto-degauss, like a real set switching on.
             power: PowerState::Warmup(std::time::Instant::now()),
             degauss_start: Some(std::time::Instant::now()),
@@ -2272,6 +2265,7 @@ impl State {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        self.res.hdr_bt2020 = surface_uses_bt2020(&mut self.surface);
         self.depth_view = create_depth(&self.device, self.config.width, self.config.height);
     }
 
@@ -2324,6 +2318,7 @@ impl State {
                 let e = (now - t0).as_secs_f32();
                 if e >= DEGAUSS_DUR {
                     self.degauss_start = None;
+                    self.degaussed = true;
                     0.0
                 } else {
                     (-e / DEGAUSS_TAU).exp() // exponential AC burst — snaps then fades fast
@@ -2331,7 +2326,7 @@ impl State {
             }
             None => 0.0,
         };
-        [warmup, collapse, degauss, 0.0]
+        [warmup, collapse, degauss, if self.degaussed { 1.0 } else { 0.0 }]
     }
 
     // 'P' toggles power (with the collapse/warmup animation); auto-degauss on power-on.
@@ -2347,17 +2342,29 @@ impl State {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        self.poll_capture();
-        self.poll_player();
-        let dt = self.last_frame.elapsed().as_secs_f32().clamp(0.0, 0.1);
-        self.last_frame = std::time::Instant::now();
+        let time = self.start.elapsed().as_secs_f64();
+        // Bootstrap the first field. Thereafter catch-up fields use the source
+        // held at the previous presentation, before polling a newer live frame.
+        if self.field_clock.next == 0 {
+            self.poll_capture();
+            self.poll_player();
+        }
         let pwr = self.power_params();
         self.frame = self.frame.wrapping_add(1);
-        let (interlace, field) = if self.interlace {
-            (0.7, (self.frame & 1) as f32)
-        } else {
-            (0.0, 0.0)
-        };
+        let interlace = if self.interlace { 1.0 } else { 0.0 };
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        // Submit before overwriting the uniform buffer: queue writes are not snapshots
+        // captured by an encoded render pass.
+        self.res.exposure_group = self.frame as u32 % 16_000_000 + 1;
+        for field in self.field_clock.through(time) {
+            write_uniforms(&self.queue, &self.res, &self.orbit, aspect,
+                (field as f64 / FIELD_HZ) as f32, &self.preset, 1.0, self.hdr,
+                (1.0 / FIELD_HZ) as f32, pwr, interlace, (field % 4) as f32,
+                self.exposure, self.subpixel, 1.0, self.glare, self.window_reflection);
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            accum_step(&mut enc, &mut self.res);
+            self.queue.submit(Some(enc.finish()));
+        }
         // BFI: strobe the emitted phosphor light dark on alternate refreshes so motion
         // reads as CRT-impulse rather than LCD sample-and-hold. Only the emission is
         // blanked (the glass keeps mirroring the room). 1.0 = lit frame, 0.0 = dark.
@@ -2372,10 +2379,10 @@ impl State {
             &self.preset,
             1.0, // live window renders at surface resolution (no supersampling)
             self.hdr,
-            dt,
+            0.0,
             pwr,
             interlace,
-            field,
+            (self.field_clock.next.saturating_sub(1) % 4) as f32,
             self.exposure,
             self.subpixel,
             bfi_mul,
@@ -2390,11 +2397,15 @@ impl State {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
-        // Advance the phosphor plane one field, then draw the tube sampling it.
-        accum_step(&mut encoder, &mut self.res);
+        // Present the latest completed field.
         draw_tube(&mut encoder, &self.res, &view, &self.depth_view);
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+        // Latch the next source only after drawing the completed fields. In
+        // particular, a stall must not retroactively scan the newest game frame
+        // into every missed field (which also destroys monochrome motion history).
+        self.poll_capture();
+        self.poll_player();
         Ok(())
     }
 }
@@ -2403,7 +2414,7 @@ impl State {
 // Headless capture: render one frame to a PNG (`--shot out.png`)
 // ---------------------------------------------------------------------------
 
-fn save_shot(path: &str, width: u32, height: u32, preset: Preset) {
+fn save_shot(path: &str, width: u32, height: u32, preset: Preset) -> anyhow::Result<()> {
     // Supersample: the CRT's fine mask + scanline structure sits near the output
     // Nyquist limit, so render at SSxSS and box-downsample (in linear light) to
     // the requested size. Without this the fine detail aliases into flat color.
@@ -2411,25 +2422,17 @@ fn save_shot(path: &str, width: u32, height: u32, preset: Preset) {
     let rw = width * SS;
     let rh = height * SS;
 
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
-    });
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }))
-    .expect("no GPU adapter");
+    let instance = gpu::instance();
+    let adapter = gpu::adapter(&instance, None)?;
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("headless-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits: gpu::limits(&adapter),
         },
         None,
     ))
-    .expect("device");
+    .map_err(|error| anyhow::anyhow!("failed to create Vulkan device: {error}"))?;
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut res = build_resources(&device, &queue, format, preset);
@@ -2461,7 +2464,7 @@ fn save_shot(path: &str, width: u32, height: u32, preset: Preset) {
     // The shot path writes an 8-bit sRGB PNG, so always tonemap to SDR.
     // CRTULUM_TIME lets a still capture pick a moment in the beam-scan cycle.
     let shot_t = std::env::var("CRTULUM_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let dt = 1.0 / 60.0;
+    let dt = (1.0 / FIELD_HZ) as f32;
     // Power state for stills: default fully on; override to capture a warmup/collapse/
     // degauss phase (CRTULUM_WARMUP / _COLLAPSE / _DEGAUSS in 0..1).
     let pwr = [
@@ -2479,11 +2482,6 @@ fn save_shot(path: &str, width: u32, height: u32, preset: Preset) {
     let subpixel = envf("CRTULUM_SUBPIXEL", 0.0) > 0.5;
     let glare = envf("CRTULUM_GLARE", 1.0) > 0.5;
     let window_reflection = envf("CRTULUM_WINDOW_REFLECTION", 1.0) > 0.5;
-    write_uniforms(
-        &queue, &res, &orbit, width as f32 / height as f32, shot_t, &preset, SS as f32,
-        false, dt, pwr, interlace, field, exposure, subpixel, 1.0, glare,
-        window_reflection,
-    );
 
     // Warm up the phosphor plane. A single headless frame has no history, so run
     // the accumulation a few fields to reach steady state. CRTULUM_MOTION=1 instead
@@ -2509,6 +2507,11 @@ fn save_shot(path: &str, width: u32, height: u32, preset: Preset) {
             }
             res.set_source(&device, &queue, mw, mh, wgpu::TextureFormat::Rgba8UnormSrgb, &buf);
         }
+        let phase = ((field as u32 + s + 4 - (steps - 1) % 4) % 4) as f32;
+        let time = shot_t - (steps - 1 - s) as f32 * dt;
+        write_uniforms(&queue, &res, &orbit, width as f32 / height as f32, time,
+            &preset, SS as f32, false, dt, pwr, interlace, phase, exposure,
+            subpixel, 1.0, glare, window_reflection);
         let mut enc =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("accum-enc") });
         accum_step(&mut enc, &mut res);
@@ -2593,188 +2596,9 @@ fn save_shot(path: &str, width: u32, height: u32, preset: Preset) {
             std::fs::create_dir_all(parent).ok();
         }
     }
-    img.save(path).expect("save png");
+    img.save(path)?;
     println!("wrote {path} ({width}x{height})");
-}
-
-// ---------------------------------------------------------------------------
-// Headless clip: run a real frame sequence through the tube (`--clip in/ out/`)
-// ---------------------------------------------------------------------------
-//
-// Unlike `--shot`, which warms the phosphor with one still, this feeds a whole
-// sequence of source frames through the SAME `Resources` (so the phosphor
-// history planes carry over field-to-field) and writes one rendered PNG per
-// input frame. That's the honest test that motion actually melts: fast water
-// from a real clip drags a fading persistence trail, because the tube is
-// genuinely remembering the last few fields — not a per-still fake.
-//
-//   crtulum --clip frames/ out/ [WxH] [--preset green]
-//   ffmpeg -framerate 30 -i out/f_%04d.png crt.mp4   # reassemble
-//
-// Env knobs: CRTULUM_DT (per-field decay dt, default 1/60 — smaller = longer
-// melt), CRTULUM_YAW/_PITCH/_DIST (camera, same as --shot).
-fn save_clip(in_dir: &str, out_dir: &str, width: u32, height: u32, preset: Preset) {
-    const SS: u32 = 3;
-    let rw = width * SS;
-    let rh = height * SS;
-
-    // Collect + sort the input PNGs so the timeline is in order.
-    let mut frames: Vec<std::path::PathBuf> = std::fs::read_dir(in_dir)
-        .unwrap_or_else(|e| panic!("cannot read --clip input dir {in_dir}: {e}"))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("png"))
-        .collect();
-    frames.sort();
-    assert!(!frames.is_empty(), "no .png frames found in {in_dir}");
-    std::fs::create_dir_all(out_dir).expect("create --clip output dir");
-
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
-    });
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }))
-    .expect("no GPU adapter");
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("clip-device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-        },
-        None,
-    ))
-    .expect("device");
-
-    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut res = build_resources(&device, &queue, format, preset);
-
-    let color = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("clip-color"),
-        size: wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
-    let depth_view = create_depth(&device, rw, rh);
-
-    let envf = |k: &str, d: f32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
-    let orbit = Orbit {
-        yaw: envf("CRTULUM_YAW", 0.82),
-        pitch: envf("CRTULUM_PITCH", 0.34),
-        distance: envf("CRTULUM_DIST", 3.7),
-    };
-    // Per-field decay step. Default 1/60: the phosphor decay constants are tuned
-    // for 60 Hz fields, so this keeps the melt looking period-correct even when the
-    // source cadence is lower. Shrink it (CRTULUM_DT=0.008) for a longer smear.
-    let dt = envf("CRTULUM_DT", 1.0 / 60.0);
-    let exposure = envf("CRTULUM_EXPOSURE", 1.0);
-    let pwr = [1.0, 0.0, 0.0, 0.0]; // fully warmed up for the whole clip
-
-    // padded copy: bytes_per_row must be a multiple of 256
-    let unpadded = rw * 4;
-    let padded = ((unpadded + 255) / 256) * 256;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("clip-readback"),
-        size: (padded * rh) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let srgb_to_lin = |c: u8| {
-        let s = c as f32 / 255.0;
-        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
-    };
-    let lin_to_srgb = |l: f32| {
-        let s = if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
-        (s.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
-    };
-    let inv = 1.0 / (SS * SS) as f32;
-
-    let total = frames.len();
-    let mut t = 0.0f32; // beam-scan clock, advanced one field per source frame
-    let mut field = 0.0f32;
-    for (i, frame_path) in frames.iter().enumerate() {
-        // Load the source frame (RGBA8, linear-sRGB texture).
-        let img = image::open(frame_path)
-            .unwrap_or_else(|e| panic!("open {}: {e}", frame_path.display()))
-            .to_rgba8();
-        let (sw, sh) = img.dimensions();
-        res.set_source(&device, &queue, sw, sh, wgpu::TextureFormat::Rgba8UnormSrgb, &img);
-
-        // One field per new source frame: the phosphor plane retains the last few
-        // fields, so moving water leaves a decaying trail across output frames.
-        write_uniforms(
-            &queue, &res, &orbit, width as f32 / height as f32, t, &preset, SS as f32,
-            false, dt, pwr, 0.0, field, exposure, false, 1.0, true, true,
-        );
-        let mut enc = device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("clip-accum") });
-        accum_step(&mut enc, &mut res);
-        draw_tube(&mut enc, &res, &color_view, &depth_view);
-        enc.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
-                texture: &color,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::ImageCopyBuffer {
-                buffer: &readback,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded),
-                    rows_per_image: Some(rh),
-                },
-            },
-            wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
-        );
-        queue.submit(std::iter::once(enc.finish()));
-
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
-        device.poll(wgpu::Maintain::Wait);
-        {
-            let data = slice.get_mapped_range();
-            let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-            for oy in 0..height {
-                for ox in 0..width {
-                    let mut acc = [0.0f32; 4];
-                    for sy in 0..SS {
-                        let row = ((oy * SS + sy) * padded) as usize;
-                        for sx in 0..SS {
-                            let p = row + ((ox * SS + sx) * 4) as usize;
-                            acc[0] += srgb_to_lin(data[p]);
-                            acc[1] += srgb_to_lin(data[p + 1]);
-                            acc[2] += srgb_to_lin(data[p + 2]);
-                            acc[3] += data[p + 3] as f32 / 255.0;
-                        }
-                    }
-                    pixels.push(lin_to_srgb(acc[0] * inv));
-                    pixels.push(lin_to_srgb(acc[1] * inv));
-                    pixels.push(lin_to_srgb(acc[2] * inv));
-                    pixels.push((acc[3] * inv * 255.0 + 0.5) as u8);
-                }
-            }
-            let img = image::RgbaImage::from_raw(width, height, pixels).expect("image");
-            let out = std::path::Path::new(out_dir).join(format!("f_{:04}.png", i + 1));
-            img.save(&out).expect("save png");
-        }
-        readback.unmap();
-
-        t += 1.0 / 60.0;
-        field = 1.0 - field; // alternate parity, same as the live loop
-        if i % 15 == 0 || i + 1 == total {
-            println!("clip {}/{}", i + 1, total);
-        }
-    }
-    println!("wrote {total} frames to {out_dir}/ ({width}x{height})");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2807,21 +2631,10 @@ fn main() {
             .and_then(|s| s.split_once('x'))
             .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
             .unwrap_or((1000, 800));
-        save_shot(path, w, h, preset);
-        return;
-    }
-
-    // Headless clip mode: `crtulum --clip in_frames/ out_frames/ [WxH]`.
-    // Feeds a real frame sequence through the tube so motion melts for real.
-    if let Some(i) = args.iter().position(|a| a == "--clip") {
-        let in_dir = args.get(i + 1).map(String::as_str).unwrap_or("frames");
-        let out_dir = args.get(i + 2).map(String::as_str).unwrap_or("out");
-        let (w, h) = args
-            .get(i + 3)
-            .and_then(|s| s.split_once('x'))
-            .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
-            .unwrap_or((1000, 800));
-        save_clip(in_dir, out_dir, w, h, preset);
+        if let Err(error) = save_shot(path, w, h, preset) {
+            eprintln!("[shot] {error:#}");
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -2849,7 +2662,7 @@ fn main() {
     // Scripted video export: `crtulum --render in.mp4 out.mp4 [--script run.crts]`.
     // Runs a whole source (file / URL / stills / a TAS through RetroArch) through the
     // tube and pipes the result into ffmpeg. See src/video.rs.
-    if args.iter().any(|a| a == "--render") {
+    if args.iter().any(|a| a == "--render" || a == "--clip") {
         let result = video::opts_from_args(&args, preset).and_then(video::render);
         if let Err(e) = result {
             eprintln!("[render] error: {e:#}");
@@ -2898,13 +2711,19 @@ fn main() {
         None
     };
 
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoop::new().unwrap_or_else(|error| {
+        eprintln!("[window] cannot connect to the desktop: {error}");
+        std::process::exit(1);
+    });
     let window = Arc::new(
         WindowBuilder::new()
             .with_title("crtulum")
             .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 800.0))
             .build(&event_loop)
-            .unwrap(),
+            .unwrap_or_else(|error| {
+                eprintln!("[window] cannot create a window: {error}");
+                std::process::exit(1);
+            }),
     );
 
     let mut state = match pollster::block_on(State::new(window.clone(), capture, preset)) {
@@ -2994,10 +2813,10 @@ fn main() {
                                         state.exposure = (state.exposure * 1.08).clamp(0.2, 5.0);
                                         eprintln!("[exposure] {:.2}", state.exposure);
                                     }
-                                    // I = toggle 480i interlace vs 240p progressive.
+                                    // I = alternate fields vs progressive scanning of the current signal.
                                     PhysicalKey::Code(KeyCode::KeyI) => {
                                         state.interlace = !state.interlace;
-                                        eprintln!("[interlace] {}", if state.interlace { "480i" } else { "240p" });
+                                        eprintln!("[interlace] {}", if state.interlace { "alternate fields" } else { "progressive" });
                                     }
                                     // M = subpixel-accurate (Megatron) mask vs the resolution-
                                     // independent gaussian mask. Only looks right at native
@@ -3030,6 +2849,10 @@ fn main() {
                                     _ => {}
                                 }
                             }
+                        }
+                        WindowEvent::Focused(false) => {
+                            if let Some(player) = &mut state.player { player.clear_keys(); }
+                            state.dragging = false;
                         }
                         WindowEvent::Resized(size) => state.resize(size),
                         WindowEvent::MouseInput { state: s, button, .. } => {
@@ -3070,7 +2893,10 @@ fn main() {
                 _ => {}
             }
         })
-        .unwrap();
+        .unwrap_or_else(|error| {
+            eprintln!("[window] event loop failed: {error}");
+            std::process::exit(1);
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -3085,6 +2911,414 @@ mod tests {
     /// into the shader when the spot exponent stopped being constant across the picture, so
     /// this mirrors it here to keep it pinned; a wrong Γ would silently re-expose the whole
     /// picture by a few percent per preset with nothing to see but "the tubes look a bit off".
+    #[test]
+    fn signal_filter_cutoffs_match_the_documented_bandwidths() {
+        // Read the actual shader constants and measure the finite discrete kernel's
+        // frequency response; a -6 dB/-3 dB confusion must fail this test.
+        let constant = |name: &str| -> f64 {
+            let prefix = format!("const {name}: ");
+            concat!(include_str!("phosphor.wgsl"), "\n", include_str!("shader.wgsl")).lines().find(|l| l.starts_with(&prefix)).unwrap()
+                .split_once('=').unwrap().1.split(';').next().unwrap().trim().parse().unwrap()
+        };
+        let rate = 320.0 / 52.6;
+        let step = constant("NTSC_STEP");
+        let taps = constant("NTSC_TAPS") as i32;
+        for (name, cutoff) in [
+            ("NTSC_SIG_I", 1.0 / (1.0_f64 / 1.3_f64.powi(2) + 1.0 / 0.5_f64.powi(2)).sqrt()),
+            ("NTSC_SIG_Q", 1.0 / (1.0_f64 / 0.4_f64.powi(2) + 1.0 / 0.5_f64.powi(2)).sqrt()),
+            ("NTSC_SIG_Y", 3.0), ("NTSC_SIG_TRAP", 3.579545 / 10.0 / 2.0),
+            ("SVIDEO_SIG_Y", 4.0),
+        ] {
+            let sigma = constant(name);
+            let support = if name == "SVIDEO_SIG_Y" { 36 } else { taps };
+            let (mut dc, mut gain) = (0.0, 0.0);
+            for k in -support..=support {
+                let x = k as f64 * step;
+                let weight = (-x * x / (2.0 * sigma * sigma)).exp();
+                dc += weight;
+                gain += weight * (std::f64::consts::TAU * cutoff / rate * x).cos();
+            }
+            let db = 20.0 * (gain / dc).abs().log10();
+            assert!((db + 3.0103).abs() < 0.025, "{name}: {db} dB at {cutoff} MHz");
+        }
+        assert!((constant("NTSC_FSC") - 3.579545 / rate).abs() < 1e-5);
+    }
+
+    #[test]
+    fn voltage_noise_matches_target_snr() {
+        for snr in [36.0, 42.0, 52.0, 64.0] {
+            let amplitude = noise_peak_to_peak(snr);
+            // Integrate the uniform distribution, independently of the conversion.
+            let variance = (0..10000).map(|i| {
+                let v = amplitude * ((i as f32 + 0.5) / 10000.0 - 0.5);
+                v * v
+            }).sum::<f32>() / 10000.0;
+            assert!((-10.0 * variance.log10() - snr).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn average_picture_level_tracks_beam_current() {
+        let grey = source_stats(&[128, 128, 128, 255], 1, 1, false);
+        assert!((grey[3] - (128.0_f32 / 255.0).powf(2.4)).abs() < 1e-6);
+        let mixed = source_stats(&[0, 0, 0, 255, 255, 255, 255, 255], 2, 1, false);
+        assert!((mixed[3] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn supply_ripple_tracks_the_field_clock() {
+        assert!((1.0 / HUM_BEAT_HZ - 1001.0 / 120.0).abs() < 1e-10);
+        for field in 0..10_000 {
+            let time = field as f64 / FIELD_HZ;
+            let mains = (std::f64::consts::TAU * 120.0 * time).sin();
+            let beat = (std::f64::consts::TAU * HUM_BEAT_HZ * time).sin();
+            assert!((mains - beat).abs() < 1e-10, "field {field}");
+        }
+    }
+
+    #[test]
+    fn beam_and_mask_preserve_uniform_field_energy_on_gpu() {
+        let (device, queue) = headless_device();
+        let mut res = build_resources(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb, RCA);
+        res.set_source(&device, &queue, 8, 8, wgpu::TextureFormat::Rgba8UnormSrgb, &vec![128; 8 * 8 * 4]);
+        write_uniforms(&queue, &res, &Orbit { yaw: 0.0, pitch: 0.0, distance: 3.0 },
+            1.0, 0.0, &RCA, 1.0, false, 0.0, [1.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, false, 1.0, false, false);
+        let source = format!("{}\n{}", concat!(include_str!("phosphor.wgsl"), "\n", include_str!("shader.wgsl")), r#"
+            @fragment fn fs_beam_probe(in: FullOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(scan_reconstruct(in.uv, u.params.xy, 1.7, vec2<f32>(0.0)) / u.tone.z, 1.0);
+            }
+            @fragment fn fs_hdr_srgb(in: FullOut) -> @location(0) vec4<f32> {
+                return output_color(vec3<f32>(1.0, 0.0, 0.0));
+            }
+            @fragment fn fs_hdr_bt2020(in: FullOut) -> @location(0) vec4<f32> {
+                return output_color(vec3<f32>(1.0, 0.0, 0.0));
+            }
+            @fragment fn fs_bounce(in: FullOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(screen_bounce_color(), 1.0);
+            }
+            @fragment fn fs_bounce_bfi(in: FullOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(screen_bounce_color(), 1.0);
+            }
+            @fragment fn fs_mask_near(in: FullOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(phosphor3(in.uv.x, 0.0), 1.0);
+            }
+            @fragment fn fs_mask_middle(in: FullOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(phosphor3(in.uv.x, 0.2), 1.0);
+            }
+            @fragment fn fs_mask_far(in: FullOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(phosphor3(in.uv.x, 0.8), 1.0);
+            }
+            @fragment fn fs_hum(in: FullOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(
+                    hum_modulation(in.uv.y, 0.0, u.focus.z, 0.02),
+                    hum_modulation(in.uv.y, 2.0, u.focus.z, 0.02),
+                    hum_modulation(in.uv.y, 7.0, u.focus.z, 0.02), 1.0);
+            }
+            @fragment fn fs_svm_step(in: FullOut) -> @location(0) vec4<f32> {
+                let beam = svm_source(in.uv, u.params.xy);
+                let trajectory = svm_trajectory(beam.x * u.params.x, floor(beam.y * u.params.y), u.params.xy);
+                let light = textureSampleLevel(t_screen, s_screen, beam.xy, 0.0).r * beam.z;
+                // Uniform deposited energy integrates inverse velocity over
+                // screen position; velocity itself has no unit-mean invariant.
+                return vec4<f32>(light, beam.z,
+                    abs(beam.x * u.params.x + trajectory.x - in.uv.x * u.params.x), 1.0);
+            }
+        "#);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("beam-energy-test"), source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let binds = res.accum_pipeline.get_bind_group_layout(0);
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&binds], push_constant_ranges: &[],
+        });
+        let decoded = ((128.0_f32 / 255.0 + 0.055) / 1.055).powf(2.4);
+        let current = (128.0_f32 / 255.0).powf(2.4);
+        for (entry, expected) in [("fs_beam_probe", [decoded; 3]), ("fs_mask_near", [0.26317; 3]),
+            ("fs_mask_middle", [0.26317; 3]), ("fs_mask_far", [0.26317; 3]),
+            ("fs_hdr_srgb", [1.0, 0.0, 0.0]), ("fs_hdr_bt2020", [0.6274, 0.0691, 0.0164]),
+            ("fs_bounce", [current; 3]), ("fs_bounce_bfi", [0.0; 3]), ("fs_hum", [1.0; 3]),
+            ("fs_svm_step", [0.5, 1.0, 0.0])] {
+            if entry == "fs_svm_step" {
+                let pixels: Vec<u8> = (0..64).flat_map(|i| [if i % 8 < 4 { 0 } else { 255 }; 4]).collect();
+                res.set_source(&device, &queue, 8, 8, wgpu::TextureFormat::Rgba8UnormSrgb, &pixels);
+                write_uniforms(&queue, &res, &Orbit { yaw: 0.0, pitch: 0.0, distance: 3.0 },
+                    1.0, 0.0, &RCA, 1.0, false, 0.0, [1.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, false, 1.0, false, false);
+            }
+            if entry.starts_with("fs_hdr") || entry.starts_with("fs_bounce") {
+                res.hdr_bt2020 = entry == "fs_hdr_bt2020";
+                write_uniforms(&queue, &res, &Orbit { yaw: 0.0, pitch: 0.0, distance: 3.0 },
+                    1.0, 0.0, &PVM, 1.0, true, 0.0, [1.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, false, if entry == "fs_bounce_bfi" { 0.0 } else { 1.0 }, false, false);
+            }
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None, layout: Some(&layout),
+                vertex: wgpu::VertexState { module: &shader, entry_point: "vs_full", buffers: &[], compilation_options: Default::default() },
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: entry,
+                    targets: &[Some(wgpu::ColorTargetState { format: PHOSPHOR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                    compilation_options: Default::default() }),
+                primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview: None,
+            });
+            let (target, view) = make_phosphor(&device, 32, 256);
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256 * 256,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view,
+                        resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                    depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &res.accum_bind[0], &[]);
+                pass.draw(0..3, 0..1);
+            }
+            enc.copy_texture_to_buffer(target.as_image_copy(), wgpu::ImageCopyBuffer { buffer: &buffer,
+                layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(256) } },
+                wgpu::Extent3d { width: 32, height: 256, depth_or_array_layers: 1 });
+            queue.submit(Some(enc.finish()));
+            let slice = buffer.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
+            device.poll(wgpu::Maintain::Wait);
+            let data = slice.get_mapped_range();
+            let mut sums = [0.0; 3];
+            for (index, pixel) in data.chunks_exact(8).enumerate() {
+                for c in 0..3 {
+                    let h = u16::from_le_bytes([pixel[2 * c], pixel[2 * c + 1]]);
+                    assert_eq!(h >> 15, 0);
+                    let e = (h >> 10) & 31;
+                    assert!(e < 31, "non-finite beam energy");
+                    let value = if e == 0 { (h & 1023) as f32 * 2.0_f32.powi(-24) }
+                        else { (1.0 + (h & 1023) as f32 / 1024.0) * 2.0_f32.powi(e as i32 - 15) };
+                    if entry == "fs_mask_far" {
+                        assert!((value - expected[c]).abs() < 0.0002, "unresolved mask aliases: {value}");
+                    }
+                    if entry == "fs_hum" {
+                        let y = ((index / 32) as f64 + 0.5) / 256.0;
+                        let phase = HUM_BEAT_HZ * [0.0, 2.0, 7.0][c] - 2.0 * y;
+                        let expected = 1.0 + 0.02 * (std::f64::consts::TAU * phase).sin();
+                        assert!((value as f64 - expected).abs() < 0.001, "hum phase/amplitude: {value} vs {expected}");
+                    }
+                    if entry == "fs_svm_step" && c == 1 {
+                        assert!(value > 0.7 && value < 1.3, "beam folded or stalled: {value}");
+                    }
+                    if entry == "fs_svm_step" && c == 2 {
+                        assert!(value < 1e-4, "beam trajectory inversion failed: {value}");
+                    }
+                    sums[c] += value;
+                }
+            }
+            for (sum, expected) in sums.into_iter().zip(expected) {
+                let mean = sum / (32 * 256) as f32;
+                assert!((mean - expected).abs() < 0.002, "{entry} lost energy: {mean} vs {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn field_clock_is_independent_of_presentation_rate() {
+        for fps in [24.0, 25.0, 30.0, 50.0, 59.94, 60.0, 120.0, 144.0] {
+            let mut clock = FieldClock::default();
+            let mut fields = Vec::new();
+            for frame in 0..=(fps * 10.0_f64).ceil() as u64 {
+                fields.extend(clock.through((frame as f64 / fps).min(10.0)));
+            }
+            assert_eq!(fields, (0..600).collect::<Vec<_>>(), "{fps} fps");
+            assert!(clock.through(10.0).is_empty());
+        }
+    }
+
+    #[test]
+    fn measured_phosphor_integrates_scan_timing_and_published_decay_on_gpu() {
+        let (device, queue) = headless_device();
+        let mut res = build_resources(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb, PVM);
+        let orbit = Orbit { yaw: 0.0, pitch: 0.0, distance: 3.0 };
+        let period = 1.0 / FIELD_HZ;
+        let read = |res: &Resources| -> Vec<[f32; 3]> {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256 * 8,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            let mut enc = device.create_command_encoder(&Default::default());
+            enc.copy_texture_to_buffer(res.phosphor[res.phos_cur].as_image_copy(),
+                wgpu::ImageCopyBuffer { buffer: &buffer, layout: wgpu::ImageDataLayout {
+                    offset: 0, bytes_per_row: Some(256), rows_per_image: Some(8) } },
+                wgpu::Extent3d { width: 8, height: 8, depth_or_array_layers: 1 });
+            queue.submit(Some(enc.finish()));
+            let slice = buffer.slice(..); slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
+            device.poll(wgpu::Maintain::Wait);
+            let data = slice.get_mapped_range();
+            (0..64).map(|pixel| std::array::from_fn(|c| {
+                let offset = (pixel / 8) * 256 + (pixel % 8) * 8 + c * 2;
+                let h = u16::from_le_bytes([data[offset], data[offset + 1]]);
+                let e = (h >> 10) & 31;
+                assert!(e < 31 && h >> 15 == 0);
+                if e == 0 { (h & 1023) as f32 * 2_f32.powi(-24) }
+                else { (1.0 + (h & 1023) as f32 / 1024.0) * 2_f32.powi(e as i32 - 15) }
+            })).collect()
+        };
+        for field in 0..3 {
+            let level = if field == 1 { 128 } else { 0 };
+            res.set_source(&device, &queue, 8, 8, wgpu::TextureFormat::Rgba8UnormSrgb, &vec![level; 256]);
+            res.exposure_group = field + 1;
+            write_uniforms(&queue, &res, &orbit, 1.0, field as f32 * period as f32, &PVM, 1.0,
+                false, period as f32, [1.0, 0.0, 0.0, 0.0], 0.0, field as f32, 1.0, false, 1.0, false, false);
+            queue.write_buffer(&res.ubuf, (std::mem::offset_of!(Uniforms, look) + 8) as u64,
+                bytemuck::bytes_of(&0.0_f32));
+            let mut enc = device.create_command_encoder(&Default::default());
+            accum_step(&mut enc, &mut res); queue.submit(Some(enc.finish()));
+            for (pixel, rgb) in read(&res).iter().enumerate() {
+                let x = ((pixel % 8) as f64 + 0.5) / 8.;
+                let horizontal = (63.5555556 - 52.6 + x * 52.6) / 63.5555556;
+                let arrival = ((8. * (262.5 / 240. - 1.)) + (pixel / 8) as f64 + horizontal)
+                    / (8. * 262.5 / 240.) * period;
+                for c in 0..3 {
+                    let expected = if field == 0 { 0. } else {
+                        let end = field as f64 * period - arrival;
+                        (128_f64 / 255.).powf(2.4) * phosphor::energy(c, (end - period).max(0.), end)
+                    };
+                    assert!((rgb[c] as f64 - expected).abs() < 0.0005,
+                        "field {field}, pixel {pixel}, channel {c}: {} vs {expected}", rgb[c]);
+                }
+            }
+        }
+        // A warm, static tube must preserve a neutral field's mean radiance;
+        // short measured decay constants must not darken it or tint it red.
+        let mut warm = build_resources(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb, PVM);
+        warm.set_source(&device, &queue, 8, 8, wgpu::TextureFormat::Rgba8UnormSrgb, &vec![128; 256]);
+        write_uniforms(&queue, &warm, &orbit, 1.0, 0.0, &PVM, 1.0, false, period as f32,
+            [1.0, 0.0, 0.0, 0.0], 0.0, 0.0, 1.0, false, 1.0, false, false);
+        queue.write_buffer(&warm.ubuf, (std::mem::offset_of!(Uniforms, look) + 8) as u64, bytemuck::bytes_of(&0.0_f32));
+        let mut enc = device.create_command_encoder(&Default::default());
+        accum_step(&mut enc, &mut warm); queue.submit(Some(enc.finish()));
+        for pixel in read(&warm) { for value in pixel {
+            assert!((value - (128_f32/255.).powf(2.4)).abs() < 0.0005, "warm field changed: {value}");
+        }}
+        // A short shutter resolves the moving raster instead of dimming every
+        // row uniformly. Compare red against exact impulse-response integrals.
+        warm.shutter_fraction = 0.25;
+        warm.exposure_group = 2;
+        write_uniforms(&queue, &warm, &orbit, 1.0, period as f32, &PVM, 1.0, false, period as f32,
+            [1.0, 0.0, 0.0, 0.0], 0.0, 1.0, 1.0, false, 1.0, false, false);
+        queue.write_buffer(&warm.ubuf, (std::mem::offset_of!(Uniforms, look) + 8) as u64, bytemuck::bytes_of(&0.0_f32));
+        let mut enc = device.create_command_encoder(&Default::default());
+        accum_step(&mut enc, &mut warm); queue.submit(Some(enc.finish()));
+        let short = read(&warm);
+        for (pixel, rgb) in short.iter().enumerate() {
+            let x = ((pixel % 8) as f64 + 0.5) / 8.;
+            let horizontal = (63.5555556 - 52.6 + x * 52.6) / 63.5555556;
+            let arrival = (8. * (262.5/240. - 1.) + (pixel/8) as f64 + horizontal)
+                / (8. * 262.5/240.) * period;
+            let energy: f64 = (0..4).map(|age| {
+                let end = (age + 1) as f64 * period - arrival;
+                phosphor::energy(0, (end - period * 0.25).max(0.), end)
+            }).sum();
+            let expected = 4. * (128_f64/255.).powf(2.4) * energy;
+            assert!((rgb[0] as f64 - expected).abs() < 0.001, "short shutter at {pixel}: {} vs {expected}", rgb[0]);
+        }
+        assert!(short[0][0] < 0.001 && short[63][0] > 0.1, "short shutter did not resolve scanout");
+    }
+
+    // Read actual GPU phosphor values, before tone mapping or glass hides errors.
+    #[test]
+    fn legacy_phosphor_transfer_interlace_and_power() {
+        let (device, queue) = headless_device();
+        let mut res = build_resources(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb, PVM);
+        res.physical_phosphor = false;
+        let pixels = vec![128u8; 4 * 4 * 4];
+        res.set_source(&device, &queue, 4, 4, wgpu::TextureFormat::Rgba8UnormSrgb, &pixels);
+        let orbit = Orbit { yaw: 0.0, pitch: 0.0, distance: 3.0 };
+        let read = |res: &Resources| -> Vec<f32> {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None, size: 1024, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            enc.copy_texture_to_buffer(res.phosphor[res.phos_cur].as_image_copy(),
+                wgpu::ImageCopyBuffer { buffer: &buffer, layout: wgpu::ImageDataLayout {
+                    offset: 0, bytes_per_row: Some(256), rows_per_image: Some(4),
+                } }, wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 1 });
+            queue.submit(Some(enc.finish()));
+            let slice = buffer.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
+            device.poll(wgpu::Maintain::Wait);
+            let data = slice.get_mapped_range();
+            (0..4).map(|y| {
+                let h = u16::from_le_bytes([data[y * 256], data[y * 256 + 1]]);
+                let exp = (h >> 10) & 31;
+                let fraction = (h & 1023) as f32;
+                if exp == 0 { fraction * 2.0_f32.powi(-24) }
+                else { (1.0 + fraction / 1024.0) * 2.0_f32.powi(exp as i32 - 15) }
+            }).collect()
+        };
+        for field in 0..2 {
+            write_uniforms(&queue, &res, &orbit, 1.0, field as f32 / FIELD_HZ as f32,
+                &PVM, 1.0, false, 1.0 / FIELD_HZ as f32, [1.0, 0.0, 0.0, 0.0],
+                1.0, field as f32, 1.0, false, 1.0, false, false);
+            // Isolate gun transfer from the separately tested voltage noise.
+            queue.write_buffer(&res.ubuf, (std::mem::offset_of!(Uniforms, look) + 8) as u64,
+                bytemuck::bytes_of(&0.0_f32));
+            let mut enc = device.create_command_encoder(&Default::default());
+            accum_step(&mut enc, &mut res);
+            queue.submit(Some(enc.finish()));
+            let rows = read(&res);
+            for (y, value) in rows.iter().enumerate() {
+                if y % 2 == field {
+                    let expected = (128.0_f32 / 255.0).powf(2.4);
+                    assert!((value - expected).abs() < 0.003, "gun transfer: {value} vs {expected}");
+                } else if field == 0 {
+                    assert!(*value < 0.0001, "inactive row {y} in field {field} was excited: {value}; rows={rows:?}");
+                } else {
+                    // Previously scanned rows keep a fading afterglow. They must
+                    // neither be re-excited nor have their history erased.
+                    let excitation = (128.0_f32 / 255.0).powf(2.4);
+                    assert!(*value > 0.01 && *value < excitation * 0.9,
+                        "inactive row {y} did not coast on its history: {value}");
+                }
+            }
+        }
+        write_uniforms(&queue, &res, &orbit, 1.0, 1.0, &PVM, 1.0, false, 0.1,
+            [1.0, 1.0, 0.0, 0.0], 0.0, 0.0, 1.0, false, 1.0, false, false);
+        let mut enc = device.create_command_encoder(&Default::default());
+        accum_step(&mut enc, &mut res);
+        queue.submit(Some(enc.finish()));
+        let afterglow = read(&res);
+        let excitation = (128.0_f32 / 255.0).powf(2.4);
+        assert!(afterglow.iter().all(|v| *v > 0.0 && *v < excitation * 0.05),
+            "power-off must stop excitation and preserve fading history: {afterglow:?}");
+        write_uniforms(&queue, &res, &orbit, 1.0, 2.0, &PVM, 1.0, false, 1.0,
+            [1.0, 1.0, 0.0, 0.0], 0.0, 0.0, 1.0, false, 1.0, false, false);
+        let mut enc = device.create_command_encoder(&Default::default());
+        accum_step(&mut enc, &mut res);
+        queue.submit(Some(enc.finish()));
+        assert!(read(&res).iter().all(|v| *v < 0.0001), "powered-off gun still excites phosphor");
+
+        // A quoted time-to-10% must hold at different starting levels and step
+        // sizes. A level-dependent tail on the converted tau breaks both.
+        for (preset, t10) in [(GREEN, 0.050), (AMBER, 0.013)] {
+            for level in [128u8, 255] {
+                for steps in [1, 10] {
+                    let mut mono = build_resources(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb, preset);
+                    mono.physical_phosphor = false;
+                    mono.set_source(&device, &queue, 4, 4, wgpu::TextureFormat::Rgba8UnormSrgb, &vec![level; 64]);
+                    for step in 0..=steps {
+                        let power = if step == 0 { [1.0, 0.0, 0.0, 0.0] } else { [1.0, 1.0, 0.0, 0.0] };
+                        write_uniforms(&queue, &mono, &orbit, 1.0, 0.0, &preset, 1.0,
+                            false, if step == 0 { 0.0 } else { t10 / steps as f32 },
+                            power, 0.0, 0.0, 1.0, false, 1.0, false, false);
+                        let mut enc = device.create_command_encoder(&Default::default());
+                        accum_step(&mut enc, &mut mono);
+                        queue.submit(Some(enc.finish()));
+                    }
+                    let expected = (level as f32 / 255.0).powf(2.4) * 0.1;
+                    for value in read(&mono) {
+                        assert!((value / expected - 1.0).abs() < 0.02,
+                            "{} T10 drift at level {level}, {steps} steps: {value} vs {expected}", preset.name);
+                    }
+                }
+            }
+        }
+    }
+
     fn gamma1p(x: f32) -> f32 {
         ((-0.10654 * x + 0.58755) * x - 0.47554) * x + 0.99029
     }
@@ -3235,7 +3469,7 @@ mod tests {
     }
 
     /// The mask is a physical grille on the faceplate, so its triad count has to come from a
-    /// measured pitch and a measured screen width — and the ordering that falls out of those
+    /// documented pitch and screen-width inputs — and the ordering that falls out of those
     /// is the thing the old hand-set pitch-in-output-pixels got backwards: a broadcast PVM
     /// and a PC monitor have far MORE triads across the face than any consumer TV.
     #[test]
@@ -3266,40 +3500,18 @@ mod tests {
         );
     }
 
-    // Headless device, or None on a machine with no usable GPU adapter (CI
-    // software-render runners): the caller skips rather than fails.
-    //
-    // Vulkan first, and only then the rest. The tube's fragment shader goes
-    // through naga's GLSL backend on the GL path, which emits a `gl_`-prefixed
-    // temporary that mesa's compiler rejects outright — so a machine with both
-    // backends must not be allowed to pick GL and fail a shading test for
-    // reasons that have nothing to do with shading. Enumerating GL is also what
-    // panics (rather than reporting "no adapter") when EGL has no usable vendor.
-    fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        // Naga 0.20's GLSL backend can emit `gl_`-prefixed temporaries that Mesa
-        // rejects, so this GPU regression test needs Vulkan rather than a GL fallback.
-        let adapter = adapter_on(wgpu::Backends::VULKAN)?;
+    // Tests exercise the same mandatory physical Vulkan selection as the app.
+    fn headless_device() -> (wgpu::Device, wgpu::Queue) {
+        let instance = gpu::instance();
+        let adapter = gpu::adapter(&instance, None).expect("GPU test requires a physical Vulkan GPU");
         pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("test-device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: gpu::limits(&adapter),
             },
             None,
-        ))
-        .ok()
-    }
-
-    fn adapter_on(backends: wgpu::Backends) -> Option<wgpu::Adapter> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends,
-            ..Default::default()
-        });
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
+        )).expect("create hardware Vulkan test device")
     }
 
     // Feed a sequence of source frames through the tube (phosphor history carried
@@ -3337,7 +3549,8 @@ mod tests {
         let mut t = 0.0f32;
         let mut field = 0.0f32;
         for frame in frames {
-            res.set_source(device, queue, sw, sh, format, frame);
+            res.physical_phosphor = false;
+        res.set_source(device, queue, sw, sh, format, frame);
             write_uniforms(
                 queue, &res, &orbit, ow as f32 / oh as f32, t, &TRINITRON, 1.0, false, dt, pwr,
                 0.0, field, 1.0, false, 1.0, true, true,
@@ -3411,7 +3624,7 @@ mod tests {
         buf
     }
 
-    /// The waterfall melts: fast-moving bright content leaves a *decaying phosphor
+    /// At video field cadence, moving bright content leaves a *decaying phosphor
     /// trail* on the tube, and that trail is red-dominant — because the red P22
     /// phosphor sits a whole EIA persistence class above green and blue and lingers
     /// well over an order of magnitude longer (see the decay constants in
@@ -3420,21 +3633,12 @@ mod tests {
     /// the final position (phosphor converged, no history). The difference is the
     /// melt, and it must lead in red.
     #[test]
-    fn waterfall_melts() {
-        let Some((device, queue)) = headless_device() else {
-            // CI sets CRTULUM_REQUIRE_GPU (it ships a software Vulkan driver), so a
-            // missing adapter there is a real failure — not a silent skip that would
-            // let the melt regression slip through green.
-            if std::env::var_os("CRTULUM_REQUIRE_GPU").is_some() {
-                panic!("CRTULUM_REQUIRE_GPU set but no GPU adapter — the melt test could not run");
-            }
-            eprintln!("waterfall_melts: no GPU adapter — skipping");
-            return;
-        };
+    fn legacy_waterfall_melts() {
+        let (device, queue) = headless_device();
 
         let (sw, sh) = (240u32, 180u32);
         let (ow, oh) = (400u32, 320u32);
-        let dt = 1.0 / 60.0;
+        let dt = (1.0 / FIELD_HZ) as f32;
         let n = 20;
         let y_end = (sh as i32) - 30; // final band position (near the bottom)
 

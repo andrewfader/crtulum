@@ -16,8 +16,9 @@ struct Uniforms {
     scan: vec4<f32>,    // beam math: x=beam_min(width, dark), y=beam_max(width, bright), z=beam_shape, w=beam_range
     env: vec4<f32>,     // xyz=avg source color, w=avg picture level (screen area-light)
     look: vec4<f32>,    // x=convergence, y=corner_radius, z=grain, w=ghost
-    phys: vec4<f32>,    // x=crt_gamma, y=warmth, z=glow_bounce, w=bloom
+    phys: vec4<f32>,    // x=crt_gamma, y=reserved, z=glow_bounce, w=HV sag
     temporal: vec4<f32>,// x=dt(sec), y=persist_mult, z=interlace, w=field_parity
+    raster: vec4<f32>, // measured response, shutter fraction, exposure group, reserved
     ptau: vec4<f32>,    // per-phosphor decay tau: xyz = R,G,B (sec); w = power-law tail exponent
     geom: vec4<f32>,    // raster geometry: x=pincushion, y=trapezoid, z=corner_pin, w=purity
     mono: vec4<f32>,    // monochrome phosphor tint (rgb) + flag (w>0.5 = single-gun)
@@ -37,6 +38,24 @@ struct Uniforms {
 @group(0) @binding(1) var t_screen: texture_2d<f32>;
 @group(0) @binding(2) var s_screen: sampler;
 @group(0) @binding(3) var t_prev: texture_2d<f32>;
+@group(0) @binding(4) var<storage, read_write> phos_bank0: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> phos_bank1: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> phos_bank2: array<vec4<f32>>;
+
+fn history_load(index: u32) -> vec4<f32> {
+    let term = index % 33u;
+    let offset = (index / 33u) * 11u + term % 11u;
+    if (term < 11u) { return phos_bank0[offset]; }
+    if (term < 22u) { return phos_bank1[offset]; }
+    return phos_bank2[offset];
+}
+fn history_store(index: u32, value: vec4<f32>) {
+    let term = index % 33u;
+    let offset = (index / 33u) * 11u + term % 11u;
+    if (term < 11u) { phos_bank0[offset] = value; }
+    else if (term < 22u) { phos_bank1[offset] = value; }
+    else { phos_bank2[offset] = value; }
+}
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -99,37 +118,30 @@ fn molded_noise(p: vec3<f32>, n: vec3<f32>, scale: f32) -> f32 {
          + value_noise(p.xy * scale + vec2<f32>(29.0, 67.0)) * w.z;
 }
 
-// Three phosphor stripes (R,G,B) across a triad, evaluated periodically so the
-// pattern wraps cleanly. `t` in [0,1) is the position within one triad; `fw` is the
-// pixel footprint in triads (see mask()), which BAND-LIMITS the stripe.
-//
-// The band-limit is not an anti-aliasing nicety, it is the physics of looking at a
-// tube from a distance: a 0.66 mm grille on a 385 mm face is 583 triads across, and
-// unless the display is putting more than ~2 pixels on each of those triads the eye
-// (and the framebuffer) integrates the stripes and sees only their mean — which is
-// exactly why nobody can see the grille on a TV across the room, and why a macro photo
-// of the same tube is all stripes. Convolving with the pixel's box footprint adds
-// variance fw²/12 to the stripe's own w², and the amplitude is scaled by w/w' so the
-// convolution conserves the stripe's total light. So the pattern fades to a flat,
-// correctly-bright field on its own as it becomes unresolvable, and sharpens back into
-// real RGB stripes as the camera moves in. Nothing is faded by hand.
+// Periodic Gaussian phosphor stripes, evaluated in the frequency domain.
+// The coefficients are analytic: mean * exp(-2*pi^2*sigma^2*n^2).
+// Integrate each harmonic over the pixel box (sinc), then reject frequencies
+// the output grid cannot resolve. Merely adding footprint variance to sigma
+// left substantial energy above Nyquist and produced colored moire on gray.
+// Eight harmonics leave < 5e-8 absolute truncation error for sigma=0.105.
 fn phosphor3(t: f32, fw: f32) -> vec3<f32> {
-    let w = 0.105; // tighter stripes → clearer black grille gaps (per Trinitron macro refs)
-    let wb = sqrt(w * w + fw * fw / 12.0); // stripe ⊗ pixel box
-    let amp = w / wb;                      // conserve each stripe's integral
-    var r = 0.0;
-    var g = 0.0;
-    var b = 0.0;
-    // Include neighbour copies so the gaussians wrap at triad seams. ±2 rather than ±1:
-    // once the footprint widens wb past ~0.3 a stripe reaches well beyond its neighbour,
-    // and truncating there would leave a residual ripple that never flattens.
-    for (var k = -2; k <= 2; k = k + 1) {
-        let tk = t + f32(k);
-        r = r + gauss(tk, 1.0 / 6.0, wb);
-        g = g + gauss(tk, 3.0 / 6.0, wb);
-        b = b + gauss(tk, 5.0 / 6.0, wb);
+    let w = 0.105;
+    let mean = w * sqrt(TAU);
+    var result = vec3<f32>(mean);
+    let phase = vec3<f32>(t) - vec3<f32>(1.0 / 6.0, 0.5, 5.0 / 6.0);
+    for (var k = 1; k <= 8; k = k + 1) {
+        let frequency = f32(k);
+        let pixel_frequency = frequency * fw;
+        // A triangular spectral window is a nonnegative reconstruction kernel:
+        // unlike a sharp/tapered cutoff it cannot ring into negative light.
+        let cutoff = max(1.0 - 2.0 * pixel_frequency, 0.0);
+        let a = PI * pixel_frequency;
+        var aperture = 1.0;
+        if (abs(a) > 1e-5) { aperture = sin(a) / a; }
+        let amplitude = 2.0 * mean * exp(-2.0 * PI * PI * w * w * frequency * frequency);
+        result = result + amplitude * aperture * cutoff * cos(TAU * frequency * phase);
     }
-    return vec3<f32>(r, g, b) * amp;
+    return result;
 }
 
 // Mean transmission of `mask()` over one full period, per channel — the DC term of the
@@ -219,9 +231,9 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
 fn output_color(col: vec3<f32>) -> vec4<f32> {
     // Output. col is HDR (linear light, BT.709/sRGB primaries, highlights >1.0).
     if (u.tone.x > 0.5) {
-        // HDR swapchain: emit linear light where 1.0 = SDR white and values above
-        // 1.0 drive the panel's extra nits. The surface is BT.2020 linear, so
-        // rotate our BT.709 primaries into BT.2020 (else colors read oversaturated).
+        // Float surfaces can be scRGB (1) or BT.2020 linear (2). Convert only
+        // for the color space actually configured by the compositor/backend.
+        if (u.tone.x < 1.5) { return vec4<f32>(col * u.tone.y, 1.0); }
         let bt2020 = mat3x3<f32>(
             0.6274, 0.0691, 0.0164,
             0.3293, 0.9195, 0.0880,
@@ -383,28 +395,15 @@ const TAU: f32 = 6.28318530;
 // detail instead of 1.25–2.7-px, and ordinary 4-px-period pixel art — 2-px text stems,
 // wide dither — demodulates to full-strength false chroma that a real set leaves grey.
 const NTSC_FSC: f32 = 0.58839;
-// Tap spacing for the composite decode, in content pixels. 0.58839 cyc/px cannot be
-// demodulated on the integer content grid (0.5 cyc/px Nyquist), so the decode is
-// oversampled 2×: 0.29419 cyc/sample, 3.40 samples/cycle. That also puts the demodulator's
-// 2·f_sc product term (1.1768 cyc/px) at a fold-down of 0.8232 cyc/px, which the chroma
-// low-pass rejects by ~35 decades — so the oversampling is exactly enough, not arbitrary.
-//
-// KNOWN SIMPLIFICATION: the half-pixel taps come from the hardware linear sampler, so the
-// source is reconstructed with a triangle kernel. A console DAC is closer to a zero-order
-// hold, whose images carry sinc(0.588) = 52% of the input at f_sc; the triangle kernel
-// carries sinc²(0.583) = 28%. Both are real — stair-step source detail near 0.412 cyc/px
-// (a 2.43-px period) genuinely has subcarrier-band energy and genuinely cross-colours on a
-// real set — but this understates that path by ~2×. It errs toward too little false colour,
-// which is the safe direction. Fixing it properly means reconstructing each half-pixel tap
-// with a 4-tap cubic (4× the fetches) instead of trusting the sampler.
-const NTSC_STEP: f32 = 0.5;
-// Half-window, content pixels. 9 px is 2.47σ of the widest (Q) chroma kernel below; the
-// truncated tail carries 4.8% weight, and the sums are normalised so it costs gain, not
-// colour. 37 taps.
-const NTSC_TAPS: i32 = 18;
+// Four integration samples per virtual pixel resolve both the subcarrier and
+// the narrow luma Gaussian. The trap needs ±18 pixels for four sigma of support.
+// Source pixels are held at their native centers; carrier phase stays continuous.
+const NTSC_STEP: f32 = 0.25;
+const NTSC_TAPS: i32 = 72;
 
 // --- NTSC bandwidths, all in content pixels as gaussian σ ---
-// σ = sqrt(2 ln2)·6.0837 / (2π·f_MHz) — the -3 dB point of exp(-k²/2σ²) at 6.0837 MHz.
+// σ = sqrt(ln2)·6.0837 / (2π·f_MHz): Gaussian amplitude is 1/sqrt(2)
+// at the -3 dB cutoff. sqrt(2 ln2) incorrectly places that cutoff at -6 dB.
 //
 // Chroma is the CASCADE of two real filters, which is the part that is easy to get wrong.
 // The NTSC *encoder* transmits I at ~1.3 MHz and Q at only ~0.4 MHz, so green–magenta
@@ -414,20 +413,18 @@ const NTSC_TAPS: i32 = 18;
 // both axes. Cascading the two (σ² adds) is what a consumer set actually delivers: the
 // encoder's 3.25:1 asymmetry survives, but compressed to 1.49:1, because the receiver's own
 // 0.5 MHz limit dominates the I axis and barely touches the already-narrower Q axis.
-const NTSC_SIG_I: f32 = 2.4429; // enc 1.3 MHz ⊗ rx 0.5 MHz → 0.467 MHz
-const NTSC_SIG_Q: f32 = 3.6498; // enc 0.4 MHz ⊗ rx 0.5 MHz → 0.312 MHz
+const NTSC_SIG_I: f32 = 1.727367; // enc 1.3 MHz ⊗ rx 0.5 MHz → 0.467 MHz
+const NTSC_SIG_Q: f32 = 2.580828; // enc 0.4 MHz ⊗ rx 0.5 MHz → 0.312 MHz
 // Luma: the set's video amplifier, ~3.0 MHz for a mid-range consumer set (cheap RF-fed
 // sets run nearer 2.5). It is NOT narrowed to reject the subcarrier — that is the trap's
 // job, below. Making one gaussian do both jobs is what forced the old 0.88 MHz luma path,
 // i.e. most of the composite softness was a side effect of the f_sc error, not a tube.
-const NTSC_SIG_Y: f32 = 0.3800;
-// 3.58 MHz subcarrier trap: a series LC of Q ≈ 10 → 0.358 MHz bandwidth → σ 3.185 px, and
-// consumer traps are specified at 20–26 dB rejection. Take the loose end (20 dB = 0.90) for
-// an aged consumer set. The 3.0 MHz luma path already attenuates f_sc to 37.3%, so the trap
-// leaves 3.7% of a flat-field subcarrier — correctly subtle. The dot crawl you SEE comes
-// out of this for free and for the right reason: at a colour edge the trap's wide-kernel
-// estimate of the local subcarrier is wrong, so the cancellation fails exactly there.
-const NTSC_SIG_TRAP: f32 = 3.1848;
+const NTSC_SIG_Y: f32 = 0.268705;
+// Approximate a Q=10 trap by estimating quadrature carrier amplitude through
+// Gaussian baseband filters. Its 0.358 MHz full width means a 0.179 MHz cutoff
+// on EACH side of the carrier, not a 0.358 MHz one-sided low-pass cutoff.
+const NTSC_SIG_TRAP: f32 = 4.504009;
+const SVIDEO_SIG_Y: f32 = 0.201529; // 4 MHz luma at -3 dB
 const NTSC_TRAP: f32 = 0.90;
 
 // NTSC is defined on GAMMA-CORRECTED video. The camera (or the console's DAC) applies
@@ -442,11 +439,16 @@ const NTSC_TRAP: f32 = 0.90;
 // the subcarrier, so dot crawl and cross-colour all but vanish from shadows and pile up in
 // highlights — the opposite of what a real set does, where the worst rainbows in any
 // composite capture are in the mid-dark detail.
+// Exact sRGB inverse of the GPU texture decode; the toe is not gamma 2.2.
 fn oetf(c: vec3<f32>) -> vec3<f32> {
-    return pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+    let x = max(c, vec3<f32>(0.0));
+    return select(1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055,
+                  12.92 * x, x <= vec3<f32>(0.0031308));
 }
 fn eotf(c: vec3<f32>) -> vec3<f32> {
-    return pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.2));
+    let x = max(c, vec3<f32>(0.0));
+    return select(pow((x + 0.055) / 1.055, vec3<f32>(2.4)),
+                  x / 12.92, x <= vec3<f32>(0.04045));
 }
 
 fn rgb2yiq(c: vec3<f32>) -> vec3<f32> {
@@ -477,7 +479,7 @@ fn subcarrier(px: f32, line: f32, t: f32) -> f32 {
     // mod 4 is free: four fields is 3.0 whole cycles, so it wraps exactly. It also keeps the
     // argument small — an unwrapped field index passes 10⁵ within half an hour, where f32
     // cos/sin has lost the fractional radians the phase is made of.
-    let field = floor(t * 59.94) % 4.0;
+    let field = u.temporal.w % 4.0;
     return TAU * NTSC_FSC * px + PI * line + TAU * 0.75 * field;
 }
 
@@ -493,18 +495,17 @@ fn subcarrier(px: f32, line: f32, t: f32) -> f32 {
 // filters can't reach across a checkerboard, and everything below is mistuned by the
 // capture scale. At native capture step→1.
 //
-// That remap is also what makes Mega Drive / Sonic dither read like a real console — but by
-// the right mechanism, now that f_sc is where it belongs. A 1-px checkerboard sits at the
-// content Nyquist, 3.042 MHz, which is 0.54 MHz off the 3.58 MHz subcarrier: the 3.0 MHz
-// luma path keeps 49% of it, and 40% of it demodulates straight into chroma. So the dither
-// half-blends AND shimmers coloured, which is what a composite set does with it. The old
-// decode claimed a cleaner result — the checkerboard averaged to a flat translucent tone —
-// but only because the luma path had been narrowed to 0.88 MHz to reject a subcarrier
-// parked at 1.52 MHz. Real sets do not erase dither, they tint it.
+// That remap also preserves the physical frequency of console dither: some detail
+// survives the luma low-pass and some demodulates into false color near the carrier.
+// The luma filter and the separate carrier trap serve different roles; neither is
+// narrowed just to make checkerboards disappear. See the cutoff regression test.
 fn ntsc(uv: vec2<f32>, res: vec2<f32>, t: f32) -> vec3<f32> {
-    let step = max(res.x / 320.0, 1.0); // texels per virtual-320 content pixel (1 at native capture)
+    let step = res.x / 320.0; // texels per virtual-320 content pixel (1 at native capture)
     let cx = uv.x * (res.x / step);     // column on the virtual content line
-    let line = floor(uv.y * res.y);
+    // Adjacent scanned lines in an interlaced field are two texture rows apart.
+    // Phase alternates per scanned line, not per full-frame row.
+    let row = floor(uv.y * res.y);
+    let line = select(row, floor(row * 0.5), u.temporal.z > 0.5);
     var y_acc = 0.0;  var yw = 0.0;     // luma low-pass
     var i_acc = 0.0;  var iw_s = 0.0;   // I demod
     var q_acc = 0.0;  var qw_s = 0.0;   // Q demod
@@ -526,7 +527,7 @@ fn ntsc(uv: vec2<f32>, res: vec2<f32>, t: f32) -> vec3<f32> {
         // f_sc where a real hold carries sinc=52%, so stair-step detail cross-coloured at
         // half strength.) The subcarrier phase stays on the CONTINUOUS position: a real
         // encoder modulates a held baseband onto a free-running 3.58 MHz carrier.
-        let sxc = (floor(scx) + 0.5) * step / res.x;
+        let sxc = (floor(scx * step) + 0.5) / res.x;
         let src = textureSampleLevel(t_screen, s_screen, vec2<f32>(sxc, uv.y), 0.0).rgb;
         let yiq = rgb2yiq(oetf(src));
         let ph = subcarrier(scx, line, t);
@@ -560,7 +561,7 @@ fn ntsc(uv: vec2<f32>, res: vec2<f32>, t: f32) -> vec3<f32> {
 // separation — no dot crawl, no cross-colour rainbow — but chroma is still
 // band-limited (the horizontal colour bleed remains). Sharp luma, soft colour.
 fn svideo(uv: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
-    let step = max(res.x / 320.0, 1.0); // same content-line remap as ntsc(): bleed tracks the source grid
+    let step = res.x / 320.0; // same content-line remap as ntsc(): bleed tracks the source grid
     let cx = uv.x * (res.x / step);
     var y = 0.0;
     var yw = 0.0;
@@ -568,22 +569,22 @@ fn svideo(uv: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
     var q = 0.0;
     var cw = 0.0;
     var qw = 0.0;
-    // No modulation on this path, so nothing needs oversampling: Y/I/Q come straight off
-    // the wires and the source itself holds no detail above the content Nyquist. Integer
-    // taps, ±9 px to span the Q kernel.
-    for (var k = -9; k <= 9; k = k + 1) {
-        let scx = cx + f32(k);
+    // Integrate at the same quarter-pixel spacing: integer-only taps undersample
+    // the 4 MHz luma kernel and incorrectly turn it into an almost perfect wire.
+    for (var k = -36; k <= 36; k = k + 1) {
+        let d = f32(k) * NTSC_STEP;
+        let scx = cx + d;
         // Same zero-order hold and same gamma-encoded working space as ntsc(): S-video
         // splits the wires, it does not change what is on them.
-        let sxc = (floor(scx) + 0.5) * step / res.x;
+        let sxc = (floor(scx * step) + 0.5) / res.x;
         let yiq = rgb2yiq(oetf(textureSampleLevel(t_screen, s_screen, vec2<f32>(sxc, uv.y), 0.0).rgb));
-        let kk = f32(k * k);
+        let kk = d * d;
         // Luma rides its own wire, so no 3.58 trap has to cut into it — the limit is just
         // the set's video amp at ~4.0 MHz. That is wider than the 3.04 MHz content Nyquist,
-        // so this is very nearly a passthrough, and correctly so: an S-video-fed consumer
-        // set resolves single content pixels. Composite's softness is the trap's shoulder,
+        // so single content pixels remain distinguishable, with finite bandwidth
+        // rolloff rather than an unfiltered passthrough. Composite's softness is the trap's shoulder,
         // not the tube's, which is why the two paths differ here at all.
-        let lw = exp(-kk / (2.0 * 0.2850 * 0.2850));
+        let lw = exp(-kk / (2.0 * SVIDEO_SIG_Y * SVIDEO_SIG_Y));
         // Chroma is unchanged from composite: it is still a demodulated subcarrier, so it
         // still cascades the encoder's 1.3/0.4 MHz asymmetry with the consumer receiver's
         // 0.5 MHz equiband demodulator. Separate wires buy perfect Y/C separation — no dot
@@ -670,51 +671,57 @@ fn gamma1p(x: f32) -> f32 {
 //    hardware's linear filter — as this did — models neither: a triangle kernel a full
 //    source pixel wide turns every pixel into a ramp between its neighbours' centres, so
 //    nothing ever reaches a flat top and the tube's focus has no say on this axis at all.
-//    A razor PVM and a fuzzy RCA came out identically soft horizontally. `spot_x` below
-//    restores it, for free.
-fn spot_x(uvx: f32, resx: f32, w: f32) -> f32 {
-    // ZOH ⊗ spot is a trapezoid: flat across the part of the pixel the spot clears, ramping
-    // over ~2w at the boundary. The linear sampler draws exactly that if the sample
-    // coordinate is remapped so its ramp spans the spot rather than the whole pixel.
-    // Capped at 1: a spot wider than a source pixel would spread past its neighbours'
-    // centres, which one sampler tap cannot express, so the widest tubes stay at plain
-    // bilinear — an under-blur, and the safe direction.
-    let t = uvx * resx - 0.5;
-    let i = floor(t);
-    let f = t - i;
-    let e = clamp((f - 0.5) / clamp(2.0 * w, 1e-3, 1.0) + 0.5, 0.0, 1.0);
-    return (i + 0.5 + e) / resx;
+//    A razor PVM and a fuzzy RCA came out identically soft horizontally. `horizontal_signal` below
+//    restores the held signal with an integrated horizontal spot.
+// Zero-mean supply ripple: changing its phase redistributes brightness without
+// changing a uniform field's mean. Keep this separate from phosphor persistence.
+fn hum_modulation(y: f32, time: f32, beat_hz: f32, amplitude: f32) -> f32 {
+    return 1.0 + amplitude * sin(TAU * (fract(time * beat_hz) - 2.0 * y));
+}
+
+// Integral of exp(-x²), Abramowitz/Stegun 7.1.26 (absolute error < 1.5e-7).
+fn spot_erf(x: vec3<f32>) -> vec3<f32> {
+    let t = 1.0 / (1.0 + 0.3275911 * abs(x));
+    let poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+                  - 0.284496736) * t + 0.254829592) * t;
+    return sign(x) * (1.0 - poly * exp(-x * x));
+}
+
+// Convolve the DAC's held pixel intervals with a horizontal Gaussian spot.
+// Integrating each interval, instead of remapping one bilinear fetch, includes
+// multi-pixel tails and gives each gun its own current-dependent spot width.
+fn horizontal_signal(uvx: f32, row: f32, res: vec2<f32>, wscale: f32, footprint: f32) -> vec3<f32> {
+    let x = uvx * res.x;
+    let scale = wscale * (res.x / res.y) * (HALF_H / HALF_W);
+    let widest = max(u.scan.y * scale, 0.5 * footprint);
+    let radius = i32(ceil(3.0 * widest)) + 1;
+    let center = floor(x);
+    var result = vec3<f32>(0.0);
+    for (var k = -radius; k <= radius; k = k + 1) {
+        let column = center + f32(k);
+        let c = textureSampleLevel(t_screen, s_screen,
+            vec2<f32>((column + 0.5) / res.x, (row + 0.5) / res.y), 0.0).rgb;
+        let w = max(beam_width(c) * scale, vec3<f32>(max(0.5 * footprint, 1e-4)));
+        let weight = 0.5 * (spot_erf(vec3<f32>(column + 1.0 - x) / w)
+                          - spot_erf(vec3<f32>(column - x) / w));
+        result = result + c * weight;
+    }
+    return result;
 }
 
 fn scan_reconstruct(uv: vec2<f32>, res: vec2<f32>, wscale: f32, src_px: vec2<f32>) -> vec3<f32> {
     let fy = uv.y * res.y - 0.5;
     let row0 = floor(fy);
-    // Horizontal spot width. One nearest-column probe on the nearest row sets the drive, so
-    // the ramp widens on bright content exactly as the vertical spot does. Scalar (mean of
-    // the three channel widths) because a single sample coordinate has to serve all three;
-    // that per-channel difference is second order next to the ZOH-vs-triangle correction.
-    // The half-width converts rows → columns through the ratio of a source pixel's physical
-    // height to its width, because the spot is round on the glass, not on the pixel grid:
-    // at 320x240 on a 4:3 face that ratio is exactly 1, at 320x224 it is 1.07.
-    let nx = (floor(uv.x * res.x - 0.5) + 0.5) / res.x;
-    let probe = textureSampleLevel(t_screen, s_screen, vec2<f32>(nx, (row0 + 0.5) / res.y), 0.0).rgb;
-    let wv = beam_width(probe) * wscale;
-    // Never narrower than the output pixel itself: sharpening the ramp below what the
-    // display can draw would only alias. Past two source columns per pixel the ramp caps at
-    // plain bilinear anyway, so under heavy minification this lands exactly where the old
-    // unconditional bilinear did.
-    let wx = max((wv.r + wv.g + wv.b) / 3.0 * (res.x / res.y) * (HALF_H / HALF_W),
-                 0.5 * src_px.x);
-    let sx = spot_x(uv.x, res.x, wx);
     var beam = vec3<f32>(0.0); // energy-normalised beam sum (blooms where lines overlap)
     var flat = vec3<f32>(0.0); // profile-weighted reference (the settled picture)
     var wsum = vec3<f32>(0.0);
-    let range = i32(u.scan.w);
+    // Defocused bright spots can extend beyond the preset's minimum support.
+    // Three widths cover >99.99% of a Gaussian; a fixed ±1 row lost corner energy.
+    let range = max(i32(u.scan.w), i32(ceil(3.0 * u.scan.y * wscale)));
     let p = u.beam2.x;
     for (var k = -range; k <= range + 1; k = k + 1) {
         let row = row0 + f32(k);
-        let ly = (row + 0.5) / res.y;
-        let c = textureSampleLevel(t_screen, s_screen, vec2<f32>(sx, ly), 0.0).rgb;
+        let c = horizontal_signal(uv.x, row, res, wscale, src_px.x);
         // wscale > 1 near the edges: deflection defocus widens the vertical spot.
         let s = beam_drive(c);
         let w = mix(vec3<f32>(u.scan.x), vec3<f32>(u.scan.y), s) * wscale;
@@ -772,10 +779,118 @@ fn vs_full(@builtin(vertex_index) vid: u32) -> FullOut {
     return out;
 }
 
+// Auxiliary-coil displacement is driven by differentiated luminance (US5600381A).
+// Integrate the held input through a Gaussian differentiator. Its bounded second
+// derivative keeps velocity positive even on a black/white transition.
+// Returns displacement in source columns and dx_screen/dx_time.
+fn svm_trajectory(x: f32, row: f32, res: vec2<f32>) -> vec2<f32> {
+    if (u.fx.x <= 0.0) { return vec2<f32>(0.0, 1.0); }
+    let sigma = max(0.65, 0.004375 * res.x);
+    let radius = i32(ceil(4.0 * sigma)) + 1;
+    let center = floor(x);
+    var gradient = 0.0;
+    var curvature = 0.0;
+    for (var k = -radius; k <= radius; k = k + 1) {
+        let column = center + f32(k);
+        let c = textureSampleLevel(t_screen, s_screen,
+            vec2<f32>((column + 0.5) / res.x, (row + 0.5) / res.y), 0.0).rgb;
+        let y = dot(clamp(oetf(c), vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.299, 0.587, 0.114));
+        let left = x - column;
+        let right = left - 1.0;
+        let gl = exp(-0.5 * left * left / (sigma * sigma)) / (sqrt(TAU) * sigma);
+        let gr = exp(-0.5 * right * right / (sigma * sigma)) / (sqrt(TAU) * sigma);
+        gradient = gradient + y * (gl - gr);
+        curvature = curvature + y * (right * gr - left * gl) / (sigma * sigma);
+    }
+    let gain = u.fx.x * sigma * sigma;
+    return vec2<f32>(gain * gradient, 1.0 + gain * curvature);
+}
+
+fn svm_source(uv: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
+    let target_x = uv.x * res.x;
+    var x = target_x;
+    var trajectory = vec2<f32>(0.0, 1.0);
+    // Newton inversion maps a phosphor position back to the instant the beam
+    // crossed it. Dividing current by velocity preserves deposited energy.
+    for (var i = 0; i < 4; i = i + 1) {
+        trajectory = svm_trajectory(x, floor(uv.y * res.y), res);
+        x = x - (x + trajectory.x - target_x) / max(trajectory.y, 0.1);
+    }
+    trajectory = svm_trajectory(x, floor(uv.y * res.y), res);
+    return vec3<f32>(x / res.x, uv.y, 1.0 / max(trajectory.y, 0.1));
+}
+
+// Time of the beam crossing within the field. The horizontal retrace and
+// vertical blanking intervals contain no excitation. SD uses NTSC's 262.5-line
+// field / 52.6 us active line; denser PC rasters retain their rows and use the
+// same normalized blanking budget until an explicit source timing is supplied.
+fn raster_arrival(uv: vec2<f32>, res: vec2<f32>, interlace: f32) -> f32 {
+    let rows = res.y / (1.0 + interlace);
+    let line = floor(floor(uv.y * res.y) / (1.0 + interlace));
+    let total = rows * (262.5 / 240.0);
+    let vertical_blank = total - rows;
+    let horizontal = (63.5555556 - 52.6) / 63.5555556 + uv.x * (52.6 / 63.5555556);
+    return (vertical_blank + line + horizontal) / total * (1001.0 / 60000.0);
+}
+
+// Stable 1-exp(-x) for slow reservoirs, avoiding loss of a small time step.
+fn released(x: vec3<f32>) -> vec3<f32> {
+    let small = x * (1.0 - 0.5 * x + x * x / 6.0);
+    return select(1.0 - exp(-x), small, x < vec3<f32>(0.001));
+}
+
+fn measured_phosphor(uv: vec2<f32>, scan_uv: vec2<f32>, sig: vec3<f32>, lit: f32) -> vec3<f32> {
+    let dt = u.temporal.x;
+    if (dt <= 0.0) { return sig * lit; }
+    let period = 1001.0 / 60000.0;
+    let arrival = raster_arrival(scan_uv, u.params.xy, u.temporal.z);
+    let remaining = max(dt - arrival, 0.0);
+    let shutter = dt * clamp(u.raster.y, 0.000001, 1.0);
+    let begin = dt - shutter;
+    let index = (u32(uv.y * u.params.y) * u32(u.params.x) + u32(uv.x * u.params.x)) * 33u;
+    let deposited = sig * lit * period * (1.0 + u.temporal.z) * select(0.0, 1.0, arrival <= dt);
+    var integral = vec3<f32>(0.0);
+    let mono = u.mono.w > 0.5;
+    let material = select(0.0, u.ptau.x, mono);
+    for (var k = 0u; k < 31u; k = k + 1u) {
+        var rate = PHOS_RATE[k];
+        var weight = PHOS_ENERGY[k];
+        if (mono) {
+            rate = vec3<f32>(1.0) / u.ptau.rgb;
+            weight = select(vec3<f32>(0.0), vec3<f32>(1.0), k == 0u);
+        }
+        var previous = history_load(index + k).rgb;
+        // A newly opened, already-warm tube starts at the periodic steady state
+        // of its initial signal. Power-up from a blank signal still starts dark.
+        if (history_load(index + 32u).w == 0.0 || history_load(index + 32u).y != material) {
+            let cycle = period * (1.0 + u.temporal.z);
+            previous = deposited * weight * rate * exp(-rate * max(cycle - arrival, 0.0))
+                / max(released(rate * cycle), vec3<f32>(1e-12));
+        }
+        integral = integral + previous * exp(-rate * begin) * released(rate * shutter) / rate;
+        // Integrate the new impulse only over the open shutter interval.
+        let age_begin = max(begin - arrival, 0.0);
+        integral = integral + deposited * weight * exp(-rate * age_begin)
+            * released(rate * max(remaining - age_begin, 0.0));
+        let next = previous * exp(-rate * dt) + deposited * weight * rate * exp(-rate * remaining);
+        history_store(index + k, vec4<f32>(next, 0.0));
+        if (mono) { break; }
+    }
+    // Accumulate all field exposures belonging to one output frame. A 30 fps
+    // frame must include both fields' light, not just the final field snapshot.
+    var exposure = history_load(index + 31u);
+    if (history_load(index + 32u).x != u.raster.z) { exposure = vec4<f32>(0.0); }
+    exposure = exposure + vec4<f32>(integral, shutter);
+    history_store(index + 31u, exposure);
+    history_store(index + 32u, vec4<f32>(u.raster.z, material, 0.0, 1.0));
+    return exposure.rgb / max(exposure.w, 1e-9);
+}
+
 @fragment
 fn fs_phosphor(in: FullOut) -> @location(0) vec4<f32> {
     let res = u.params.xy;
-    let uv = in.uv;
+    let beam = svm_source(in.uv, res);
+    let uv = beam.xy;
     // Input signal path (tone.w): 0 = RGB/component (clean — PVM, arcade board, PC),
     // 1 = S-video (sharp luma, band-limited colour, no dot crawl), 2 = composite
     // (dot crawl + cross-colour rainbow + colour bleed — RF/antenna consumer TV).
@@ -788,30 +903,26 @@ fn fs_phosphor(in: FullOut) -> @location(0) vec4<f32> {
         sig = textureSampleLevel(t_screen, s_screen, uv, 0.0).rgb; // clean RGB
     }
 
-    // CRT transfer curve — drive volts → beam current → LIGHT. This is the boundary between
-    // the signal domain and the optical domain, and everything past it (persistence, the
-    // beam spot, the mask, halation, diffusion) is a linear operation on light, so it has to
-    // happen HERE and not, as it used to, several stages downstream in the tube pass. Order
-    // matters because the curve is nonlinear: summing overlapping scanline profiles and only
-    // then applying the exponent reconstructed the beam in the wrong space, and it forced
-    // every optical term that reads the phosphor plane directly (halation, diffusion, the
-    // ghost) to carry its own copy of the exponent just to be comparable with the picture it
-    // was mixing into. All of those go away now. phys.x = 1.12: the source is an sRGB
-    // texture the hardware already decoded at ~2.2 and a real tube's EOTF is ~2.4 (BT.1886),
-    // so 2.2 × 1.12 = 2.46 lands the end-to-end transfer where a measured tube sits.
-    // phys.y then applies the tube's warm phosphor white point, also a property of the
-    // emitted light — held here so the scatter taps below see the same light the picture
-    // does (mixing a tinted picture with untinted scatter tilted the glow's colour).
-    sig = pow(max(sig, vec3<f32>(0.0)), vec3<f32>(u.phys.x));
-    sig = sig * mix(vec3<f32>(1.0), vec3<f32>(1.06, 1.015, 0.93), u.phys.y);
+    // Signal noise belongs before the nonlinear gun and phosphor history.
+    // Analog noise correlation follows the fixed signal bandwidth, not capture width.
+    let noise_res = vec2<f32>(select(res.x, 320.0, u.tone.w > 0.5), res.y);
+    let grain = hash21(floor(uv * noise_res) + vec2<f32>(u.params.z * 61.0, u.params.z * 37.0)) - 0.5;
+    var voltage = max(oetf(sig) + vec3<f32>(grain * u.look.z), vec3<f32>(0.0));
+    if (u.mono.w > 0.5) {
+        voltage = vec3<f32>(dot(voltage, vec3<f32>(0.299, 0.587, 0.114)));
+    }
+    sig = pow(voltage, vec3<f32>(u.phys.x)) * beam.z;
+    // Cut excitation when fully off; stored light must decay rather than secretly
+    // tracking the source while the power switch hides the output.
+    sig = sig * select(1.0, 0.0, u.pwr.y >= 1.0 || u.pwr.x <= 0.0);
 
-    let prev = textureSampleLevel(t_prev, s_screen, uv, 0.0).rgb;    // last phosphor
+    let prev = textureSampleLevel(t_prev, s_screen, in.uv, 0.0).rgb;    // last phosphor
 
     let dt = max(u.temporal.x, 0.0);
     // Per-phosphor decay: each primary keeps its own fraction of last field's charge.
     // Red lingers a whole persistence class longer than green and blue → moving highlights
     // trail warm (the real P22 look; see the ptau comment on the CPU side).
-    let tau = max(u.ptau.rgb * max(u.temporal.y, 1e-4), vec3<f32>(1e-4));
+    let tau = max(u.ptau.rgb * max(u.temporal.y, 1e-4), vec3<f32>(1e-8));
     // Sulfide phosphors do not decay as a single exponential. The measured curve is a fast
     // near-exponential drop followed by a slow power-law tail (I = a/(t+t₀)^b), which is
     // where the visible afterglow lives — a pure exponential drops it entirely. Physically
@@ -830,11 +941,20 @@ fn fs_phosphor(in: FullOut) -> @location(0) vec4<f32> {
     let odd = f32(i32(line) - (i32(line) / 2) * 2);
     let lit = 1.0 - u.temporal.z * abs(odd - parity);
     let excite = sig * lit;
+    if (u.raster.x > 0.5) { return vec4<f32>(measured_phosphor(in.uv, beam.xy, sig, lit), 1.0); }
 
     // Phosphor charges instantly to the beam excitation, then decays. max() keeps a
     // freshly-lit pixel bright while unlit pixels fall off toward the previous field.
     let out = max(excite, prev * decay);
     return vec4<f32>(out, 1.0);
+}
+
+// Source statistics already contain average linear light. Do not multiply by
+// APL again: that squares brightness and loses the midtone screen illumination.
+fn screen_bounce_color() -> vec3<f32> {
+    var color = vec3<f32>(dot(u.cmat0.xyz, u.env.rgb), dot(u.cmat1.xyz, u.env.rgb), dot(u.cmat2.xyz, u.env.rgb));
+    if (u.mono.w > 0.5) { color = dot(u.env.rgb, vec3<f32>(0.299, 0.587, 0.114)) * u.mono.rgb; }
+    return max(color, vec3<f32>(0.0)) * u.fx.w;
 }
 
 @fragment
@@ -965,20 +1085,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // Front fragments catch this emission with directional inverse-square falloff and inner-bevel specular glints.
         let fz = smoothstep(-0.75, -0.02, in.world_pos.z);
         let front = fz * fz;
-        var glow_col = u.env.rgb;
-        if (u.mono.w > 0.5) { glow_col = dot(u.env.rgb, vec3<f32>(0.299, 0.587, 0.114)) * u.mono.rgb; }
+        let glow_col = screen_bounce_color();
         let son = min(u.pwr.x, 1.0 - u.pwr.y);
 
         let screen_pt = vec3<f32>(clamp(in.world_pos.x, -HALF_W, HALF_W), clamp(in.world_pos.y, -HALF_H, HALF_H), 0.0);
         let to_screen = screen_pt - in.world_pos;
-        let screen_dist = max(length(to_screen), 0.12);
+        let screen_dist = max(length(to_screen), 1e-4);
         let screen_dir = to_screen / screen_dist;
         let screen_ndl = max(dot(nn, screen_dir), 0.0);
         let f0 = mix(vec3<f32>(0.04), base, metal);
         let screen_spec = ggx_spec(nn, v, screen_dir, rough, f0);
 
         let screen_falloff = 1.0 / (1.0 + screen_dist * screen_dist * 2.8);
-        let screen_spill = glow_col * u.env.w * u.phys.z * front * (screen_ndl * 0.90 + 0.18 * max(dot(nn, v), 0.0) + screen_spec * 0.45) * screen_falloff * son;
+        let screen_spill = glow_col * u.phys.z * front * (screen_ndl * 0.90 + 0.18 * max(dot(nn, v), 0.0) + screen_spec * 0.45) * screen_falloff * son;
         col = col + screen_spill;
 
         return output_color(col);
@@ -1039,9 +1158,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // field grows, so the spot widens (astigmatic — elongates horizontally at the sides,
     // worst in the corners) and the picture softens toward the edges. r2 grows to the
     // corners; a 4th-order term makes the corners bloom hardest. u.focus.x = the tube's
-    // edge-focus quality (a PVM ~0, a fuzzy RCA/arcade blooms). Physical faceplate
-    // effects keep the true in.uv; this only shapes the sampled image.
-    let dfv = ruv - vec2<f32>(0.5);
+    // edge-focus quality (a PVM ~0, a fuzzy RCA/arcade blooms). Deflection is
+    // a position on the physical faceplate, not the inverse-mapped source signal.
+    // During power collapse that signal coordinate can be far outside [0,1];
+    // using it here invents enormous spots and unbounded convolution workloads.
+    let dfv = in.uv - vec2<f32>(0.5);
     let r2 = dot(dfv, dfv);
     let vscale = 1.0 + u.focus.x * (2.0 * r2 + 3.5 * r2 * r2);
     let src_px = uv_fw * res; // source columns/scanlines covered by one output pixel
@@ -1069,32 +1190,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         col = mix(col, hb, hamt);
     }
 
-    // Scan-velocity modulation (SVM / "VM"): a consumer-set circuit that briefly changed
-    // the beam's HORIZONTAL velocity at luminance transitions — slowing it (more energy,
-    // brighter) on the bright side of an edge and speeding it (less energy) on the dark
-    // side — which crispens vertical edges with the signature bright overshoot / dark
-    // undershoot "VM halo." Modeled as a horizontal unsharp (Laplacian of luma) on the
-    // scanned image. Per-tube: composite consumer sets strong, S-video milder, RGB /
-    // PC / mono off (broadcast PVMs and PC monitors ran without it). See IEEE 4042821.
-    if (u.fx.x > 0.0) {
-        // The VM circuit's overshoot lasts a fixed ~100 ns, which on NTSC's 52.6 µs active
-        // line is 0.19% of the picture width — so, again, a fraction of the face and not a
-        // texel count. 0.44% here is the ±1 half-width of the laplacian, i.e. a ~230 ns lip.
-        let dx = vec2<f32>(0.004375, 0.0);
-        let lw = vec3<f32>(0.299, 0.587, 0.114);
-        let cC = dot(textureSampleLevel(t_screen, s_screen, uv, 0.0).rgb, lw);
-        let cL = dot(textureSampleLevel(t_screen, s_screen, uv - dx, 0.0).rgb, lw);
-        let cR = dot(textureSampleLevel(t_screen, s_screen, uv + dx, 0.0).rgb, lw);
-        let lap = clamp(2.0 * cC - cL - cR, -0.6, 0.6); // + on ridges, − in troughs
-        // Depth. On a hard black-to-white step the laplacian saturates the ±0.6 clamp, so
-        // this constant sets the worst-case overshoot directly: it was 2.0, which at the
-        // composite set's fx.x = 0.55 put the halo at ±66% of local brightness. Scope traces
-        // of VM sets show the leading-edge overshoot running more like 20-30% above the flat
-        // white level — a crisp bright lip, not a doubled edge. 0.9 lands the composite set
-        // at 0.55 × 0.9 × 0.6 ≈ 30% worst case, with the S-video Trinitron near 19%.
-        col = max(col * (1.0 + u.fx.x * lap * 0.9), vec3<f32>(0.0));
-    }
-
     // (The CRT transfer curve and the phosphor white point are applied at the signal→light
     // boundary in fs_phosphor, so `col` and every phosphor-plane tap below are already in
     // the same light units — see the note there.)
@@ -1112,17 +1207,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let apl = u.env.w;
     col = col * (1.0 - apl * u.phys.w);
 
-    // Rolling refresh band ("hum bar"): the beam sweeps top→bottom at the field rate, so
-    // a just-scanned line glows a hair brighter and fades as it ages toward the next
-    // sweep. Viewed dead-on by eye this averages out, but a "captured" CRT rolls because
-    // the viewing rate beats against the tube's 59.94 Hz field — focus.z is that beat
-    // rate, focus.w the amplitude. A soft bright band drifting down = a living tube.
-    if (u.focus.w > 0.0) {
-        let beam_y = fract(u.params.z * u.focus.z);   // beam vertical position (rolls)
-        let age = fract(beam_y - in.uv.y);            // 0 = just scanned → 1 = most decayed
-        let refresh = u.focus.w * (exp(-age * 6.5) - 0.14);
-        col = col * (1.0 + refresh);
-    }
+    // Supply ripple sampled by successive fields. The CPU supplies the signed
+    // difference between full-wave mains and twice the field rate. Two spatial
+    // periods retain the rectified supply's two cycles per field; the slowly
+    // changing phase is the beat, not a second phosphor-decay animation.
+    col = col * hum_modulation(in.uv.y, u.params.z, u.focus.z, u.focus.w);
 
     // Monochrome tube: a single electron gun paints ONE phosphor colour scaled by the
     // signal's luminance — no colour triads, no convergence (a green/amber terminal).
@@ -1141,7 +1230,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // exponent. Getting this wrong is what used to break conservation: the fraction taken
     // off `col` was worth about twice the fraction added back from the taps, so every tube
     // lost a few percent of brightness in proportion to how much it scattered.
-    let emit = u.tone.z;
+    let emit = u.tone.z * (1.0 - apl * u.phys.w);
 
     // Halation: light scattering laterally inside the glass, biased warm/red
     // because the red phosphor persists longest. Sampled around the parallax uv.
@@ -1176,14 +1265,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // Conserving it means a flat field passes through untouched while an isolated
         // highlight dims a shade as it blooms, which is what one does on real glass.
         let hshare = halo * u.beam2.w;
-        var htint = vec3<f32>(1.0, 0.6, 0.45); // warm: leaded panel + the longest-lit phosphor
-        if (u.mono.w > 0.5) { htint = u.mono.rgb; } // mono glows its own single colour
-        // Normalise the tint to unit luminance so the warm bias only shifts the glow's
-        // colour and does not smuggle in extra light (the old tint had a luma of 0.70, so
-        // adding it raised red 16% on every flat field — a cast, not a scatter).
-        htint = htint / max(dot(htint, vec3<f32>(0.299, 0.587, 0.114)), 1e-3);
-        let gl = select(glow, vec3<f32>(dot(glow, vec3<f32>(0.299, 0.587, 0.114))), u.mono.w > 0.5);
-        col = col * (1.0 - hshare) + gl * htint * hshare;
+        // Wavelength-dependent scattering redistributes each primary separately.
+        // Tinting only the added term creates red energy even on a flat field.
+        let share = vec3<f32>(hshare) * select(vec3<f32>(1.0, 0.6, 0.45), vec3<f32>(1.0), u.mono.w > 0.5);
+        let gl = select(glow, vec3<f32>(dot(glow, vec3<f32>(0.299, 0.587, 0.114))) * u.mono.rgb, u.mono.w > 0.5);
+        col = col * (vec3<f32>(1.0) - share) + gl * share;
     }
 
     // Diffusion — a SECOND, wider bloom scale, physically distinct from halation.
@@ -1226,13 +1312,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let diff = max((d + d2 * 0.30) / 10.4, vec3<f32>(0.0)) * emit;
         // Same conservation as halation: light scattered sideways inside the panel is light
         // that did not come straight out, so the same fraction comes off the direct term as
-        // goes back on, and the tint is luma-normalised so it only recolours the haze.
+        // goes back on. A single-phosphor tube keeps the same hue in its scattered light.
         let dshare = diff_amt * u.beam2.w;
-        var dtint = vec3<f32>(1.0, 0.95, 0.9); // near-neutral, faintly warm
-        if (u.mono.w > 0.5) { dtint = u.mono.rgb; }
-        dtint = dtint / max(dot(dtint, vec3<f32>(0.299, 0.587, 0.114)), 1e-3);
-        let dl = select(diff, vec3<f32>(dot(diff, vec3<f32>(0.299, 0.587, 0.114))), u.mono.w > 0.5);
-        col = col * (1.0 - dshare) + dl * dtint * dshare;
+        let share = vec3<f32>(dshare) * select(vec3<f32>(1.0, 0.95, 0.9), vec3<f32>(1.0), u.mono.w > 0.5);
+        let dl = select(diff, vec3<f32>(dot(diff, vec3<f32>(0.299, 0.587, 0.114))) * u.mono.rgb, u.mono.w > 0.5);
+        col = col * (vec3<f32>(1.0) - share) + dl * share;
     }
 
     // Phosphor mask. The mask is a physical object GLUED TO THE TUBE — a grille of
@@ -1357,17 +1441,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Tube vignette.
     let vd = distance(in.uv, vec2<f32>(0.5, 0.5));
     col = col * mix(1.0, 1.0 - u.glass.z, smoothstep(0.30, 0.92, vd));
-
-    // Analog noise floor: a little animated grain, strongest in the shadows where
-    // a real signal's snow is visible.
-    let lum = dot(col, vec3<f32>(0.299, 0.587, 0.114));
-    // Grain cell size comes from the signal, not from the capture's pixel count: horizontally
-    // the video amp's ~4 MHz limit is about one cell per content pixel on a virtual 320-wide
-    // line (the same content grid ntsc() decodes on), vertically one cell per scanline. Tying
-    // it to res.x instead made a desktop capture's snow six times finer than a console's.
-    let grain = (hash21(vec2<f32>(in.uv.x * 320.0, in.uv.y * res.y)
-                        + vec2<f32>(u.params.z * 61.0, u.params.z * 37.0)) - 0.5);
-    col = col + grain * u.look.z * (1.0 - smoothstep(0.0, 0.5, lum));
 
     // Real phosphor colorimetry: map the tube's drive RGB through its measured gamut
     // and native white point into sRGB (SMPTE-C green is less saturated, its red is

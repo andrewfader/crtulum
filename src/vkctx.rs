@@ -432,7 +432,7 @@ impl VkHost {
         let instance_from_core = negotiated_instance.is_some();
         wrapper_ctx.create_device = Some(instance.fp_v1_0().create_device);
 
-        // Prefer a real GPU over a software rasteriser.
+        // Vulkan cores require a physical GPU, just like the tube renderer.
         let gpus = unsafe { instance.enumerate_physical_devices() }?;
         let pick = |want: vk::PhysicalDeviceType| {
             gpus.iter().copied().find(|g| {
@@ -441,13 +441,7 @@ impl VkHost {
         };
         let gpu = pick(vk::PhysicalDeviceType::DISCRETE_GPU)
             .or_else(|| pick(vk::PhysicalDeviceType::INTEGRATED_GPU))
-            .or_else(|| gpus.first().copied())
-            .ok_or_else(|| anyhow!("no Vulkan physical device"))?;
-        let props = unsafe { instance.get_physical_device_properties(gpu) };
-        let gpu_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-
+            .ok_or_else(|| anyhow!("a discrete or integrated Vulkan GPU is required for this core; software adapters are not supported"))?;
         // The windowless surface itself, if the extension made it in.
         let surface_fns = vk::KhrSurfaceFn::load(|name| unsafe {
             std::mem::transmute(entry.get_instance_proc_addr(instance.handle(), name.as_ptr()))
@@ -552,6 +546,9 @@ impl VkHost {
                 if !ok || ctx.device == vk::Device::null() {
                     bail!("the core declined to create a Vulkan device");
                 }
+                if ctx.gpu != vk::PhysicalDevice::null() {
+                    negotiated_gpu = ctx.gpu;
+                }
                 core_destroy_device = negotiation.and_then(|n| n.destroy_device);
                 let device = unsafe { ash::Device::load(instance.fp_v1_0(), ctx.device) };
                 let queue = if ctx.queue != vk::Queue::null() {
@@ -589,6 +586,24 @@ impl VkHost {
         }
         };
         let gpu = negotiated_gpu;
+        let props = unsafe { instance.get_physical_device_properties(gpu) };
+        let gpu_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }.to_string_lossy();
+        if !matches!(props.device_type, vk::PhysicalDeviceType::DISCRETE_GPU | vk::PhysicalDeviceType::INTEGRATED_GPU) {
+            // A negotiating core may choose a different device. Enforce the
+            // hardware contract on its result as well as on our offered device.
+            unsafe {
+                let _ = device.device_wait_idle();
+                match core_destroy_device {
+                    Some(destroy) => destroy(),
+                    None => device.destroy_device(None),
+                }
+                if surface != vk::SurfaceKHR::null() {
+                    (surface_fns.destroy_surface_khr)(instance.handle(), surface, std::ptr::null());
+                }
+                instance.destroy_instance(None);
+            }
+            bail!("the core selected {gpu_name} ({:?}); a physical Vulkan GPU is required", props.device_type);
+        }
 
         let cmd_pool = unsafe {
             device.create_command_pool(

@@ -46,7 +46,7 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub enum Input {
-    /// Anything ffmpeg can demux (also a directory of PNGs, via a glob pattern).
+    /// Anything ffmpeg can demux, or a directory of supported still images.
     Media(PathBuf),
     /// Anything yt-dlp can fetch (YouTube, Vimeo, a direct link, …).
     Url(String),
@@ -71,6 +71,7 @@ pub struct Opts {
     pub size: (u32, u32),
     pub fps: f64,                        // 0 → inherit the source rate
     pub ssaa: u32,                       // supersampling factor (1 = fast preview)
+    pub shutter: f32,                    // open fraction of each field exposure
     pub source_size: Option<(u32, u32)>, // signal resolution fed to the tube
     pub start: f64,
     pub duration: Option<f64>,
@@ -79,7 +80,7 @@ pub struct Opts {
     pub audio: bool,
     pub script: Script,
     /// libretro core options, e.g. `parallel-n64-gfxplugin=angrylion`. Needed to put
-    /// the 3D cores on a software renderer, since this host has no GL/Vulkan path.
+    /// the 3D cores on a particular software, OpenGL, or Vulkan renderer.
     pub core_options: Vec<(String, String)>,
     /// Microsoft Agent character to put on the screen — a name or an asset directory.
     pub agent: Option<String>,
@@ -263,8 +264,10 @@ fn parse_time(s: &str) -> Result<f32> {
         let v: f32 = part
             .parse()
             .with_context(|| format!("bad time component `{part}` in `{s}`"))?;
+        if !v.is_finite() || v < 0.0 { bail!("time must be finite and nonnegative"); }
         total = total * 60.0 + v;
     }
+    if !total.is_finite() { bail!("time is too large"); }
     Ok(total)
 }
 
@@ -272,12 +275,14 @@ fn parse_size(s: &str) -> Result<(u32, u32)> {
     let (w, h) = s
         .split_once(['x', 'X'])
         .ok_or_else(|| anyhow!("bad size `{s}` (want WxH, e.g. 1280x960)"))?;
-    Ok((w.trim().parse()?, h.trim().parse()?))
+    let size = (w.trim().parse()?, h.trim().parse()?);
+    if size.0 == 0 || size.1 == 0 { bail!("size must be nonzero"); }
+    Ok(size)
 }
 
 /// Split a script line into tokens, honouring quotes — `agent say "well hi there"`
 /// is four tokens, and a `#` inside the quotes is text, not a comment.
-fn tokenize(line: &str) -> Vec<String> {
+fn tokenize(line: &str) -> Result<Vec<String>> {
     let (mut out, mut cur, mut quote, mut quoted) = (Vec::new(), String::new(), None, false);
     for c in line.chars() {
         match quote {
@@ -302,7 +307,8 @@ fn tokenize(line: &str) -> Vec<String> {
     if quoted || !cur.is_empty() {
         out.push(cur);
     }
-    out
+    if quote.is_some() { bail!("unterminated quoted string"); }
+    Ok(out)
 }
 
 /// A point on the screen, in raster-normalised coordinates: `0.7,0.3` or `0.7 0.3`,
@@ -318,10 +324,12 @@ fn parse_point(a: &mut Args) -> Result<[f32; 2]> {
                 .to_string(),
         ),
     };
-    Ok([
+    let point: [f32; 2] = [
         x.parse().with_context(|| format!("bad x in `{first}`"))?,
         y.parse().with_context(|| format!("bad y in `{first}`"))?,
-    ])
+    ];
+    if point.iter().any(|v| !v.is_finite()) { bail!("point must be finite"); }
+    Ok(point)
 }
 
 fn parse_bool(s: &str) -> Result<bool> {
@@ -350,14 +358,14 @@ impl<'a> Args<'a> {
         t
     }
     fn value_for(&mut self, key: &str, inline: Option<&'a str>) -> Result<f32> {
-        match inline {
-            Some(v) => v.parse().with_context(|| format!("bad value for `{key}`")),
-            None => self
-                .next()
-                .ok_or_else(|| anyhow!("`{key}` needs a value"))?
-                .parse()
-                .with_context(|| format!("bad value for `{key}`")),
+        let raw = inline.or_else(|| self.next())
+            .ok_or_else(|| anyhow!("`{key}` needs a value"))?;
+        let value: f32 = raw.parse().with_context(|| format!("bad value for `{key}`"))?;
+        if !value.is_finite() { bail!("`{key}` must be finite"); }
+        if matches!(key, "over" | "dist" | "scale") && value < 0.0 {
+            bail!("`{key}` must be nonnegative");
         }
+        Ok(value)
     }
 }
 
@@ -365,6 +373,12 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
     let verb = toks[0].to_ascii_lowercase();
     let rest = &toks[1..];
     let mut a = Args::new(rest);
+    let limit = match verb.as_str() {
+        "degauss" => Some(0),
+        "preset" | "power" | "interlace" | "subpixel" | "bfi" | "wait" => Some(1),
+        _ => None,
+    };
+    if limit.is_some_and(|n| rest.len() > n) { bail!("unexpected argument to `{verb}`"); }
     match verb.as_str() {
         "preset" => {
             let name = rest.first().ok_or_else(|| anyhow!("`preset` needs a name"))?;
@@ -406,6 +420,7 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
                     v => turns = v.parse().with_context(|| format!("bad spin arg `{v}`"))?,
                 }
             }
+            if !turns.is_finite() { bail!("turns must be finite"); }
             Ok(Action::Spin { turns, over, ease })
         }
         "exposure" | "brightness" => {
@@ -423,8 +438,10 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
                     v => to = Some(v.parse().with_context(|| format!("bad exposure `{v}`"))?),
                 }
             }
+            let to: f32 = to.ok_or_else(|| anyhow!("`exposure` needs a value"))?;
+            if !to.is_finite() || to < 0.0 { bail!("exposure must be nonnegative and finite"); }
             Ok(Action::Exposure {
-                to: to.ok_or_else(|| anyhow!("`exposure` needs a value"))?,
+                to,
                 over,
                 ease,
             })
@@ -486,6 +503,7 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
                      (show, hide, at, move, point, say, play, scale)"
                 ),
             };
+            if a.next().is_some() { bail!("unexpected argument to agent `{verb}`"); }
             Ok(Action::Agent(cmd))
         }
 
@@ -496,9 +514,11 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
         // hold right / release right / tap b
         "stick" => {
             let p = parse_point(&mut a)?;
+            if a.next().is_some() { bail!("unexpected argument to stick"); }
             Ok(Action::Stick { x: p[0].clamp(-1.0, 1.0), y: p[1].clamp(-1.0, 1.0) })
         }
         "center" if a.next().is_some_and(|v| v.eq_ignore_ascii_case("stick")) => {
+            if a.next().is_some() { bail!("unexpected argument to center stick"); }
             Ok(Action::Stick { x: 0.0, y: 0.0 })
         }
         "press" | "hold" | "release" | "tap" => {
@@ -512,12 +532,15 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
                             .ok_or_else(|| anyhow!("`for` needs a duration"))?
                             .parse()
                             .context("bad duration after `for`")?;
+                        if !n.is_finite() || n <= 0.0 { bail!("button duration must be positive and finite"); }
+                        if matches!(verb.as_str(), "hold" | "release") { bail!("`{verb}` does not take a duration; use press"); }
                         // A bare number is seconds; `frames`/`f` makes it exact.
                         let unit = a.toks.get(a.i).copied().unwrap_or("");
                         dur = Some(match unit.to_ascii_lowercase().as_str() {
                             "frames" | "frame" | "f" => {
                                 a.next();
-                                Dur::Frames(n.round().max(1.0) as u64)
+                                if n.fract() != 0.0 { bail!("frame duration must be an integer"); }
+                                Dur::Frames(n as u64)
                             }
                             "s" | "sec" | "secs" | "seconds" => {
                                 a.next();
@@ -551,7 +574,7 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
 pub fn parse_script(text: &str) -> Result<Script> {
     let mut s = Script::default();
     for (lineno, raw) in text.lines().enumerate() {
-        let owned = tokenize(raw);
+        let owned = tokenize(raw).with_context(|| format!("script line {}", lineno + 1))?;
         if owned.is_empty() {
             continue;
         }
@@ -578,6 +601,10 @@ pub fn parse_script(text: &str) -> Result<Script> {
         let key = toks[0].to_ascii_lowercase();
         let arg = toks.get(1).copied().unwrap_or("");
         let r = (|| -> Result<()> {
+            if !matches!(key.as_str(), "camera" | "cam" | "option" | "core-option")
+                && (toks.len() != 2 || arg.is_empty()) {
+                bail!("`{key}` needs exactly one value (quote paths containing spaces)");
+            }
             match key.as_str() {
                 "source" | "input" => s.source = Some(arg.trim_matches(['"', '\'']).to_string()),
                 "rom" | "game" => s.rom = Some(arg.trim_matches(['"', '\'']).to_string()),
@@ -592,6 +619,9 @@ pub fn parse_script(text: &str) -> Result<Script> {
                 "frames" => s.frames = Some(arg.parse()?),
                 // `option key=value` (or `option key value`) — passed to the core.
                 "option" | "core-option" => {
+                    if !(toks.len() == 2 && arg.contains('=')) && toks.len() != 3 {
+                        bail!("`option` wants key=value or key value (quote values containing spaces)");
+                    }
                     let rest = toks[1..].join(" ");
                     let (k, v) = rest
                         .split_once('=')
@@ -600,10 +630,15 @@ pub fn parse_script(text: &str) -> Result<Script> {
                             toks.get(2).map(|v| (arg.to_string(), v.to_string()))
                         })
                         .ok_or_else(|| anyhow!("`option` wants key=value"))?;
+                    if k.is_empty() || v.is_empty() { bail!("option key and value must be nonempty"); }
                     s.options.push((k, v));
                 }
                 "size" | "out-size" => s.size = Some(parse_size(arg)?),
-                "fps" | "rate" => s.fps = Some(arg.parse()?),
+                "fps" | "rate" => {
+                    let fps: f64 = arg.parse()?;
+                    if !fps.is_finite() || fps <= 0.0 { bail!("fps must be positive and finite"); }
+                    s.fps = Some(fps);
+                }
                 "ssaa" | "supersample" => s.ssaa = Some(arg.parse()?),
                 "source-size" | "signal" => s.source_size = Some(parse_size(arg)?),
                 // `lines N` = N-line signal, width derived from the source aspect.
@@ -618,7 +653,11 @@ pub fn parse_script(text: &str) -> Result<Script> {
                         s.dist = dist.or(s.dist);
                     }
                 }
-                "exposure" | "brightness" => s.exposure = Some(arg.parse()?),
+                "exposure" | "brightness" => {
+                    let value: f32 = arg.parse()?;
+                    if !value.is_finite() || value < 0.0 { bail!("exposure must be nonnegative and finite"); }
+                    s.exposure = Some(value);
+                }
                 "interlace" => s.interlace = Some(parse_bool(arg)?),
                 "subpixel" => s.subpixel = Some(parse_bool(arg)?),
                 "bfi" => s.bfi = Some(parse_bool(arg)?),
@@ -737,10 +776,14 @@ impl Timeline {
 
         // Camera and exposure keys are relative to whatever came before, so walk the
         // event list in order carrying a cursor.
-        let mut cam = cam0;
-        let mut exp = exp0;
-        for (when, action) in &s.events {
+        let mut events: Vec<_> = s.events.iter().collect();
+        events.sort_by(|a, b| a.0.seconds(fps).total_cmp(&b.0.seconds(fps)));
+        for (when, action) in events {
             let t = when.seconds(fps);
+            // Interrupted moves start at the interpolated position, not the old
+            // destination. Resolve frame-addressed actions at the actual core rate.
+            let cam = tl.cam.last().map(|seg| seg.eval(t)).unwrap_or(cam0);
+            let exp = tl.exp.last().map(|seg| seg.eval(t)[0]).unwrap_or(exp0);
             tl.end = tl.end.max(t);
             match action {
                 Action::Preset(name) => {
@@ -755,13 +798,11 @@ impl Timeline {
                         dist.unwrap_or(cam[2]),
                     ];
                     tl.cam.push(Seg { t0: t, t1: t + over, from: cam, to, ease: *ease });
-                    cam = to;
                     tl.end = tl.end.max(t + over);
                 }
                 Action::Spin { turns, over, ease } => {
                     let to = [cam[0] + turns * std::f32::consts::TAU, cam[1], cam[2]];
                     tl.cam.push(Seg { t0: t, t1: t + over, from: cam, to, ease: *ease });
-                    cam = to;
                     tl.end = tl.end.max(t + over);
                 }
                 Action::Exposure { to, over, ease } => {
@@ -772,7 +813,6 @@ impl Timeline {
                         to: [*to, 0.0, 0.0],
                         ease: *ease,
                     });
-                    exp = *to;
                     tl.end = tl.end.max(t + over);
                 }
                 Action::Power(on) => {
@@ -843,7 +883,8 @@ impl Timeline {
             orbit: Orbit { yaw: cam[0], pitch: cam[1], distance: cam[2] },
             preset: step_at(&self.presets, t, self.preset0),
             exposure,
-            pwr: [warmup, collapse, degauss, 0.0],
+            pwr: [warmup, collapse, degauss,
+                if self.degauss.iter().any(|t0| t - t0 >= DEGAUSS_DUR) { 1.0 } else { 0.0 }],
             interlace: if step_at(&self.interlace, t, self.interlace0) { 1.0 } else { 0.0 },
             subpixel: step_at(&self.subpixel, t, self.subpixel0),
             bfi: step_at(&self.bfi, t, self.bfi0),
@@ -1110,6 +1151,18 @@ fn core_for(rom: &Path, explicit: Option<&str>) -> Result<PathBuf> {
     )
 }
 
+// Replay cache entries depend on the selected core and file revisions, not just
+// the ROM/replay path strings. A core update must not reuse an older recording.
+fn recording_key(rom: &Path, movie: Option<&Path>, core: &Path) -> Result<String> {
+    let mut revisions = String::new();
+    for path in [Some(rom), movie, Some(core)].into_iter().flatten() {
+        let path = path.canonicalize().with_context(|| format!("finding {path:?}"))?;
+        let meta = path.metadata()?;
+        revisions.push_str(&format!("{path:?}:{}:{:?};", meta.len(), meta.modified()?));
+    }
+    Ok(hash_of(&revisions))
+}
+
 /// Run a ROM (optionally driving a TAS replay) through RetroArch, recording A/V.
 ///
 /// RetroArch does the emulation and the input playback; we only consume its
@@ -1125,19 +1178,20 @@ fn run_emulator(
     tool("retroarch")?;
     let core = core_for(rom, core)?;
     // Recording a run costs real time (the emulator plays it at 1x), so cache it per
-    // rom+replay pair; delete the file to force a fresh take.
-    let key = hash_of(&format!("{rom:?}{movie:?}"));
+    // ROM/replay/core revision; delete the file to force a fresh take.
+    let key = recording_key(rom, movie, &core)?;
     let out = work.join(format!("run-{key}.mkv"));
     if out.is_file() {
         eprintln!("[render] reusing cached recording {} (delete it to re-record)", out.display());
         return Ok(out);
     }
+    let partial = work.join(format!("run-{key}-{}.partial.mkv", std::process::id()));
     let mut args: Vec<String> = vec![
         "-L".into(),
         core.to_string_lossy().into(),
         rom.to_string_lossy().into(),
         "-r".into(),
-        out.to_string_lossy().into(),
+        partial.to_string_lossy().into(),
     ];
     if let Some(m) = movie {
         args.push("-P".into());
@@ -1151,11 +1205,14 @@ fn run_emulator(
     eprintln!("[render] a RetroArch window will open and play the run in real time…");
     let status = Command::new("retroarch").args(&args).status()?;
     if !status.success() {
+        std::fs::remove_file(&partial).ok();
         bail!("retroarch exited with {status}");
     }
-    if !out.is_file() {
-        bail!("retroarch produced no recording at {out:?}");
+    if !partial.is_file() {
+        bail!("retroarch produced no recording at {partial:?}");
     }
+    // Publish only after successful completion; failed recordings are never hits.
+    std::fs::rename(&partial, &out).context("finalising the replay recording")?;
     Ok(out)
 }
 
@@ -1172,6 +1229,8 @@ struct Emu {
     audio: Option<std::fs::File>,
     audio_frames: u64,
     last_mask: u32,
+    cache_key: String,
+    recording: Option<crate::rom_cache::Recording>,
 }
 
 /// "a + right" for a button mask, or "—" for nothing held.
@@ -1211,6 +1270,8 @@ impl Emu {
         );
 
         let inputs = InputTrack::compile(script, core.fps);
+        let cache_key = crate::rom_cache::key(rom, &core_path, &system, work, options,
+            &format!("{:?}", inputs.events))?;
         // How long to run: an explicit length wins, otherwise play out the scripted
         // run plus a couple of seconds so the last input is actually on screen.
         let total = match (script.frames, opts_duration.or(script.duration)) {
@@ -1223,7 +1284,8 @@ impl Emu {
         } else {
             None
         };
-        Ok(Emu { core, inputs, frame: 0, total, audio, audio_frames: 0, last_mask: 0 })
+        Ok(Emu { core, inputs, frame: 0, total, audio, audio_frames: 0, last_mask: 0,
+            cache_key, recording: None })
     }
 
     /// Run one emulated frame with the scripted input for it.
@@ -1243,7 +1305,16 @@ impl Emu {
             return Ok(None);
         }
         let (mask, analog) = self.inputs.advance_state(self.frame);
-        let out = self.core.run_frame_with_analog(mask, analog)?;
+        let cached = match &mut self.recording { Some(r) => r.read()?, None => None };
+        let (out, pcm) = if let Some((pixels, w, h, pcm)) = cached {
+            self.core.saw_frame = true;
+            ((pixels, w, h), pcm)
+        } else {
+            let out = self.core.run_frame_with_analog(mask, analog)?;
+            let pcm = self.core.take_audio();
+            if let Some(recording) = &mut self.recording { recording.write(&out.0, out.1, out.2, &pcm)?; }
+            (out, pcm)
+        };
         // `CRTULUM_DEBUG_INPUT=1` prints the run as it happens — every frame where the
         // held buttons change, which is what you want when a scripted run isn't doing
         // what you meant. (stderr, so it interleaves with the progress line.)
@@ -1252,13 +1323,15 @@ impl Emu {
         }
         self.last_mask = mask;
         if let Some(f) = &mut self.audio {
-            let pcm = self.core.take_audio();
             if !pcm.is_empty() {
                 self.audio_frames += (pcm.len() / 2) as u64;
                 f.write_all(bytemuck::cast_slice(&pcm)).context("writing emulator audio")?;
             }
         }
         self.frame += 1;
+        if self.frame == self.total && self.core.saw_frame {
+            if let Some(recording) = &mut self.recording { recording.finish()?; }
+        }
         Ok(Some(out))
     }
 }
@@ -1341,7 +1414,15 @@ fn has_audio_stream(path: &Path) -> bool {
 /// `normalize=0` matters: `amix` otherwise divides every input by the input count, so
 /// adding a character who says one line halfway through would quietly halve the game's
 /// volume for the whole run.
-fn mux_beds(video: &Path, beds: &[PcmBed], embedded: bool, out: &Path) -> Result<()> {
+fn audio_codec(output: &Path) -> &'static str {
+    if output.extension().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case("webm")) {
+        "libopus"
+    } else {
+        "aac"
+    }
+}
+
+fn mux_beds(video: &Path, beds: &[PcmBed], embedded: bool, start: f64, duration: f64, out: &Path) -> Result<()> {
     let mut args: Vec<String> = ["-hide_banner", "-v", "error", "-y", "-i"]
         .iter()
         .map(|s| s.to_string())
@@ -1352,6 +1433,7 @@ fn mux_beds(video: &Path, beds: &[PcmBed], embedded: bool, out: &Path) -> Result
             "-f".into(), "s16le".into(),
             "-ar".into(), bed.rate.to_string(),
             "-ac".into(), "2".into(),
+            "-ss".into(), start.to_string(),
             "-i".into(), bed.path.to_string_lossy().into(),
         ]);
     }
@@ -1362,20 +1444,18 @@ fn mux_beds(video: &Path, beds: &[PcmBed], embedded: bool, out: &Path) -> Result
     }
     labels.extend((1..=beds.len()).map(|i| format!("[{i}:a]")));
 
-    args.extend(["-map".into(), "0:v:0".into()]);
-    if labels.len() == 1 {
-        args.extend(["-map".into(), labels[0].trim_matches(['[', ']']).to_string()]);
+    // Pad short narration/game tracks with silence. -shortest used to truncate
+    // the video as soon as the last sound ended.
+    let audio_filter = if labels.len() == 1 {
+        format!("{}apad[aout]", labels[0])
     } else {
-        args.extend([
-            "-filter_complex".into(),
-            format!("{}amix=inputs={}:normalize=0[aout]", labels.concat(), labels.len()),
-            "-map".into(),
-            "[aout]".into(),
-        ]);
-    }
+        format!("{}amix=inputs={}:normalize=0,apad[aout]", labels.concat(), labels.len())
+    };
+    args.extend(["-map".into(), "0:v:0".into(), "-filter_complex".into(), audio_filter,
+        "-map".into(), "[aout]".into(), "-t".into(), duration.to_string()]);
     args.extend([
         "-c:v".into(), "copy".into(),
-        "-c:a".into(), "aac".into(),
+        "-c:a".into(), audio_codec(out).into(),
         "-b:a".into(), "192k".into(),
         "-shortest".into(),
         out.to_string_lossy().into(),
@@ -1388,14 +1468,47 @@ fn mux_beds(video: &Path, beds: &[PcmBed], embedded: bool, out: &Path) -> Result
     Ok(())
 }
 
-/// A directory of stills is fed to ffmpeg as a glob; probing it means probing the
-/// first image, and the file count gives the progress bar something to aim at.
+/// PNGs carry the picture; a floating-point WAV preserves the synchronized mix,
+/// including peaks above unity when source and character sounds overlap.
+fn write_sequence_audio(source: Option<&Path>, beds: &[PcmBed], start: f64, duration: f64, out: &Path) -> Result<()> {
+    let source = source.filter(|p| has_audio_stream(p));
+    if source.is_none() && beds.is_empty() { return Ok(()); }
+    let mut args: Vec<String> = ["-hide_banner", "-v", "error", "-nostdin", "-y"]
+        .iter().map(|s| s.to_string()).collect();
+    if let Some(source) = source {
+        args.extend(["-ss".into(), start.to_string(), "-i".into(), source.to_string_lossy().into()]);
+    }
+    for bed in beds {
+        args.extend([
+            "-f".into(), "s16le".into(), "-ar".into(), bed.rate.to_string(),
+            "-ac".into(), "2".into(), "-ss".into(), start.to_string(),
+            "-i".into(), bed.path.to_string_lossy().into(),
+        ]);
+    }
+    let count = usize::from(source.is_some()) + beds.len();
+    let labels = (0..count).map(|i| format!("[{i}:a:0]")).collect::<Vec<_>>().concat();
+    let filter = if count == 1 {
+        format!("{labels}apad[aout]")
+    } else {
+        format!("{labels}amix=inputs={count}:normalize=0,apad[aout]")
+    };
+    args.extend([
+        "-filter_complex".into(), filter, "-map".into(), "[aout]".into(),
+        "-t".into(), duration.to_string(), "-c:a".into(), "pcm_f32le".into(),
+        "-rf64".into(), "auto".into(), out.to_string_lossy().into(),
+    ]);
+    let status = Command::new("ffmpeg").args(args).status().context("writing PNG sequence audio")?;
+    if !status.success() { bail!("ffmpeg failed to write sequence audio ({status})"); }
+    Ok(())
+}
+
+/// Stills are decoded individually so mixed formats, case and sizes all work.
 fn list_images(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .with_context(|| format!("reading frame directory {dir:?}"))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
-            matches!(
+            p.is_file() && matches!(
                 p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(),
                 Some("png" | "jpg" | "jpeg" | "bmp" | "tga")
             )
@@ -1406,6 +1519,22 @@ fn list_images(dir: &Path) -> Result<Vec<PathBuf>> {
         bail!("no image frames (.png/.jpg/.bmp/.tga) found in {dir:?}");
     }
     Ok(files)
+}
+
+fn still_frame(path: &Path, size: Option<(u32, u32)>) -> Result<(Vec<u8>, u32, u32)> {
+    let mut image = image::open(path).with_context(|| format!("decoding still {path:?}"))?;
+    if let Some((width, height)) = size {
+        image = image.resize_exact(width, height, image::imageops::FilterType::CatmullRom);
+    }
+    let image = image.to_rgba8();
+    let (width, height) = image.dimensions();
+    Ok((image.into_raw(), width, height))
+}
+
+fn still_range(count: usize, start: f64, duration: Option<f64>, fps: f64) -> std::ops::Range<usize> {
+    let first = ((start * fps + 1e-7).floor() as usize).min(count);
+    let end = duration.map(|d| first.saturating_add((d * fps - 1e-7).ceil() as usize)).unwrap_or(count).min(count);
+    first..end
 }
 
 struct Decoder {
@@ -1426,12 +1555,12 @@ impl Decoder {
             }
         }
         if read == 0 {
+            let status = self.child.wait().context("waiting for the ffmpeg decoder")?;
+            if !status.success() { bail!("ffmpeg decoder exited with {status}"); }
             return Ok(false);
         }
         if read < buf.len() {
-            // A torn final frame means ffmpeg died mid-write; treat it as the end.
-            eprintln!("[render] short read ({read}/{}) — ending", buf.len());
-            return Ok(false);
+            bail!("truncated decoded frame: {read}/{} bytes", buf.len());
         }
         Ok(true)
     }
@@ -1448,7 +1577,7 @@ impl Drop for Decoder {
 // GPU resolve pass (SSAA box downsample, in linear light, on the GPU)
 // ---------------------------------------------------------------------------
 //
-// `--shot`/`--clip` do this on the CPU, which is fine for a handful of stills but
+// `--shot` does this on the CPU, which is fine for a single still but
 // costs ~100M ops per frame at 1280x960x3 — minutes per second of video. Same math,
 // done in a fragment shader: sampling an `Rgba8UnormSrgb` texture decodes to linear,
 // and writing to one re-encodes, so the average is a linear-light average.
@@ -1582,7 +1711,21 @@ fn even(v: u32) -> u32 {
     v.max(2) & !1
 }
 
+fn field_uses_current_source(field: u64, source_time: f64, first: bool) -> bool {
+    first || field as f64 / crate::FIELD_HZ + 1e-7 >= source_time
+}
+
 pub fn render(opts: Opts) -> Result<()> {
+    let png_sequence = opts.codec == "png";
+    if !opts.fps.is_finite() || opts.fps < 0.0 { bail!("fps must be finite and positive (0 selects source rate)"); }
+    if opts.size.0 == 0 || opts.size.1 == 0 || opts.ssaa == 0 { bail!("size and ssaa must be nonzero"); }
+    if !opts.start.is_finite() || opts.start < 0.0 || opts.duration.is_some_and(|d| !d.is_finite() || d <= 0.0) {
+        bail!("start must be nonnegative and duration must be positive and finite");
+    }
+    if opts.source_size.is_some_and(|(_, h)| h == 0) { bail!("signal must have at least one line"); }
+    if !matches!(opts.codec.as_str(), "x264" | "h264" | "x265" | "hevc" | "vp9" | "ffv1" | "png") {
+        bail!("unknown codec `{}` (x264, x265, vp9, ffv1, png)", opts.codec);
+    }
     tool("ffmpeg")?;
     let work = work_dir(&opts.output)?;
 
@@ -1617,7 +1760,7 @@ pub fn render(opts: Opts) -> Result<()> {
                     rom,
                     core.as_deref(),
                     &opts.script,
-                    opts.duration,
+                    opts.duration.map(|d| opts.start + d),
                     &work,
                     want_audio_in,
                     &opts.core_options,
@@ -1681,17 +1824,19 @@ pub fn render(opts: Opts) -> Result<()> {
         }
         (None, Some((0, h))) => {
             let aspect = if src.height > 0 { src.width as f32 / src.height as f32 } else { 4.0 / 3.0 };
-            (even((h as f32 * aspect).round() as u32), even(h))
+            (((h as f32 * aspect).round() as u32).max(1), h)
         }
-        (None, Some((w, h))) => (even(w), even(h)),
+        (None, Some((w, h))) => (w, h),
+        (None, None) if glob => (src.width.max(1), src.height.max(1)),
         (None, None) if src.height > 576 => {
             let aspect = src.width as f32 / src.height.max(1) as f32;
-            (even((480.0 * aspect).round() as u32), 480)
+            (((480.0 * aspect).round() as u32).max(1), 480)
         }
-        (None, None) => (even(src.width.max(2)), even(src.height.max(2))),
+        (None, None) => (src.width.max(1), src.height.max(1)),
     };
 
-    let (ow, oh) = (even(opts.size.0), even(opts.size.1));
+    // PNG has no chroma-subsampling alignment requirement; preserve exact sizes.
+    let (ow, oh) = if png_sequence { opts.size } else { (even(opts.size.0), even(opts.size.1)) };
     let ss = opts.ssaa.clamp(1, 4);
     let (rw, rh) = (ow * ss, oh * ss);
 
@@ -1738,9 +1883,28 @@ pub fn render(opts: Opts) -> Result<()> {
         }
     }
 
+    let mut first_emu_frame = 0;
+    if let Some(e) = &mut emu {
+        first_emu_frame = (opts.start * fps).round() as u64;
+        if first_emu_frame >= e.total { bail!("start is past the end of the ROM run"); }
+        if let Some(d) = opts.duration {
+            e.total = e.total.min(first_emu_frame + (d * fps).round() as u64);
+        }
+        e.recording = Some(crate::rom_cache::Recording::open(&work, &e.cache_key, e.total)?);
+        for _ in 0..first_emu_frame { e.next()?; }
+    }
+
+    if let Some(a) = &mut agent {
+        // Advance the animation RNG and audio on the same frame sequence as an
+        // untrimmed run, rather than jumping straight to the seek timestamp.
+        for n in 0..(opts.start * fps).round() as u64 {
+            a.step(n as f32 / fps as f32, 1.0 / fps as f32);
+        }
+    }
+    let mut still_indices = still_range(stills.as_ref().map_or(0, Vec::len), opts.start, opts.duration, fps);
     let est_frames = match (&emu, &stills) {
-        (Some(e), _) => Some(e.total),
-        (None, Some(files)) => Some(files.len() as u64),
+        (Some(e), _) => Some(e.total - first_emu_frame),
+        (None, Some(_)) => Some(still_indices.len() as u64),
         (None, None) => opts
             .duration
             .or_else(|| src.duration.map(|d| (d - opts.start).max(0.0)))
@@ -1805,7 +1969,7 @@ pub fn render(opts: Opts) -> Result<()> {
     // The character's voice and sound effects land on their own bed, mixed in at the
     // end alongside whatever the picture came with.
     let agent_audio = agent.is_some() && opts.audio;
-    let video_target = if emu_audio.is_some() || agent_audio {
+    let video_target = if !png_sequence && (emu_audio.is_some() || agent_audio) {
         work.join(format!(
             "video-only.{}",
             opts.output.extension().and_then(|e| e.to_str()).unwrap_or("mkv")
@@ -1813,7 +1977,7 @@ pub fn render(opts: Opts) -> Result<()> {
     } else {
         opts.output.clone()
     };
-    if want_audio {
+    if want_audio && !png_sequence {
         if opts.start > 0.0 {
             enc_args.extend(["-ss".into(), format!("{:.4}", opts.start)]);
         }
@@ -1828,9 +1992,10 @@ pub fn render(opts: Opts) -> Result<()> {
             "-map".into(),
             "1:a:0?".into(), // '?' = fine if the source has no audio
             "-c:a".into(),
-            "aac".into(),
+            audio_codec(&opts.output).into(),
             "-b:a".into(),
             "192k".into(),
+            "-af".into(), "apad".into(),
             "-shortest".into(),
         ]);
     } else {
@@ -1838,6 +2003,10 @@ pub fn render(opts: Opts) -> Result<()> {
     }
     let crf = opts.crf.to_string();
     match opts.codec.as_str() {
+        "png" => enc_args.extend([
+            "-c:v".into(), "png".into(), "-pix_fmt".into(), "rgba".into(),
+            "-f".into(), "image2".into(), "-start_number".into(), "1".into(),
+        ]),
         "x265" | "hevc" => enc_args.extend([
             "-c:v".into(), "libx265".into(), "-crf".into(), crf,
             "-preset".into(), "medium".into(), "-pix_fmt".into(), "yuv420p".into(),
@@ -1855,15 +2024,26 @@ pub fn render(opts: Opts) -> Result<()> {
             "-preset".into(), "slow".into(), "-pix_fmt".into(), "yuv420p".into(),
         ]),
     }
-    enc_args.extend([
-        "-color_primaries".into(), "bt709".into(),
-        "-color_trc".into(), "bt709".into(),
-        "-colorspace".into(), "bt709".into(),
-    ]);
-    if opts.output.extension().and_then(|s| s.to_str()) == Some("mp4") {
-        enc_args.extend(["-movflags".into(), "+faststart".into()]);
+    // GPU readback is sRGB-encoded RGB. Explicitly select the YUV matrix rather
+    // than letting ffmpeg use SD BT.601 and then mislabeling it as BT.709.
+    if !png_sequence {
+        enc_args.extend([
+            "-vf".into(), "scale=out_color_matrix=bt709:out_range=tv,setparams=range=limited:color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709".into(),
+            "-color_range".into(), "tv".into(),
+            "-color_primaries".into(), "bt709".into(),
+            "-color_trc".into(), "iec61966-2-1".into(),
+            "-colorspace".into(), "bt709".into(),
+        ]);
+        if opts.output.extension().and_then(|s| s.to_str()) == Some("mp4") {
+            enc_args.extend(["-movflags".into(), "+faststart".into()]);
+        }
     }
-    enc_args.push(video_target.to_string_lossy().into());
+    if png_sequence {
+        if !opts.dry_run { std::fs::create_dir_all(&opts.output).context("creating PNG output directory")?; }
+        enc_args.push(opts.output.join("f_%04d.png").to_string_lossy().into());
+    } else {
+        enc_args.push(video_target.to_string_lossy().into());
+    }
 
     match &emu {
         Some(e) => eprintln!(
@@ -1878,7 +2058,9 @@ pub fn render(opts: Opts) -> Result<()> {
     eprintln!("[render] tube    {} · {} script event(s), {:.1}s of choreography",
         timeline.preset0.name, opts.script.events.len(), timeline.end);
     if opts.dry_run {
-        if emu.is_none() {
+        if stills.is_some() {
+            println!("(still images decoded in sorted order)");
+        } else if emu.is_none() {
             println!("ffmpeg {}", dec_args.join(" "));
         } else {
             println!("(no decoder: frames come straight from the libretro core)");
@@ -1888,27 +2070,20 @@ pub fn render(opts: Opts) -> Result<()> {
     }
 
     // --- 4. GPU setup ----------------------------------------------------------
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
-    });
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }))
-    .ok_or_else(|| anyhow!("no GPU adapter"))?;
+    let instance = crate::gpu::instance();
+    let adapter = crate::gpu::adapter(&instance, None)?;
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("render-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits: crate::gpu::limits(&adapter),
         },
         None,
     ))?;
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut res = build_resources(&device, &queue, format, timeline.preset0);
+    res.shutter_fraction = opts.shutter;
     let mut cur_preset = timeline.preset0;
 
     let make_target = |w: u32, h: u32, label: &str, extra: wgpu::TextureUsages| {
@@ -1939,7 +2114,7 @@ pub fn render(opts: Opts) -> Result<()> {
     });
 
     // --- 5. Spawn ffmpeg -------------------------------------------------------
-    let mut decoder = if emu.is_some() {
+    let mut decoder = if emu.is_some() || stills.is_some() {
         None
     } else {
         let mut dec_child = Command::new("ffmpeg")
@@ -1970,16 +2145,15 @@ pub fn render(opts: Opts) -> Result<()> {
     );
 
     // --- 6. The frame loop -----------------------------------------------------
-    // The tube runs at 60 fields/sec no matter the output rate, so each output frame
-    // may consume several accumulation steps: a 30 fps export scans every frame twice,
-    // which is what a real set does — and what makes 480i twitter at the right rate.
-    let fields_per_frame = ((60.0 / fps).round() as u32).max(1);
-    let field_dt = 1.0 / 60.0f32;
+    // Advance exact NTSC fields on a separate clock; never round fields per frame.
+    let mut field_clock = crate::FieldClock {
+        next: (opts.start * crate::FIELD_HZ).floor() as u64,
+    };
+    let field_dt = (1.0 / crate::FIELD_HZ) as f32;
 
     let mut src_buf = vec![0u8; (sw * sh * 4) as usize];
     let mut row = vec![0u8; (ow * 4) as usize];
     let mut frame_idx: u64 = 0;
-    let mut field_parity = 0.0f32;
     let mut src_dim;
     let mut last_dim = (0u32, 0u32);
     let wall = std::time::Instant::now();
@@ -2008,9 +2182,16 @@ pub fn render(opts: Opts) -> Result<()> {
                 }
                 None => break None,
             },
-            (None, None) => break None,
+            (None, None) => {
+                let Some(index) = still_indices.next() else { break None; };
+                let size = opts.source_size.map(|_| (sw, sh));
+                let (pixels, width, height) = still_frame(&stills.as_ref().unwrap()[index], size)?;
+                src_buf = pixels;
+                src_dim = (width, height);
+            },
         }
-        let t = opts.start as f32 + frame_idx as f32 / fps as f32;
+        let source_time = opts.start + frame_idx as f64 / fps;
+        let t = source_time as f32;
         let shot = timeline.eval(t);
 
         if shot.preset.name != cur_preset.name {
@@ -2029,25 +2210,45 @@ pub fn render(opts: Opts) -> Result<()> {
             a.draw(&mut src_buf, src_dim.0, src_dim.1);
         }
 
-        res.set_source(&device, &queue, src_dim.0, src_dim.1, format, &src_buf);
+        let mut source_uploaded = false;
 
         // Black-frame insertion blanks the emitted phosphor on alternate frames; only
         // meaningful for a high-rate export, so it's off unless the script asks.
         let bfi_mul = if shot.bfi && frame_idx % 2 == 1 { 0.0 } else { 1.0 };
 
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("render-enc"),
-        });
-        for f in 0..fields_per_frame {
-            let ft = t + f as f32 * field_dt;
+        res.exposure_group = frame_idx as u32 % 16_000_000 + 1;
+        for field in field_clock.through(source_time) {
+            // Historical fields see the preceding held source, never a frame from
+            // their future. Upload the new frame only when its timestamp is reached.
+            if !source_uploaded && field_uses_current_source(field, source_time, frame_idx == 0) {
+                res.set_source(&device, &queue, src_dim.0, src_dim.1, format, &src_buf);
+                source_uploaded = true;
+            }
+            let ft = (field as f64 / crate::FIELD_HZ) as f32;
+            let field_shot = timeline.eval(ft);
+            if field_shot.preset.name != cur_preset.name {
+                set_preset_res(&device, &mut res, &field_shot.preset);
+                cur_preset = field_shot.preset;
+            }
             write_uniforms(
-                &queue, &res, &shot.orbit, ow as f32 / oh as f32, ft, &cur_preset, ss as f32,
-                false, field_dt, shot.pwr, shot.interlace, field_parity, shot.exposure,
-                shot.subpixel, bfi_mul, true, true,
+                &queue, &res, &field_shot.orbit, ow as f32 / oh as f32, ft,
+                &cur_preset, ss as f32, false, field_dt, field_shot.pwr,
+                field_shot.interlace, (field % 4) as f32, field_shot.exposure,
+                field_shot.subpixel, bfi_mul, true, true,
             );
+            let mut enc = device.create_command_encoder(&Default::default());
             accum_step(&mut enc, &mut res);
-            field_parity = 1.0 - field_parity;
+            queue.submit(Some(enc.finish()));
         }
+        if shot.preset.name != cur_preset.name {
+            set_preset_res(&device, &mut res, &shot.preset);
+            cur_preset = shot.preset;
+        }
+        write_uniforms(&queue, &res, &shot.orbit, ow as f32 / oh as f32, t,
+            &cur_preset, ss as f32, false, 0.0, shot.pwr, shot.interlace,
+            (field_clock.next.saturating_sub(1) % 4) as f32, shot.exposure,
+            shot.subpixel, bfi_mul, true, true);
+        let mut enc = device.create_command_encoder(&Default::default());
         draw_tube(&mut enc, &res, &hires_view, &depth_view);
         resolve.run(&mut enc, &out_view);
         enc.copy_texture_to_buffer(
@@ -2090,6 +2291,9 @@ pub fn render(opts: Opts) -> Result<()> {
             break Some(e);
         }
 
+        if !source_uploaded {
+            res.set_source(&device, &queue, src_dim.0, src_dim.1, format, &src_buf);
+        }
         frame_idx += 1;
         if frame_idx % 30 == 0 || Some(frame_idx) == est_frames {
             let secs = wall.elapsed().as_secs_f64();
@@ -2145,14 +2349,24 @@ pub fn render(opts: Opts) -> Result<()> {
             beds.push(PcmBed { path, rate: crate::agent::AUDIO_RATE });
         }
     }
-    if video_target != opts.output {
+    if png_sequence {
+        if opts.audio {
+            write_sequence_audio(
+                want_audio.then_some(media.as_path()), &beds, opts.start,
+                frame_idx as f64 / fps, &opts.output.join("audio.wav"),
+            )?;
+        }
+        for bed in &beds {
+            std::fs::remove_file(&bed.path).ok();
+        }
+    } else if video_target != opts.output {
         if beds.is_empty() {
             std::fs::rename(&video_target, &opts.output).context("moving the finished video")?;
         } else {
             // `want_audio` put the source's own track into the scratch file already; it
             // joins the mix rather than being replaced by it.
             let embedded = want_audio && has_audio_stream(&video_target);
-            mux_beds(&video_target, &beds, embedded, &opts.output)?;
+            mux_beds(&video_target, &beds, embedded, opts.start, frame_idx as f64 / fps, &opts.output)?;
             std::fs::remove_file(&video_target).ok();
         }
         for bed in &beds {
@@ -2177,7 +2391,10 @@ crtulum --render [INPUT] [OUTPUT] [options]
 
   INPUT     a video file · a URL (yt-dlp) · a directory of stills
             (or --rom to run a ROM through a libretro core, scripted)
-  OUTPUT    .mp4 · .mkv · .webm  (default crtulum_out.mp4)
+  OUTPUT    .mp4 · .mkv · .webm; directory with --codec png (default crtulum_out.mp4)
+
+  crtulum --clip INPUT_DIR OUTPUT_DIR [WxH] [options]
+            PNG sequence via the same renderer; defaults to 60000/1001 fps
 
 Options:
   --script FILE      timeline script — camera moves, preset swaps, power, degauss,
@@ -2187,15 +2404,16 @@ Options:
   --size WxH         output size            (default 1280x960)
   --fps N            output frame rate      (default: the source's)
   --ssaa N           supersampling 1-4      (default 3; use 1 for a fast preview)
+  --shutter N        field exposure fraction, 0.000001 <= N <= 1 (default 1)
   --source-size WxH  signal resolution fed to the tube
   --lines N          …or just its line count, width from the source aspect
   --start S          seek into the source
   --duration S       how much to render
-  --codec NAME       x264 (default) · x265 · vp9 · ffv1
+  --codec NAME       x264 (default) · x265 · vp9 · ffv1 · png
   --crf N            quality, lower is better (default 18)
   --no-audio         drop the source audio
   --rom FILE         ROM to run, driven by the script's input timeline
-                     (frame-exact, headless, faster than real time)
+                     (frame-exact, headless, no real-time pacing limit)
   --movie FILE       instead, play a pre-authored replay/TAS through RetroArch
   --core NAME        libretro core (guessed from the ROM extension otherwise)
   --option K=V       libretro core option, repeatable (e.g. for a software renderer)
@@ -2207,8 +2425,56 @@ Options:
   crtulum --fetch-agent NAME   download a character's assets first
 ";
 
+// Preserve the clip diagnostic sampling control as a source/output interval.
+// Decay still advances on the common field clock, never on an unrelated fake dt.
+fn clip_default_fps(interval: Option<&str>) -> Result<f64> {
+    match interval {
+        None => Ok(crate::FIELD_HZ),
+        Some(value) => {
+            let dt: f64 = value.parse().context("invalid CRTULUM_DT")?;
+            if !dt.is_finite() || dt <= 0.0 || !(1.0 / dt).is_finite() {
+                bail!("CRTULUM_DT must be positive and finite");
+            }
+            Ok(1.0 / dt)
+        }
+    }
+}
+
 /// Parse the `--render …` tail of the command line.
 pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
+    // --clip is a PNG-output spelling of the same export command, not a renderer.
+    if let Some(i) = args.iter().position(|a| a == "--clip") {
+        let input = args.get(i + 1).filter(|s| !s.starts_with('-')).ok_or_else(|| anyhow!("--clip needs input and output directories"))?;
+        let output = args.get(i + 2).filter(|s| !s.starts_with('-')).ok_or_else(|| anyhow!("--clip needs an output directory"))?;
+        let mut translated = vec![args[0].clone(), "--render".into(), input.clone(), output.clone(),
+            "--codec".into(), "png".into()];
+        translated.extend_from_slice(&args[1..i]);
+        let mut tail = i + 3;
+        if let Some(size) = args.get(tail).filter(|s| !s.starts_with('-')) {
+            parse_size(size)?;
+            translated.extend(["--size".into(), size.clone()]);
+            tail += 1;
+        }
+        translated.extend_from_slice(&args[tail..]);
+        let mut opts = opts_from_args(&translated, default_preset)?;
+        opts.codec = "png".into();
+        if !translated.iter().any(|a| a == "--fps") && opts.script.fps.is_none() {
+            opts.fps = clip_default_fps(std::env::var("CRTULUM_DT").ok().as_deref())?;
+        }
+        if !translated.iter().any(|a| a == "--size") && opts.script.size.is_none() {
+            opts.size = (1000, 800);
+        }
+        for (key, slot) in [("CRTULUM_YAW", &mut opts.script.yaw), ("CRTULUM_PITCH", &mut opts.script.pitch),
+            ("CRTULUM_DIST", &mut opts.script.dist), ("CRTULUM_EXPOSURE", &mut opts.script.exposure)] {
+            if let Ok(value) = std::env::var(key) {
+                let value: f32 = value.parse().with_context(|| format!("invalid {key}"))?;
+                if !value.is_finite() { bail!("{key} must be finite"); }
+                *slot = Some(value);
+            }
+        }
+        return Ok(opts);
+    }
+
     let start_at = args
         .iter()
         .position(|a| a == "--render")
@@ -2216,8 +2482,10 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
     let tail = &args[start_at + 1..];
 
     let mut positionals: Vec<String> = Vec::new();
+    let mut output_override = None;
     let (mut script_path, mut rom, mut movie, mut core) = (None, None, None, None);
     let (mut size, mut fps, mut ssaa, mut source_size) = (None, None, None, None);
+    let mut shutter = 1.0_f32;
     let (mut start, mut duration, mut crf, mut codec) = (None, None, None, None);
     let (mut audio, mut dry_run, mut preset_arg) = (true, false, None);
     let mut agent = None;
@@ -2240,6 +2508,12 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
             "--size" => size = Some(parse_size(&val()?)?),
             "--fps" => fps = Some(val()?.parse()?),
             "--ssaa" => ssaa = Some(val()?.parse()?),
+            "--shutter" => {
+                shutter = val()?.parse()?;
+                if !shutter.is_finite() || shutter < 0.000001 || shutter > 1.0 {
+                    bail!("shutter must be between 0.000001 and 1");
+                }
+            }
             "--source-size" => source_size = Some(parse_size(&val()?)?),
             "--lines" => source_size = Some((0, val()?.parse()?)),
             "--start" | "--ss" => start = Some(parse_time(&val()?)? as f64),
@@ -2256,7 +2530,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
             "--agent" | "--character" => agent = Some(val()?),
             "--no-audio" | "-an" => audio = false,
             "--dry-run" => dry_run = true,
-            "-o" | "--out" => positionals.insert(0, val()?),
+            "-o" | "--out" => output_override = Some(val()?),
             // `--preset` is consumed by main() but appears in the same tail.
             "--preset" => preset_arg = Some(val()?),
             other if other.starts_with('-') => bail!("unknown --render option `{other}`\n\n{USAGE}"),
@@ -2264,9 +2538,8 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
         }
         i += 1;
     }
-    let _ = preset_arg;
 
-    let script = match &script_path {
+    let mut script = match &script_path {
         Some(p) => {
             let text = std::fs::read_to_string(p).with_context(|| format!("reading script {p}"))?;
             parse_script(&text).with_context(|| format!("in script {p}"))?
@@ -2274,17 +2547,27 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
         None => Script::default(),
     };
 
+    if let Some(name) = preset_arg {
+        script.preset = Some(preset_named(&name)?.name);
+    }
+
     // A script can name its own ROM/source, so `--render out.mp4 --script run.crts`
     // is a complete command line.
     let rom = rom.or_else(|| script.rom.as_deref().map(PathBuf::from));
     let core = core.or_else(|| script.core.clone());
 
-    // With a ROM (or a script that names its own source), the first positional is the
-    // output; otherwise it's the input.
-    let have_source = rom.is_some() || script.source.is_some();
-    let (input_arg, output_arg) = if have_source {
+    // Two positionals explicitly override a script's media source. A ROM source
+    // still takes just the output; changing systems is explicit through --rom.
+    let (input_arg, output_arg) = if let Some(output) = output_override {
+        if positionals.len() > usize::from(rom.is_none()) { bail!("unexpected positional path with --out"); }
+        (positionals.first().cloned(), Some(output))
+    } else if rom.is_some() {
+        if positionals.len() > 1 { bail!("a ROM export takes one output path"); }
+        (None, positionals.first().cloned())
+    } else if script.source.is_some() && positionals.len() <= 1 {
         (None, positionals.first().cloned())
     } else {
+        if positionals.len() > 2 { bail!("expected input and output paths"); }
         (positionals.first().cloned(), positionals.get(1).cloned())
     };
 
@@ -2317,6 +2600,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
         size: size.or(script.size).unwrap_or((1280, 960)),
         fps: fps.or(script.fps).unwrap_or(0.0),
         ssaa: ssaa.or(script.ssaa).unwrap_or(3),
+        shutter,
         source_size: source_size.or(script.source_size),
         start: start.or(script.start).unwrap_or(0.0),
         duration: duration.or(script.duration),
@@ -2334,7 +2618,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
 }
 
 impl Opts {
-    /// `--preset` on the command line seeds the timeline unless the script sets one.
+    /// Supply the default after explicit CLI/script choices have been resolved.
     fn with_default_preset(mut self, preset: Preset) -> Opts {
         if self.script.preset.is_none() {
             self.script.preset = Some(preset.name);
@@ -2346,6 +2630,177 @@ impl Opts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequence_audio_preserves_mix_peaks_seek_and_padding() {
+        // Two full-volume beds must not be normalized or clipped. Discard a
+        // distinctive prefix through --start, then pad beyond both beds' ends.
+        let dir = std::env::temp_dir().join(format!("crtulum-audio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut pcm = Vec::new();
+        for frame in 0..960 {
+            let value = if frame < 480 { -16000_i16 } else { 24000_i16 };
+            for _ in 0..2 { pcm.extend_from_slice(&value.to_le_bytes()); }
+        }
+        let bed = dir.join("bed.raw");
+        std::fs::write(&bed, pcm).unwrap();
+        let out = dir.join("audio.wav");
+        write_sequence_audio(None, &[
+            PcmBed { path: bed.clone(), rate: 48000 },
+            PcmBed { path: bed, rate: 48000 },
+        ], 0.01, 0.02, &out).unwrap();
+        let decoded = Command::new("ffmpeg").args(["-v", "error", "-i"])
+            .arg(&out).args(["-f", "f32le", "pipe:1"]).output().unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 960 * 2 * 4);
+        for (sample, bytes) in decoded.stdout.chunks_exact(4).enumerate() {
+            let value = f32::from_le_bytes(bytes.try_into().unwrap());
+            let expected = if sample < 480 * 2 { 48000.0 / 32768.0 } else { 0.0 };
+            assert!((value - expected).abs() < 1e-6, "sample {sample}: {value} vs {expected}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clip_sampling_interval_preserves_real_elapsed_time() {
+        assert_eq!(clip_default_fps(None).unwrap(), crate::FIELD_HZ);
+        assert_eq!(clip_default_fps(Some("0.01")).unwrap(), 100.0);
+        for bad in ["0", "-1", "NaN", "inf", "oops"] {
+            assert!(clip_default_fps(Some(bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn clip_uses_shared_export_options() {
+        let args = ["crtulum", "--preset", "green", "--clip", "frames", "out", "320x240",
+            "--fps", "24", "--ssaa", "1", "--shutter", "0.25"].map(str::to_string);
+        let opts = opts_from_args(&args, TRINITRON).unwrap();
+        assert!(matches!(opts.input, Input::Media(ref p) if p == Path::new("frames")));
+        assert_eq!(opts.output, Path::new("out"));
+        assert_eq!(opts.codec, "png");
+        assert_eq!(opts.size, (320, 240));
+        assert_eq!(opts.fps, 24.0);
+        assert_eq!(opts.ssaa, 1);
+        assert_eq!(opts.shutter, 0.25);
+        assert_eq!(opts.script.preset, Some("green"));
+        assert!(opts.audio);
+        let args = ["crtulum", "--clip", "frames", "out"].map(str::to_string);
+        assert_eq!(opts_from_args(&args, TRINITRON).unwrap().fps, crate::FIELD_HZ);
+        let args = ["crtulum", "--clip", "frames"].map(str::to_string);
+        assert!(opts_from_args(&args, TRINITRON).is_err());
+    }
+
+    #[test]
+    fn native_stills_preserve_odd_dimensions_and_pixel_values() {
+        let path = std::env::temp_dir().join(format!("crt-native-still-{}.png", std::process::id()));
+        let img = image::RgbaImage::from_fn(3, 601, |x, y| image::Rgba([x as u8 * 100, (y % 256) as u8, 0, 255]));
+        img.save(&path).unwrap();
+        let (pixels, w, h) = still_frame(&path, None).unwrap();
+        assert_eq!((w, h), (3, 601));
+        assert_eq!(pixels, img.into_raw());
+        let (_, w, h) = still_frame(&path, Some((4, 240))).unwrap();
+        assert_eq!((w, h), (4, 240));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clip_defaults_do_not_override_script_settings() {
+        let path = std::env::temp_dir().join(format!("crt-clip-script-{}.crts", std::process::id()));
+        std::fs::write(&path, "fps 24\nsize 161x121\n").unwrap();
+        let args = vec!["crtulum".into(), "--clip".into(), "in".into(), "out".into(), "--script".into(), path.to_string_lossy().into_owned()];
+        let opts = opts_from_args(&args, TRINITRON).unwrap();
+        assert_eq!(opts.fps, 24.0);
+        assert_eq!(opts.size, (161, 121));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn replay_cache_tracks_core_and_source_revisions() {
+        let dir = std::env::temp_dir().join(format!("crt-cache-test-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&dir).unwrap();
+        let rom = dir.join("game.nes");
+        let core = dir.join("core.so");
+        let other_core = dir.join("other.so");
+        for path in [&rom, &core, &other_core] { std::fs::write(path, b"original").unwrap(); }
+        let before = recording_key(&rom, None, &core).unwrap();
+        assert_eq!(before, recording_key(&rom, None, &core).unwrap());
+        assert_ne!(before, recording_key(&rom, None, &other_core).unwrap());
+        std::fs::write(&rom, b"changed content").unwrap();
+        assert_ne!(before, recording_key(&rom, None, &core).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn decoder_reports_failure_and_truncated_frames() {
+        for (command, first_frame) in [("printf abcd; exit 1", true), ("printf abc; exit 0", false)] {
+            let mut child = Command::new("sh").args(["-c", command]).stdout(Stdio::piped()).spawn().unwrap();
+            let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut decoder = Decoder { child, stdout, frame_bytes: 4 };
+            let mut pixels = [0; 4];
+            if first_frame { assert!(decoder.next_frame(&mut pixels).unwrap()); }
+            assert!(decoder.next_frame(&mut pixels).is_err());
+        }
+    }
+
+    #[test]
+    fn fields_never_scan_a_source_from_the_future() {
+        assert!(field_uses_current_source(0, 0.0, true));
+        assert!(!field_uses_current_source(1, 1.0 / 30.0, false));
+        assert!(!field_uses_current_source(2, 1.0 / 24.0, false));
+        assert!(field_uses_current_source(2, 2.0 / crate::FIELD_HZ, false));
+    }
+
+    #[test]
+    fn timeline_resolves_core_rate_and_interrupts_moves_continuously() {
+        let script = parse_script("camera yaw=0\nat 0 camera to yaw=1 over 10 linear\nat 5 camera to yaw=0 over 5 linear").unwrap();
+        let tl = Timeline::compile(&script, TRINITRON, 60.0);
+        assert!((tl.eval(5.0).orbit.yaw - 0.5).abs() < 1e-6);
+        assert!((tl.eval(7.5).orbit.yaw - 0.25).abs() < 1e-6);
+        let script = parse_script("frame 60 preset rca\nat 1.5 preset pvm").unwrap();
+        let tl = Timeline::compile(&script, TRINITRON, 30.0);
+        assert_eq!(tl.eval(2.1).preset.name, "rca");
+    }
+
+    #[test]
+    fn output_flag_keeps_the_input_in_place() {
+        let args = ["crtulum", "--render", "input.mp4", "-o", "output.webm", "--preset", "rca"]
+            .map(str::to_string);
+        let opts = opts_from_args(&args, TRINITRON).unwrap();
+        assert!(matches!(opts.input, Input::Media(ref p) if p == Path::new("input.mp4")));
+        assert_eq!(opts.output, Path::new("output.webm"));
+        assert_eq!(opts.script.preset, Some("rca"));
+        assert_eq!(audio_codec(&opts.output), "libopus");
+    }
+
+    #[test]
+    fn still_seek_and_duration_select_exact_frames() {
+        assert_eq!(still_range(10, 0.2, Some(0.3), 10.0), 2..5);
+        assert_eq!(still_range(10, 2.0, None, 10.0), 10..10);
+        assert_eq!(still_range(10, 0.0, Some(0.01), 10.0), 0..1);
+    }
+
+    #[test]
+    fn malformed_scripts_report_the_line() {
+        for bad in ["at 0 degauss typo", "preset pvm extra", "source", "at NaN power on",
+                    "duration -1", "at 0 agent say \"unclosed", "size 0x480", "fps NaN", "at 0 agent show typo",
+                    "at 0 camera yaw=NaN", "at 0 press a for -1", "at 0 hold a for 5 frames", "at 0 exposure NaN", "at 0 spin inf",
+                    "at 0 agent at NaN,0.5", "at 0 press a for 1.5 frames",
+                    "at 0 stick 0,1 typo", "at 0 center stick typo", "option a b typo", "option =x", "option x="] {
+            let error = parse_script(&format!("# heading\n{bad}")).err().expect(bad);
+            assert!(format!("{error:#}").contains("line 2"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn degauss_clears_residual_purity_after_the_burst() {
+        let script = parse_script("at 1 degauss").unwrap();
+        let timeline = Timeline::compile(&script, crate::TRINITRON, 60.0);
+        assert_eq!(timeline.eval(0.0).pwr[3], 0.0);
+        assert_eq!(timeline.eval(1.1).pwr[3], 0.0);
+        assert_eq!(timeline.eval(4.0).pwr[3], 1.0);
+        assert_eq!(timeline.eval(40.0).pwr[3], 1.0);
+    }
 
     #[test]
     fn parses_times() {

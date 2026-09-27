@@ -5,6 +5,11 @@ edition = "2021"
 description = "A manipulable 3D CRT tube renderer (M1: static test-pattern source)"
 license-file = "LICENSE"
 
+[features]
+# Explicit build-time exception for headless checks on GitHub-hosted CPU runners.
+# Normal builds still require a physical Vulkan GPU; there is no runtime override.
+ci-software-vulkan = []
+
 [dependencies]
 winit = "0.29"
 wgpu = "0.20"
@@ -15,7 +20,7 @@ env_logger = "0.11"
 log = "0.4"
 
 # Offscreen PNG capture for headless verification (`--shot out.png`).
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
 
 # M2: live source capture via the ScreenCast portal + PipeWire (the OBS path).
 # async-io (not the default tokio) so a plain pollster::block_on drives the portal.

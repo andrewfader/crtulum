@@ -308,6 +308,7 @@ impl SwapchainImageSemaphores {
 }
 
 struct Swapchain {
+    color_space: vk::ColorSpaceKHR,
     raw: vk::SwapchainKHR,
     raw_flags: vk::SwapchainCreateFlagsKHR,
     functor: khr::Swapchain,
@@ -343,6 +344,14 @@ pub struct Surface {
     functor: khr::Surface,
     instance: Arc<InstanceShared>,
     swapchain: RwLock<Option<Swapchain>>,
+}
+
+impl Surface {
+    /// Color space of the configured swapchain (crtulum's HDR output contract).
+    /// Float texture format alone does not distinguish scRGB from BT.2020.
+    pub fn configured_color_space(&self) -> Option<vk::ColorSpaceKHR> {
+        self.swapchain.read().as_ref().map(|swapchain| swapchain.color_space)
+    }
 }
 
 #[derive(Debug)]

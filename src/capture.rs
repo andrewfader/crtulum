@@ -73,6 +73,22 @@ async fn portal() -> anyhow::Result<(OwnedFd, u32)> {
     Ok((fd, node_id))
 }
 
+// SPA chunk offsets need not be zero, and the last row need not include padding.
+// Invalid/inaccessible chunks are dropped before touching or allocating frame data.
+fn pack_frame(src: &[u8], offset: usize, size: usize, stride: i32, width: u32, height: u32) -> Option<Vec<u8>> {
+    let row = (width as usize).checked_mul(4)?;
+    let stride = usize::try_from(stride).ok()?;
+    if row == 0 || height == 0 || stride < row { return None; }
+    let required = (height as usize - 1).checked_mul(stride)?.checked_add(row)?;
+    if required > size { return None; }
+    let source = src.get(offset..offset.checked_add(required)?)?;
+    let mut packed = vec![0; row.checked_mul(height as usize)?];
+    for (y, dst) in packed.chunks_exact_mut(row).enumerate() {
+        dst.copy_from_slice(&source[y * stride..y * stride + row]);
+    }
+    Some(packed)
+}
+
 // User data threaded through the PipeWire stream callbacks.
 struct UserData {
     width: u32,
@@ -150,25 +166,10 @@ fn pipewire_loop(fd: OwnedFd, node_id: u32, shared: SharedFrame) -> anyhow::Resu
             let Some(d) = datas.first_mut() else {
                 return;
             };
-            let stride = d.chunk().stride().max(0) as usize;
-            let (w, h) = (ud.width as usize, ud.height as usize);
-            if w == 0 || h == 0 {
-                return;
-            }
-            let row_bytes = w * 4;
-            let Some(src) = d.data() else {
-                return;
-            };
-            if stride < row_bytes || src.len() < stride * h {
-                return;
-            }
-            // repack, stripping any row padding
-            let mut packed = vec![0u8; row_bytes * h];
-            for y in 0..h {
-                let s = y * stride;
-                packed[y * row_bytes..(y + 1) * row_bytes]
-                    .copy_from_slice(&src[s..s + row_bytes]);
-            }
+            let (offset, size, stride) = (d.chunk().offset() as usize,
+                d.chunk().size() as usize, d.chunk().stride());
+            let Some(src) = d.data() else { return; };
+            let Some(packed) = pack_frame(src, offset, size, stride, ud.width, ud.height) else { return; };
             ud.seq += 1;
             let frame = Frame {
                 width: ud.width,
@@ -257,4 +258,18 @@ fn pipewire_loop(fd: OwnedFd, node_id: u32, shared: SharedFrame) -> anyhow::Resu
 
     mainloop.run();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn capture_honors_offset_padding_and_chunk_bounds() {
+        let src = [99, 99, 1, 2, 3, 4, 88, 88, 5, 6, 7, 8];
+        assert_eq!(pack_frame(&src, 2, 10, 6, 1, 2), Some(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        assert!(pack_frame(&src, 2, 9, 6, 1, 2).is_none());
+        assert!(pack_frame(&src, 3, 10, 6, 1, 2).is_none());
+        assert!(pack_frame(&src, 0, 12, -4, 1, 2).is_none());
+        assert!(pack_frame(&src, 0, 12, 3, 1, 2).is_none());
+    }
 }

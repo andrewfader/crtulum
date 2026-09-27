@@ -47,6 +47,11 @@ const KEYMAP: &[(winit::keyboard::KeyCode, &str)] = {
     ]
 };
 
+// gilrs has positive Y upward; libretro's analog Y is positive downward.
+fn analog_stick(x: f32, y: f32) -> [i16; 2] {
+    [x, -y].map(|v| (v.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
+}
+
 pub fn keymap_help() -> String {
     "arrows move · Z/X = B/A · A/S = Y/X · Q/W = L/R · Enter = Start · RShift = Select".into()
 }
@@ -58,6 +63,23 @@ pub fn keymap_help() -> String {
 /// Interleaved stereo f32 at the device's rate, filled by the emulator thread and
 /// drained by the audio callback.
 type Samples = Arc<Mutex<VecDeque<f32>>>;
+
+fn output_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
+    device: &cpal::Device, config: &cpal::StreamConfig, sink: Samples,
+) -> Result<cpal::Stream, cpal::Error> {
+    device.build_output_stream(config.clone(), move |out: &mut [T], _: &cpal::OutputCallbackInfo| {
+        let mut q = sink.lock().unwrap_or_else(|e| e.into_inner());
+        for s in out { *s = T::from_sample(q.pop_front().unwrap_or(0.0)); }
+    }, |e| eprintln!("[play] audio: {e}"), None)
+}
+
+fn push_device_frame(q: &mut VecDeque<f32>, stereo: [f32; 2], channels: usize) {
+    if channels == 1 { q.push_back((stereo[0] + stereo[1]) * 0.5); }
+    else if channels >= 2 {
+        q.extend(stereo);
+        q.extend(std::iter::repeat_n(0.0, channels - 2));
+    }
+}
 
 struct AudioOut {
     queue: Samples,
@@ -84,23 +106,22 @@ impl AudioOut {
         let channels = config.channels() as usize;
 
         let queue: Samples = Arc::new(Mutex::new(VecDeque::new()));
-        let sink = queue.clone();
-        let stream = device
-            .build_output_stream(
-                config.into(),
-                move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut q = match sink.lock() {
-                        Ok(q) => q,
-                        Err(e) => e.into_inner(),
-                    };
-                    for s in out.iter_mut() {
-                        *s = q.pop_front().unwrap_or(0.0); // silence on underrun
-                    }
-                },
-                |e| eprintln!("[play] audio: {e}"),
-                None,
-            )
-            .context("opening the audio stream")?;
+        // CPAL's default device format is not necessarily floating point.
+        let sample_format = config.sample_format();
+        let config: cpal::StreamConfig = config.into();
+        let stream = match sample_format {
+            cpal::SampleFormat::F32 => output_stream::<f32>(&device, &config, queue.clone()),
+            cpal::SampleFormat::F64 => output_stream::<f64>(&device, &config, queue.clone()),
+            cpal::SampleFormat::I8 => output_stream::<i8>(&device, &config, queue.clone()),
+            cpal::SampleFormat::I16 => output_stream::<i16>(&device, &config, queue.clone()),
+            cpal::SampleFormat::I32 => output_stream::<i32>(&device, &config, queue.clone()),
+            cpal::SampleFormat::I64 => output_stream::<i64>(&device, &config, queue.clone()),
+            cpal::SampleFormat::U8 => output_stream::<u8>(&device, &config, queue.clone()),
+            cpal::SampleFormat::U16 => output_stream::<u16>(&device, &config, queue.clone()),
+            cpal::SampleFormat::U32 => output_stream::<u32>(&device, &config, queue.clone()),
+            cpal::SampleFormat::U64 => output_stream::<u64>(&device, &config, queue.clone()),
+            other => anyhow::bail!("unsupported device sample format {other:?}"),
+        }.context("opening the audio stream")?;
         stream.play().context("starting audio")?;
 
         let target = (device_rate as usize / 10) * channels;
@@ -118,7 +139,7 @@ impl AudioOut {
 
     /// Push one frame's worth of the core's audio, resampling to the device rate.
     fn push(&mut self, pcm: &[i16], core_rate: f64) {
-        if pcm.is_empty() || core_rate <= 0.0 {
+        if pcm.len() < 2 || !core_rate.is_finite() || core_rate <= 0.0 {
             return;
         }
         let step = core_rate / self.device_rate; // core samples per device sample
@@ -136,29 +157,17 @@ impl AudioOut {
         }
 
         let at = |i: usize, ch: usize| -> f32 {
-            if i == 0 {
-                self.tail[ch]
-            } else {
-                pcm[(i - 1) * 2 + ch] as f32 / 32768.0
-            }
+            if i == 0 { self.tail[ch] } else { pcm[(i - 1) * 2 + ch] as f32 / 32768.0 }
         };
         while self.phase < frames as f64 {
             let i = self.phase.floor() as usize;
             let frac = (self.phase - i as f64) as f32;
-            for ch in 0..2 {
+            let stereo = [0, 1].map(|ch| {
                 let a = at(i, ch);
-                let b = if i < frames { pcm[i * 2 + ch] as f32 / 32768.0 } else { a };
-                let v = a + (b - a) * frac;
-                // Mono or surround devices just get the same signal in every channel.
-                if self.channels >= 2 {
-                    q.push_back(v);
-                } else if ch == 0 {
-                    q.push_back((a + b) * 0.5);
-                }
-            }
-            for _ in 2..self.channels {
-                q.push_back(0.0);
-            }
+                let b = pcm[i * 2 + ch] as f32 / 32768.0;
+                a + (b - a) * frac
+            });
+            push_device_frame(&mut q, stereo, self.channels);
             self.phase += step;
         }
         self.phase -= frames as f64;
@@ -256,9 +265,10 @@ impl Player {
     }
 
     /// Whatever is held right now, from the pad and the keyboard together.
-    fn input(&mut self) -> u32 {
+    fn input(&mut self) -> (u32, [i16; 2]) {
         let mut mask = self.keys;
-        let Some(gilrs) = &mut self.gilrs else { return mask };
+        let mut analog = [0i16; 2];
+        let Some(gilrs) = &mut self.gilrs else { return (mask, analog) };
         // Drain the event queue so gilrs's own button states stay current.
         while gilrs.next_event().is_some() {}
 
@@ -278,6 +288,8 @@ impl Player {
             (B::RightTrigger2, "r2"),
             (B::Start, "start"),
             (B::Select, "select"),
+            (B::LeftThumb, "l3"),
+            (B::RightThumb, "r3"),
         ];
         for (_id, pad) in gilrs.gamepads() {
             for (button, name) in PAD {
@@ -293,6 +305,11 @@ impl Player {
                 pad.value(gilrs::Axis::LeftStickX),
                 pad.value(gilrs::Axis::LeftStickY),
             );
+            let stick = analog_stick(x, y);
+            // Preserve the strongest displacement per axis if multiple pads are present.
+            for axis in 0..2 {
+                if stick[axis].abs() > analog[axis].abs() { analog[axis] = stick[axis]; }
+            }
             const DEAD: f32 = 0.4;
             for (on, name) in [
                 (x < -DEAD, "left"),
@@ -307,7 +324,7 @@ impl Player {
                 }
             }
         }
-        mask
+        (mask, analog)
     }
 
     /// Advance emulation to catch up with the clock. Returns true if a new frame
@@ -325,13 +342,15 @@ impl Player {
 
         let period = 1.0 / self.fps.max(1.0);
         let mut drew = false;
+        let mut emulated = 0;
         while self.owed >= period {
             self.owed -= period;
-            let mask = self.input();
-            let (frame, w, h) = self.core.run_frame(mask)?;
+            let (mask, analog) = self.input();
+            let (frame, w, h) = self.core.run_frame_with_analog(mask, analog)?;
             self.frame = frame;
             self.size = (w, h);
             drew = true;
+            emulated += 1;
 
             let pcm = self.core.take_audio();
             if let Some(audio) = &mut self.audio {
@@ -342,7 +361,7 @@ impl Player {
             self.fresh = true;
         }
         if let Some((since, count)) = &mut self.stats {
-            *count += u32::from(drew);
+            *count += emulated;
             let elapsed = since.elapsed().as_secs_f64();
             if elapsed >= 1.0 {
                 let backlog = self
@@ -365,8 +384,38 @@ impl Player {
         Ok(drew)
     }
 
+    pub fn clear_keys(&mut self) { self.keys = 0; }
+
     pub fn toggle_pause(&mut self) {
         self.paused = !self.paused;
+        self.last = std::time::Instant::now();
+        self.owed = 0.0;
+        if let Some(audio) = &mut self.audio {
+            audio.queue.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
         eprintln!("[play] {}", if self.paused { "paused" } else { "running" });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn analog_input_preserves_magnitude_and_libretro_axis_direction() {
+        assert_eq!(analog_stick(0.0, 0.0), [0, 0]);
+        assert_eq!(analog_stick(1.0, 1.0), [32767, -32767]);
+        assert_eq!(analog_stick(-1.0, -1.0), [-32767, 32767]);
+        assert_eq!(analog_stick(0.25, -0.5), [8192, 16384]);
+    }
+
+    #[test]
+    fn mono_output_contains_both_channels_and_surround_stays_aligned() {
+        let mut q = VecDeque::new();
+        push_device_frame(&mut q, [0.0, 1.0], 1);
+        assert_eq!(q.pop_front(), Some(0.5));
+        push_device_frame(&mut q, [0.25, -0.5], 6);
+        push_device_frame(&mut q, [-0.75, 0.5], 6);
+        assert_eq!(q.into_iter().collect::<Vec<_>>(),
+            vec![0.25, -0.5, 0.0, 0.0, 0.0, 0.0, -0.75, 0.5, 0.0, 0.0, 0.0, 0.0]);
     }
 }

@@ -672,6 +672,15 @@ impl Rng {
     }
 }
 
+// Microsoft Agent branch percentages reserve the remainder for the next frame.
+fn branch_target(branches: &[(usize, u32)], mut roll: u32, fallback: usize) -> usize {
+    for &(target, percent) in branches {
+        if roll < percent { return target; }
+        roll -= percent;
+    }
+    fallback
+}
+
 struct Playing {
     anim: String,
     frame: usize,
@@ -779,14 +788,22 @@ impl Agent {
     /// Advance to wall-clock `t`, having taken `dt` seconds since the last call.
     /// Called once per rendered frame, in order — the agent's state is a fold over
     /// the frame sequence, not a function of `t`, because animation branching is.
-    pub fn step(&mut self, t: f32, dt: f32) {
-        self.now = t;
+    pub fn step(&mut self, t: f32, _dt: f32) {
+        // Advance to each command's own timestamp before applying it. Rendering
+        // at low fps must neither slow animations nor start a new one a frame early.
         while self.cursor < self.events.len() && self.events[self.cursor].0 <= t {
             let (at, cmd) = self.events[self.cursor].clone();
-            self.apply(&cmd, self.cursor, at.max(t - dt));
+            let at = at.max(self.now);
+            self.advance_to(at);
+            self.apply(&cmd, self.cursor, at);
             self.cursor += 1;
         }
+        self.advance_to(t.max(self.now));
+    }
 
+    fn advance_to(&mut self, t: f32) {
+        let dt = (t - self.now).max(0.0);
+        self.now = t;
         if let Some((t0, t1, from, to)) = self.walk {
             let k = ((t - t0) / (t1 - t0).max(1e-6)).clamp(0.0, 1.0);
             // Smoothstep: the Move animations are hops, and a linear glide under a
@@ -932,80 +949,76 @@ impl Agent {
     }
 
     fn advance_animation(&mut self, t: f32, dt: f32) {
-        // Trigger the sound attached to the frame we're currently on, once.
-        if !self.sounded {
-            self.sounded = true;
-            if let Some(id) = self.current_frame().and_then(|f| f.sound.clone()) {
-                if let Some(pcm) = self.character.sounds.get(&id) {
-                    let pcm = pcm.clone();
-                    self.audio.mix(t, &pcm, 0.7);
+        let mut cursor = t - dt;
+        let mut remaining = dt * 1000.0;
+        // Zero-duration ACS branch frames are valid; a malformed zero-time cycle
+        // must not hang the export. Positive-duration loops consume elapsed time.
+        let mut zero_transitions = 0;
+        loop {
+            if self.playing.is_none() {
+                if self.visible && t - self.idle_since > IDLE_AFTER {
+                    let idles: Vec<String> = self.character.animation_names().iter()
+                        .filter(|n| n.to_ascii_lowercase().starts_with("idle"))
+                        .map(|n| n.to_string()).collect();
+                    if !idles.is_empty() {
+                        let pick = idles[self.rng.below(idles.len() as u32) as usize].clone();
+                        cursor = cursor.max(self.idle_since + IDLE_AFTER);
+                        remaining = (t - cursor).max(0.0) * 1000.0;
+                        self.start(pick, cursor);
+                    }
+                }
+                if self.playing.is_none() { return; }
+            }
+            if !self.sounded {
+                self.sounded = true;
+                if let Some(id) = self.current_frame().and_then(|f| f.sound.clone()) {
+                    if let Some(pcm) = self.character.sounds.get(&id) {
+                        self.audio.mix(cursor, pcm, 0.7);
+                    }
                 }
             }
-        }
-
-        let Some(p) = &mut self.playing else {
-            // Nothing playing. After a pause, pick an idle, the way the desktop did.
-            if self.visible && t - self.idle_since > IDLE_AFTER {
-                let idles: Vec<String> = self
-                    .character
-                    .animation_names()
-                    .iter()
-                    .filter(|n| n.to_ascii_lowercase().starts_with("idle"))
-                    .map(|n| n.to_string())
-                    .collect();
-                if !idles.is_empty() {
-                    let pick = idles[self.rng.below(idles.len() as u32) as usize].clone();
-                    self.start(pick, t);
+            let p = self.playing.as_mut().unwrap();
+            let Some(anim) = self.character.anims.get(&p.anim) else {
+                self.playing = None;
+                return;
+            };
+            let Some(frame) = anim.frames.get(p.frame) else {
+                self.playing = None;
+                self.idle_since = cursor;
+                return;
+            };
+            let needed = (frame.duration_ms - p.held_ms).max(0.0);
+            if remaining + 1e-4 < needed {
+                p.held_ms += remaining;
+                return;
+            }
+            remaining = (remaining - needed).max(0.0);
+            cursor += needed / 1000.0;
+            p.held_ms = 0.0;
+            if needed == 0.0 {
+                zero_transitions += 1;
+                if zero_transitions > 4096 {
+                    eprintln!("[agent] stopping zero-duration animation cycle in {}", p.anim);
+                    self.playing = None;
+                    self.idle_since = t;
+                    return;
                 }
-            }
-            return;
-        };
+            } else { zero_transitions = 0; }
 
-        p.held_ms += dt * 1000.0;
-        let Some(anim) = self.character.anims.get(&p.anim) else {
-            self.playing = None;
-            return;
-        };
-        let Some(frame) = anim.frames.get(p.frame) else {
-            self.playing = None;
-            self.idle_since = t;
-            return;
-        };
-        if p.held_ms < frame.duration_ms {
-            return;
-        }
-        p.held_ms -= frame.duration_ms;
-
-        // Where next: an exit branch if we're unwinding, else a weighted branch, else
-        // simply onward. This is the `.acs` frame model verbatim.
-        let next = if p.exiting {
-            frame.exit_branch.unwrap_or(p.frame + 1)
-        } else if !frame.branches.is_empty() {
-            let total: u32 = frame.branches.iter().map(|(_, w)| w).sum();
-            let mut roll = self.rng.below(total.max(1));
-            let mut chosen = p.frame + 1;
-            for (target, weight) in &frame.branches {
-                if roll < *weight {
-                    chosen = *target;
-                    break;
-                }
-                roll -= *weight;
+            // ACS weights are percentages: unused probability advances normally.
+            let normal = if frame.branches.is_empty() { p.frame + 1 } else {
+                branch_target(&frame.branches, self.rng.below(100), p.frame + 1)
+            };
+            let next = if p.exiting { frame.exit_branch.unwrap_or(normal) } else { normal };
+            if next >= anim.frames.len() {
+                let hidden = p.anim.eq_ignore_ascii_case("hide") || p.anim.eq_ignore_ascii_case("goodbye");
+                self.playing = None;
+                self.idle_since = cursor;
+                if hidden { self.visible = false; }
+            } else {
+                p.frame = next;
+                self.sounded = false;
             }
-            chosen
-        } else {
-            p.frame + 1
-        };
-
-        if next >= anim.frames.len() {
-            let ended = p.anim.clone();
-            self.playing = None;
-            self.idle_since = t;
-            if ended.eq_ignore_ascii_case("hide") || ended.eq_ignore_ascii_case("goodbye") {
-                self.visible = false;
-            }
-        } else {
-            p.frame = next;
-            self.sounded = false;
         }
     }
 
@@ -1666,6 +1679,39 @@ mod tests {
     fn base64_round_trips_a_known_vector() {
         assert_eq!(base64_decode("TWFu").unwrap(), b"Man");
         assert_eq!(base64_decode("bGlnaHQgdw==").unwrap(), b"light w");
+    }
+
+    #[test]
+    fn branch_percentages_leave_probability_for_the_next_frame() {
+        let mut counts = [0; 3];
+        for roll in 0..100 {
+            counts[branch_target(&[(0, 30), (1, 20)], roll, 2)] += 1;
+        }
+        assert_eq!(counts, [30, 20, 50]);
+    }
+
+    #[test]
+    fn animation_consumes_short_and_zero_duration_frames_at_any_export_rate() {
+        let run = |fps: f32| {
+            let mut character = sheet_char();
+            let frames = &mut character.anims.get_mut("Wave").unwrap().frames;
+            frames[0].duration_ms = 0.0;
+            frames[0].branches.clear();
+            frames[1].duration_ms = 10.0;
+            frames[2].duration_ms = 10.0;
+            frames[2].branches = vec![(1, 100)];
+            let mut agent = Agent::new(character, vec![(0.015, Cmd::Play("Wave".into()))], false);
+            for i in 0..=(fps * 0.1).round() as u32 {
+                agent.step(i as f32 / fps, 1.0 / fps);
+            }
+            let playing = agent.playing.unwrap();
+            (playing.frame, playing.held_ms)
+        };
+        for fps in [10.0, 30.0, 60.0, 120.0] {
+            let (frame, held) = run(fps);
+            assert_eq!(frame, 1, "{fps} fps changed animation timing");
+            assert!((held - 5.0).abs() < 0.01, "{fps} fps: held {held} ms");
+        }
     }
 
     #[test]
