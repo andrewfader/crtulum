@@ -28,6 +28,8 @@ struct Uniforms {
     pwr: vec4<f32>,     // power: x=warmup, y=collapse, z=degauss, w=specular glare enabled
     focus: vec4<f32>,   // x=edge defocus (deflection spot growth), y=overscan(per side), z=roll rate, w=roll amp
     fx: vec4<f32>,      // x=svm (scan-velocity crispening), y=diffusion (wide glass glow), z=subpixel-mask flag, w=bfi screen multiplier
+    camera: vec4<f32>, // enabled, tan(horizontal FOV/2), aspect, reserved
+    camera_ambient: vec4<f32>, // mean linear webcam radiance
     beam2: vec4<f32>,   // x=spot profile exponent p at low beam current,
                         // y=window reflection enabled, z=ambient diffuse wash, w=scatter redistribution
 };
@@ -37,6 +39,7 @@ struct Uniforms {
 // raw source frame and t_prev = the previous phosphor plane (fed back for decay).
 @group(0) @binding(1) var t_screen: texture_2d<f32>;
 @group(0) @binding(2) var s_screen: sampler;
+@group(0) @binding(7) var t_camera: texture_2d<f32>;
 @group(0) @binding(3) var t_prev: texture_2d<f32>;
 @group(0) @binding(4) var<storage, read_write> phos_bank0: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> phos_bank1: array<vec4<f32>>;
@@ -262,6 +265,19 @@ fn output_color(col: vec3<f32>) -> vec4<f32> {
 // 1.0 so the light sources bloom in the reflections — a dark room with a soft
 // ceiling area-light, a warm lamp to the right, and a faint cool fill to the left.
 fn room(r: vec3<f32>) -> vec3<f32> {
+    if (u.camera.x > 0.5) {
+        // A camera mounted at the display faces +Z into the room. Its image
+        // right is world -X: this produces a mirror, not a pasted selfie.
+        // Keep this basis fixed in world space as the viewer orbits the tube.
+        let plane = vec2<f32>(-r.x, -r.y * u.camera.z) / (max(r.z, 0.0001) * u.camera.y);
+        let uv = plane * 0.5 + 0.5;
+        let coverage = (1.0 - smoothstep(0.94, 1.0, max(abs(plane.x), abs(plane.y))))
+            * select(0.0, 1.0, r.z > 0.0);
+        let captured = textureSampleLevel(t_camera, s_screen, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb;
+        // A single camera cannot observe behind itself. Blend to its mean
+        // radiance rather than inventing another window or stretching the edges.
+        return mix(u.camera_ambient.rgb, captured, coverage);
+    }
     let up = clamp(r.y * 0.5 + 0.5, 0.0, 1.0);
     // A NORMALLY-LIT interior — not a black void. Every photo of a real CRT shows the
     // dark glass mirroring a whole room (walls, ceiling, a window), so the environment
@@ -313,6 +329,20 @@ fn ggx_spec(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32, f0: vec3<f32>)
 // hemispheric ambient, energy-conserving Cook-Torrance specular, and roughness-blurred
 // HDR environment reflection with Fresnel.
 fn shade_body(base: vec3<f32>, rough: f32, metal: f32, n: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
+    if (u.camera.x > 0.5) {
+        let f0 = mix(vec3<f32>(0.04), base, metal);
+        let fres = f_schlick(max(dot(n, v), 0.0), f0);
+        let refl = reflect(-v, n);
+        let axis = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(refl.y) > 0.9);
+        let tangent = normalize(cross(axis, refl)) * rough * rough * 0.5;
+        let bitangent = cross(refl, tangent);
+        let filtered = (room(refl) * 2.0 + room(normalize(refl + tangent))
+            + room(normalize(refl - tangent)) + room(normalize(refl + bitangent))
+            + room(normalize(refl - bitangent))) / 6.0;
+        let specular = mix(filtered, u.camera_ambient.rgb, rough * rough);
+        return base * (vec3<f32>(1.0) - fres) * (1.0 - metal) * u.camera_ambient.rgb
+            + specular * fres;
+    }
     // 1. Matching room lights:
     // l0: Ceiling softbox (key light from upper-front)
     let l0 = normalize(vec3<f32>(0.35, 0.85, 0.40));
@@ -893,10 +923,18 @@ fn fs_phosphor(in: FullOut) -> @location(0) vec4<f32> {
     let uv = beam.xy;
     // Input signal path (tone.w): 0 = RGB/component (clean — PVM, arcade board, PC),
     // 1 = S-video (sharp luma, band-limited colour, no dot crawl), 2 = composite
-    // (dot crawl + cross-colour rainbow + colour bleed — RF/antenna consumer TV).
+    // (dot crawl + cross-colour rainbow + colour bleed), 3 = RF tuner approximation.
     var sig: vec3<f32>;
     if (u.tone.w >= 1.5) {
         sig = ntsc(uv, res, u.params.z);
+        if (u.tone.w >= 2.5) {
+            // Approximate the extra bandwidth loss of a console RF modulator/tuner.
+            // Voltage-space filtering precedes the gun; this is not an RF circuit simulation.
+            let dx = vec2<f32>(0.5 / 320.0, 0.0);
+            sig = eotf(0.5 * oetf(sig)
+                + 0.25 * oetf(ntsc(uv - dx, res, u.params.z))
+                + 0.25 * oetf(ntsc(uv + dx, res, u.params.z)));
+        }
     } else if (u.tone.w >= 0.5) {
         sig = svideo(uv, res);
     } else {
@@ -1492,7 +1530,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Diffuse, so it samples the room broadly (around the normal) rather than in the mirror
     // direction, and it falls off at grazing by (1-F)² — the same light has to get in
     // through the front surface and back out through it, and both get harder as F rises.
-    let amb_room = (room(n) * 2.0 + room(refl)) / 3.0;
+    let amb_room = select((room(n) * 2.0 + room(refl)) / 3.0, u.camera_ambient.rgb, u.camera.x > 0.5);
     col = col + amb_room * u.beam2.z * (1.0 - fres) * (1.0 - fres);
     // Tight specular glare from the ceiling softbox — a hot spot sliding across the
     // curved glass as you move; the single most CRT-reading highlight.
@@ -1506,7 +1544,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // old × 2.0 put it at ~1.6 — four times over, a mirror-finish sheen no faceplate has.
     let light_dir = normalize(vec3<f32>(-0.35, 0.55, 0.95));
     let glare = pow(max(dot(refl, light_dir), 0.0), 130.0);
-    col = col + vec3<f32>(1.0, 0.98, 0.92) * glare * (0.3 + u.glass.y) * 0.5 * u.pwr.w;
+    col = col + vec3<f32>(1.0, 0.98, 0.92) * glare * (0.3 + u.glass.y) * 0.5 * u.pwr.w * select(1.0, 0.0, u.camera.x > 0.5);
 
     return output_color(col);
 }

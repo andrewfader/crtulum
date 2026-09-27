@@ -237,6 +237,7 @@ pub struct Script {
     pub start: Option<f64>,
     pub duration: Option<f64>,
     pub preset: Option<&'static str>,
+    pub input: Option<crate::InputMode>,
     pub yaw: Option<f32>,
     pub pitch: Option<f32>,
     pub dist: Option<f32>,
@@ -646,6 +647,7 @@ pub fn parse_script(text: &str) -> Result<Script> {
                 "start" | "seek" => s.start = Some(parse_time(arg)? as f64),
                 "duration" | "length" => s.duration = Some(parse_time(arg)? as f64),
                 "preset" | "tube" => s.preset = Some(preset_named(arg)?.name),
+                "connection" => s.input = Some(crate::InputMode::parse(arg)?),
                 "camera" | "cam" => {
                     if let Action::Camera { yaw, pitch, dist, .. } = parse_action(&toks)? {
                         s.yaw = yaw.or(s.yaw);
@@ -750,10 +752,11 @@ impl Timeline {
             s.pitch.unwrap_or(0.34),
             s.dist.unwrap_or(3.7),
         ];
-        let preset0 = s
+        let mut preset0 = s
             .preset
             .and_then(|n| preset_named(n).ok().copied())
             .unwrap_or(default_preset);
+        preset0.input = s.input.unwrap_or(default_preset.input);
         let exp0 = s.exposure.unwrap_or(1.0);
 
         let mut tl = Timeline {
@@ -788,7 +791,9 @@ impl Timeline {
             match action {
                 Action::Preset(name) => {
                     if let Ok(p) = preset_named(name) {
-                        tl.presets.push((t, *p));
+                        let mut p = *p;
+                        p.input = preset0.input;
+                        tl.presets.push((t, p));
                     }
                 }
                 Action::Camera { yaw, pitch, dist, over, ease } => {
@@ -2400,6 +2405,7 @@ Options:
   --script FILE      timeline script — camera moves, preset swaps, power, degauss,
                      and (with a rom) the run itself: press/hold/release/tap, placed
                      on an exact frame or a wall-clock time
+  --input MODE       auto (default), composite, rf, s-video, rgb, component; F3 cycles live
   --preset NAME      starting tube preset
   --size WxH         output size            (default 1280x960)
   --fps N            output frame rate      (default: the source's)
@@ -2487,6 +2493,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
     let (mut size, mut fps, mut ssaa, mut source_size) = (None, None, None, None);
     let mut shutter = 1.0_f32;
     let (mut start, mut duration, mut crf, mut codec) = (None, None, None, None);
+    let mut connection_arg = None;
     let (mut audio, mut dry_run, mut preset_arg) = (true, false, None);
     let mut agent = None;
     let mut core_options: Vec<(String, String)> = Vec::new();
@@ -2533,6 +2540,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
             "-o" | "--out" => output_override = Some(val()?),
             // `--preset` is consumed by main() but appears in the same tail.
             "--preset" => preset_arg = Some(val()?),
+            "--input" => connection_arg = Some(crate::InputMode::parse(&val()?)?),
             other if other.starts_with('-') => bail!("unknown --render option `{other}`\n\n{USAGE}"),
             other => positionals.push(other.to_string()),
         }
@@ -2547,6 +2555,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
         None => Script::default(),
     };
 
+    if let Some(input) = connection_arg { script.input = Some(input); }
     if let Some(name) = preset_arg {
         script.preset = Some(preset_named(&name)?.name);
     }
@@ -2620,6 +2629,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
 impl Opts {
     /// Supply the default after explicit CLI/script choices have been resolved.
     fn with_default_preset(mut self, preset: Preset) -> Opts {
+        if self.script.input.is_none() { self.script.input = Some(preset.input); }
         if self.script.preset.is_none() {
             self.script.preset = Some(preset.name);
         }
@@ -2630,6 +2640,33 @@ impl Opts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_override_survives_script_preset_changes() {
+        let script = parse_script("connection rf\npreset pvm\nat 1 preset rca").unwrap();
+        let timeline = Timeline::compile(&script, TRINITRON, 60.0);
+        assert_eq!(timeline.eval(0.0).preset.input, crate::InputMode::Rf);
+        assert_eq!(timeline.eval(2.0).preset.input, crate::InputMode::Rf);
+        let script = parse_script("preset pvm\nat 1 preset rca").unwrap();
+        let timeline = Timeline::compile(&script, TRINITRON, 60.0);
+        for (t, expected) in [(0.0, 0), (2.0, 2)] {
+            let preset = timeline.eval(t).preset;
+            assert_eq!(preset.input.signal(preset.signal), expected);
+        }
+    }
+
+    #[test]
+    fn input_cli_selects_connection_and_rejects_invalid_modes() {
+        let args: Vec<String> = ["crtulum", "--render", "input.mp4", "out.mp4", "--input", "composite"]
+            .into_iter().map(str::to_string).collect();
+        let opts = opts_from_args(&args, TRINITRON).unwrap();
+        assert_eq!(opts.script.input, Some(crate::InputMode::Composite));
+        let mut bad = args.clone();
+        *bad.last_mut().unwrap() = "invalid".into();
+        assert!(opts_from_args(&bad, TRINITRON).is_err());
+        bad.pop();
+        assert!(opts_from_args(&bad, TRINITRON).is_err());
+    }
 
     #[test]
     fn sequence_audio_preserves_mix_peaks_seek_and_padding() {

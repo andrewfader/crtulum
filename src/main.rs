@@ -15,6 +15,7 @@
 
 mod agent;
 mod capture;
+mod webcam;
 mod font8x8;
 mod glctx;
 mod gpu;
@@ -523,6 +524,8 @@ struct Uniforms {
     pwr: [f32; 4],    // power state: warmup, collapse, degauss, specular-glare enabled
     focus: [f32; 4],  // x=edge defocus (deflection spot growth), y=overscan (per side), z=roll rate, w=roll amp
     fx: [f32; 4],     // x=svm (scan-velocity crispen), y=diffusion (wide glass glow), z=subpixel mask flag, w=bfi screen mult
+    camera: [f32; 4], // enabled, tan(horizontal FOV/2), aspect, reserved
+    camera_ambient: [f32; 4], // linear mean camera radiance
     beam2: [f32; 4],  // x=spot profile exponent p, y=window-reflection enabled,
                       // z=ambient diffuse wash through the tinted faceplate, w=scatter redistribution
 }
@@ -557,6 +560,65 @@ struct Cabinet {
     rear_z: f32,     // z of the main box back (more negative = deeper set)
     speakers: Speakers,
     badge: bool,     // molded brand strip on the bottom bezel
+}
+
+// Connections are independent of the tube. Non-native connections represent an
+// external decoder/tuner/converter; RGB and component share the clean path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum InputMode {
+    #[default]
+    Auto,
+    Composite,
+    Rf,
+    SVideo,
+    Rgb,
+    Component,
+}
+
+impl InputMode {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "auto" | "default" => Ok(Self::Auto),
+            "composite" => Ok(Self::Composite),
+            "rf" => Ok(Self::Rf),
+            "svideo" | "s-video" => Ok(Self::SVideo),
+            "rgb" => Ok(Self::Rgb),
+            "component" => Ok(Self::Component),
+            _ => anyhow::bail!("unknown input `{value}` (use auto, composite, rf, s-video, rgb, component)"),
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Composite,
+            Self::Composite => Self::Rf,
+            Self::Rf => Self::SVideo,
+            Self::SVideo => Self::Rgb,
+            Self::Rgb => Self::Component,
+            Self::Component => Self::Auto,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "preset default",
+            Self::Composite => "Composite",
+            Self::Rf => "RF (NES-style)",
+            Self::SVideo => "S-video",
+            Self::Rgb => "RGB",
+            Self::Component => "Component",
+        }
+    }
+
+    fn signal(self, default: u8) -> u8 {
+        match self {
+            Self::Auto => default,
+            Self::Rgb | Self::Component => 0,
+            Self::SVideo => 1,
+            Self::Composite => 2,
+            Self::Rf => 3,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -626,8 +688,10 @@ struct Preset {
     // single-gun mono tube has exactly ONE phosphor, so there is nothing to scale — this
     // is its absolute decay time in seconds and all three stored channels use it.
     persist: f32,
-    // input signal path: 0=RGB/component (clean), 1=S-video (Y/C split), 2=composite.
+    // Default connection and legacy chassis calibration; input overrides only the signal.
+    // 0=RGB/component (clean), 1=S-video (Y/C split), 2=composite.
     signal: u8,
+    input: InputMode,
     // phosphor set: 0=SMPTE-C, 1=P22, 2=sRGB/709, 3=mono (identity — mono tints itself).
     phos: u8,
     // native CRT white point (CIE xy) — 9300K reads cool/blue, D65 neutral, warm=aged.
@@ -726,6 +790,7 @@ const TRINITRON: Preset = Preset {
     phos: 0,
     white_xy: [0.2831, 0.2971],
     signal: 1,
+    input: InputMode::Auto,
     mono: [0.0, 0.0, 0.0, 0.0],
 };
 
@@ -771,6 +836,7 @@ const PANASONIC: Preset = Preset {
     phos: 0,
     white_xy: [0.2831, 0.2971],
     signal: 2,
+    input: InputMode::Auto,
     mono: [0.0, 0.0, 0.0, 0.0],
 };
 
@@ -811,6 +877,7 @@ const SLOTMASK: Preset = Preset {
     phos: 0,
     white_xy: [0.2831, 0.2971],
     signal: 2,
+    input: InputMode::Auto,
     mono: [0.0, 0.0, 0.0, 0.0],
 };
 
@@ -853,6 +920,7 @@ const RCA: Preset = Preset {
     phos: 0,
     white_xy: [0.305, 0.322],
     signal: 2,
+    input: InputMode::Auto,
     mono: [0.0, 0.0, 0.0, 0.0],
 };
 
@@ -894,6 +962,7 @@ const PVM: Preset = Preset {
     phos: 0,
     white_xy: [0.3127, 0.329],
     signal: 0,
+    input: InputMode::Auto,
     mono: [0.0, 0.0, 0.0, 0.0],
 };
 
@@ -937,6 +1006,7 @@ const ARCADE: Preset = Preset {
     phos: 0,
     white_xy: [0.2831, 0.2971],
     signal: 0,
+    input: InputMode::Auto,
     mono: [0.0, 0.0, 0.0, 0.0],
 };
 
@@ -978,6 +1048,7 @@ const VGA: Preset = Preset {
     phos: 2,
     white_xy: [0.2831, 0.2971],
     signal: 0,
+    input: InputMode::Auto,
     mono: [0.0, 0.0, 0.0, 0.0],
 };
 
@@ -1019,6 +1090,7 @@ const DIAMONDTRON: Preset = Preset {
     phos: 2,
     white_xy: [0.2831, 0.2971],
     signal: 0,
+    input: InputMode::Auto,
     mono: [0.0, 0.0, 0.0, 0.0],
 };
 
@@ -1060,6 +1132,7 @@ const GREEN: Preset = Preset {
     phos: 3,
     white_xy: [0.3127, 0.329],
     signal: 0,
+    input: InputMode::Auto,
     mono: [0.10, 1.0, 0.14, 1.0], // P1 green (CIE ~0.218,0.712) → sRGB, normalized
 };
 
@@ -1100,6 +1173,7 @@ const AMBER: Preset = Preset {
     phos: 3,
     white_xy: [0.3127, 0.329],
     signal: 0,
+    input: InputMode::Auto,
     mono: [1.0, 0.44, 0.06, 1.0], // P3 amber (CIE ~0.523,0.469) → sRGB, normalized
 };
 
@@ -1128,6 +1202,10 @@ const ALL_PRESETS: [Preset; 10] =
 // ---------------------------------------------------------------------------
 
 struct Resources {
+    camera_texture: wgpu::Texture,
+    camera_view: wgpu::TextureView,
+    camera: [f32; 4],
+    camera_ambient: [f32; 4],
     hdr_bt2020: bool,
     physical_phosphor: bool,
     shutter_fraction: f32,
@@ -1241,6 +1319,7 @@ impl Resources {
                 label: Some("screen_bind"),
                 layout: &self.layout,
                 entries: &[
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&self.camera_view) },
                     wgpu::BindGroupEntry { binding: 0, resource: self.ubuf.as_entire_binding() },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -1257,6 +1336,7 @@ impl Resources {
                 label: Some("accum_bind"),
                 layout: &self.accum_layout,
                 entries: &[
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&self.camera_view) },
                     wgpu::BindGroupEntry { binding: 0, resource: self.ubuf.as_entire_binding() },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -1410,6 +1490,13 @@ fn build_resources(
             label: Some("bind_layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
+                    binding: 7, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
+                    }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
@@ -1441,6 +1528,13 @@ fn build_resources(
         let accum_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("accum_layout"),
             entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
+                    }, count: None,
+                },
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1571,12 +1665,22 @@ fn build_resources(
             multiview: None,
         });
 
+        let camera_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("webcam environment"),
+            size: wgpu::Extent3d { width: webcam::WIDTH, height: webcam::HEIGHT, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let camera_view = camera_texture.create_view(&Default::default());
         // Initial bind groups (rebuilt on any source resize via rebuild_binds).
         let mk_screen = |pv: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("screen_bind"),
                 layout: &bind_layout,
                 entries: &[
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&camera_view) },
                     wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(pv) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
@@ -1588,6 +1692,7 @@ fn build_resources(
                 label: Some("accum_bind"),
                 layout: &accum_layout,
                 entries: &[
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&camera_view) },
                     wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&source_view) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
@@ -1615,6 +1720,7 @@ fn build_resources(
     });
 
     Resources {
+        camera_texture, camera_view, camera: [0.0; 4], camera_ambient: [0.0; 4],
         hdr_bt2020: false,
         physical_phosphor: std::env::var("CRTULUM_PHOSPHOR").as_deref() != Ok("legacy"),
         shutter_fraction: 1.0,
@@ -1704,6 +1810,8 @@ fn write_uniforms(
     let (view_proj, eye) = orbit.view_proj(aspect);
     let cmat = preset_color_matrix(preset);
     let uniforms = Uniforms {
+        camera: res.camera,
+        camera_ambient: res.camera_ambient,
         view_proj: view_proj.to_cols_array(),
         model: Mat4::IDENTITY.to_cols_array(),
         cam_pos: [eye.x, eye.y, eye.z, 1.0],
@@ -1735,7 +1843,7 @@ fn write_uniforms(
         ],
         // HDR path: on a scRGB swapchain, emit linear light with highlights >1.0
         // (peak/drive push the beam above white). On SDR, tonemap to `peak` white
-        // point. tone.w = input signal path (0=RGB/component clean, 1=S-video, 2=composite).
+        // point. tone.w = input signal path (0=clean, 1=S-video, 2=composite, 3=RF).
         // tone.y carries the exposure trim on the HDR path (scales SDR-white → panel
         // reference white) and the tonemap white-point × exposure on the SDR path, so
         // the [ and ] keys tune brightness identically in both.
@@ -1757,9 +1865,9 @@ fn write_uniforms(
         // luminance at 0.245 against the pre-audit 0.246 — the same picture brightness,
         // arrived at without the two fudges.
         tone: if hdr {
-            [if res.hdr_bt2020 { 2.0 } else { 1.0 }, exposure, 1.43, preset.signal as f32]
+            [if res.hdr_bt2020 { 2.0 } else { 1.0 }, exposure, 1.43, preset.input.signal(preset.signal) as f32]
         } else {
-            [0.0, 1.08 * exposure, 1.30, preset.signal as f32] // ACES exposure (was Reinhard white pt)
+            [0.0, 1.08 * exposure, 1.30, preset.input.signal(preset.signal) as f32] // ACES exposure (was Reinhard white pt)
         },
         // Guest/Megatron beam math (per-tube focus/TVL): per-channel beam half-width
         // runs from beam_min (dark → tight) to beam_max (bright → wide); beam_shape
@@ -1772,10 +1880,11 @@ fn write_uniforms(
         look: [
             preset.convergence,
             preset.corner_radius,
-            if preset.mono[3] > 0.5 || preset.phos >= 2 {
+            if preset.input.signal(preset.signal) == 0 && (preset.mono[3] > 0.5 || preset.phos >= 2) {
                 noise_peak_to_peak(64.0) // representative clean TTL/VGA path
             } else {
-                match preset.signal {
+                match preset.input.signal(preset.signal) {
+                    3 => noise_peak_to_peak(30.0), // illustrative RF tuner noise
                     2 => noise_peak_to_peak(36.0), // representative noisy consumer feed
                     1 => noise_peak_to_peak(42.0), // representative S-video baseband
                     _ => noise_peak_to_peak(52.0), // representative RGB/component feed
@@ -2041,6 +2150,7 @@ struct State {
     last_cursor: (f64, f64),
     window: Arc<Window>,
     capture: Option<capture::SharedFrame>,
+    webcam: Option<webcam::Webcam>,
     last_seq: u64,
     /// Live play: a libretro core running a game, driven by the clock and a pad.
     player: Option<play::Player>,
@@ -2184,6 +2294,7 @@ impl State {
             bfi: false,
             glare: true,
             window_reflection: true,
+            webcam: None,
             // Panel refresh, for the BFI gate: strobing only helps at ≥100 Hz (at 60 Hz
             // it just flickers at 30). Best effort — re-detected on the first BFI toggle
             // once the Wayland surface has entered an output.
@@ -2197,6 +2308,55 @@ impl State {
             preset,
             hdr,
         })
+    }
+
+    fn toggle_webcam(&mut self) {
+        if self.webcam.take().is_some() {
+            self.res.camera[0] = 0.0;
+            self.window.set_title("crtulum — camera off");
+            eprintln!("[webcam] off; camera released");
+        } else {
+            match webcam::Webcam::start() {
+                Ok(camera) => {
+                    self.webcam = Some(camera);
+                    self.window.set_title("crtulum — opening camera (F4 to stop)");
+                }
+                Err(error) => {
+                    self.window.set_title("crtulum — camera unavailable (see terminal)");
+                    eprintln!("[webcam] {error:#}");
+                }
+            }
+        }
+    }
+
+    fn poll_webcam(&mut self) {
+        let Some(camera) = &mut self.webcam else { return };
+        match camera.poll() {
+            Ok(Some(frame)) => {
+                write_source(&self.queue, &self.res.camera_texture, webcam::WIDTH, webcam::HEIGHT, &frame);
+                // Average radiance in linear light, also used outside the camera FOV.
+                let mut mean = [0.0; 4];
+                let mut count = 0.0;
+                for pixel in frame.chunks_exact(4).step_by(16) {
+                    for c in 0..3 {
+                        let v = pixel[c] as f32 / 255.0;
+                        mean[c] += if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+                    }
+                    count += 1.0;
+                }
+                for c in 0..3 { mean[c] /= count; }
+                self.res.camera_ambient = mean;
+                self.res.camera = [1.0, camera.tan_half_fov, webcam::WIDTH as f32 / webcam::HEIGHT as f32, 0.0];
+                self.window.set_title("crtulum — camera LIVE (F4 to stop)");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("[webcam] {error:#}; restoring synthetic room");
+                self.webcam = None;
+                self.res.camera[0] = 0.0;
+                self.window.set_title("crtulum — camera unavailable (F4 to retry)");
+            }
+        }
     }
 
     // Upload the latest captured frame, if any, before drawing.
@@ -2271,7 +2431,8 @@ impl State {
 
     // Switch tube/mask preset live. Optics come from `self.preset` each frame, but
     // the curvature is baked into the mesh, so the geometry buffers are rebuilt.
-    fn set_preset(&mut self, preset: Preset) {
+    fn set_preset(&mut self, mut preset: Preset) {
+        preset.input = self.preset.input;
         let (verts, indices) = build_mesh(preset.bulge, preset.curv_x, preset.curv_y, preset.cabinet);
         self.res.vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vbuf"),
@@ -2286,6 +2447,13 @@ impl State {
         self.res.index_count = indices.len() as u32;
         self.preset = preset;
         eprintln!("[preset] {}", preset.name);
+        self.show_input();
+    }
+
+    fn show_input(&self) {
+        let label = format!("crtulum — {} — {}", self.preset.name, self.preset.input.label());
+        self.window.set_title(&label);
+        eprintln!("[input] {} (signal {})", self.preset.input.label(), self.preset.input.signal(self.preset.signal));
     }
 
     // Advance the power state and return [warmup, collapse, degauss, 0] for the shader.
@@ -2342,6 +2510,7 @@ impl State {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        self.poll_webcam();
         let time = self.start.elapsed().as_secs_f64();
         // Bootstrap the first field. Thereafter catch-up fields use the source
         // held at the previous presentation, before polling a newer live frame.
@@ -2615,12 +2784,19 @@ fn main() {
     }
 
     // `--preset trinitron|panasonic|slotmask` (default trinitron)
-    let preset = args
+    let mut preset = args
         .iter()
         .position(|a| a == "--preset")
         .and_then(|i| args.get(i + 1))
         .map(|s| preset_by_name(s))
         .unwrap_or(TRINITRON);
+    if let Some(i) = args.iter().position(|a| a == "--input") {
+        preset.input = match args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--input needs a mode"))
+            .and_then(|value| InputMode::parse(value)) {
+            Ok(input) => input,
+            Err(error) => { eprintln!("{error}"); std::process::exit(2); }
+        };
+    }
     eprintln!("[preset] {}", preset.name);
 
     // Headless capture mode: `crtulum --shot out.png [WxH]`
@@ -2734,6 +2910,7 @@ fn main() {
         }
     };
     state.player = player;
+    state.show_input();
 
     event_loop
         .run(move |event, elwt| {
@@ -2773,6 +2950,7 @@ fn main() {
                                         });
                                         eprintln!("[fullscreen] {}", if fullscreen { "on" } else { "off" });
                                     }
+                                    PhysicalKey::Code(KeyCode::F4) if !event.repeat => state.toggle_webcam(),
                                     // L and R isolate the two strongest photographic glass cues.
                                     PhysicalKey::Code(KeyCode::KeyL) => {
                                         state.glare = !state.glare;
@@ -2781,6 +2959,10 @@ fn main() {
                                     PhysicalKey::Code(KeyCode::KeyR) => {
                                         state.window_reflection = !state.window_reflection;
                                         eprintln!("[window reflection] {}", if state.window_reflection { "on" } else { "off" });
+                                    }
+                                    PhysicalKey::Code(KeyCode::F3) if !event.repeat => {
+                                        state.preset.input = state.preset.input.next();
+                                        state.show_input();
                                     }
                                     // 1..9,0 pick a preset directly; Tab cycles through all.
                                     PhysicalKey::Code(KeyCode::Digit1) => state.set_preset(ALL_PRESETS[0]),
@@ -2912,6 +3094,20 @@ mod tests {
     /// this mirrors it here to keep it pinned; a wrong Γ would silently re-expose the whole
     /// picture by a few percent per preset with nothing to see but "the tubes look a bit off".
     #[test]
+    fn input_modes_preserve_defaults_and_cycle_back() {
+        for preset in ALL_PRESETS {
+            assert_eq!(preset.input, InputMode::Auto);
+            assert_eq!(preset.input.signal(preset.signal), preset.signal);
+            assert_eq!(InputMode::Composite.signal(preset.signal), 2);
+            assert_eq!(InputMode::Rf.signal(preset.signal), 3);
+        }
+        let mut input = InputMode::Auto;
+        for _ in 0..6 { input = input.next(); }
+        assert_eq!(input, InputMode::Auto);
+        assert!(InputMode::parse("typo").is_err());
+    }
+
+    #[test]
     fn signal_filter_cutoffs_match_the_documented_bandwidths() {
         // Read the actual shader constants and measure the finite discrete kernel's
         // frequency response; a -6 dB/-3 dB confusion must fail this test.
@@ -2985,6 +3181,26 @@ mod tests {
             1.0, 0.0, &RCA, 1.0, false, 0.0, [1.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, false, 1.0, false, false);
         let source = format!("{}\n{}", concat!(include_str!("phosphor.wgsl"), "\n", include_str!("shader.wgsl")), r#"
+            @fragment fn fs_camera_right(in: FullOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(room(normalize(vec3<f32>(0.3, 0.2, 1.0))), 1.0);
+            }
+            @fragment fn fs_camera_left(in: FullOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(room(normalize(vec3<f32>(-0.3, 0.2, 1.0))), 1.0);
+            }
+            @fragment fn fs_camera_bottom(in: FullOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(room(normalize(vec3<f32>(0.3, -0.2, 1.0))), 1.0);
+            }
+            @fragment fn fs_camera_behind(in: FullOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(room(vec3<f32>(0.0, 0.0, -1.0)), 1.0);
+            }
+            @fragment fn fs_camera_outside(in: FullOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(room(normalize(vec3<f32>(1.0, 0.0, 0.1))), 1.0);
+            }
+            @fragment fn fs_camera_mirror(in: FullOut) -> @location(0) vec4<f32> {
+                // A sloping glass normal redirects a head-on view toward world +X.
+                let n = normalize(vec3<f32>(0.15, 0.10, 1.0));
+                return vec4<f32>(room(reflect(vec3<f32>(0.0, 0.0, -1.0), n)), 1.0);
+            }
             @fragment fn fs_beam_probe(in: FullOut) -> @location(0) vec4<f32> {
                 return vec4<f32>(scan_reconstruct(in.uv, u.params.xy, 1.7, vec2<f32>(0.0)) / u.tone.z, 1.0);
             }
@@ -3038,7 +3254,26 @@ mod tests {
             ("fs_mask_middle", [0.26317; 3]), ("fs_mask_far", [0.26317; 3]),
             ("fs_hdr_srgb", [1.0, 0.0, 0.0]), ("fs_hdr_bt2020", [0.6274, 0.0691, 0.0164]),
             ("fs_bounce", [current; 3]), ("fs_bounce_bfi", [0.0; 3]), ("fs_hum", [1.0; 3]),
-            ("fs_svm_step", [0.5, 1.0, 0.0])] {
+            ("fs_svm_step", [0.5, 1.0, 0.0]),
+            ("fs_camera_right", [1.0, 0.0, 0.0]), ("fs_camera_left", [0.0, 1.0, 0.0]),
+            ("fs_camera_bottom", [0.0, 0.0, 1.0]), ("fs_camera_behind", [0.2, 0.3, 0.4]),
+            ("fs_camera_outside", [0.2, 0.3, 0.4]), ("fs_camera_mirror", [1.0, 0.0, 0.0])] {
+            if entry.starts_with("fs_camera") {
+                let pixels: Vec<u8> = (0..webcam::HEIGHT).flat_map(|y| (0..webcam::WIDTH).flat_map(move |x| {
+                    match (x < webcam::WIDTH / 2, y < webcam::HEIGHT / 2) {
+                        (true, true) => [255, 0, 0, 255],
+                        (false, true) => [0, 255, 0, 255],
+                        (true, false) => [0, 0, 255, 255],
+                        (false, false) => [255; 4],
+                    }
+                })).collect();
+                write_source(&queue, &res.camera_texture, webcam::WIDTH, webcam::HEIGHT, &pixels);
+                res.camera = [1.0, (70_f32.to_radians() * 0.5).tan(), 4.0 / 3.0, 0.0];
+                res.camera_ambient = [0.2, 0.3, 0.4, 0.0];
+                write_uniforms(&queue, &res, &Orbit { yaw: 0.0, pitch: 0.0, distance: 3.0 },
+                    1.0, 0.0, &PVM, 1.0, false, 0.0, [1.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, false, 1.0, false, false);
+            }
             if entry == "fs_svm_step" {
                 let pixels: Vec<u8> = (0..64).flat_map(|i| [if i % 8 < 4 { 0 } else { 255 }; 4]).collect();
                 res.set_source(&device, &queue, 8, 8, wgpu::TextureFormat::Rgba8UnormSrgb, &pixels);

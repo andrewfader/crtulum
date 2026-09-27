@@ -76,6 +76,34 @@ tube can be viewed under neutral glass lighting without adding a visible room cu
 Headless shots expose the same switches as `CRTULUM_GLARE=0` and
 `CRTULUM_WINDOW_REFLECTION=0`.
 
+**F4** toggles a live webcam room. Capture is off at startup. Once frames arrive,
+its image replaces the synthetic room, including the daylight window and ceiling
+highlights, in the curved glass and cabinet reflections. Camera colors also light
+the cabinet and the glass's diffuse wash. The title shows when the camera is live;
+pressing F4 again closes the camera and restores the usual room. Capture failure
+or a five-second stall also releases the camera and restores the room; see the
+terminal for the error and press F4 to retry. L/R retain their synthetic-room
+settings for when the camera is off.
+
+This optional feature requires **ffmpeg with V4L2 support** and access to a Linux
+camera device (default `/dev/video0`). For another device or lens:
+
+```sh
+CRTULUM_WEBCAM_DEVICE=/dev/video2 CRTULUM_WEBCAM_FOV=70 cargo run --release
+```
+
+Mount the camera at the display, facing the viewer. `CRTULUM_WEBCAM_FOV` is the
+horizontal field of view in degrees (20–140, default 70) of the center-cropped
+4:3 feed. Capture requests 640×480 at 30 fps; frames are center-cropped without stretching
+if the driver negotiates another aspect ratio.
+The room stays fixed as you orbit; the reflection uses the glass normal, mirror
+orientation and Fresnel response. A single SDR camera cannot recover room depth,
+HDR light intensity or a full panorama: unseen directions use the feed's mean
+linear color, and cabinet roughness uses an approximate blur. Capture stays local
+in memory, with no recording or upload. It does not change the game/screen source
+or enable camera capture in headless exports.
+
+
 Sound comes from the core, resampled to whatever your audio device wanted.
 `CRTULUM_PLAY_STATS=1` prints the emulated rate and how much audio is buffered, which
 is what to look at if it ever feels off.
@@ -348,6 +376,7 @@ the screen that drove people nuts and that nobody could explain.
 | left-drag    | orbit the tube                          |
 | scroll       | zoom                                    |
 | 1–9,0 / Tab  | pick / cycle preset                     |
+| F3           | cycle input: default, composite, RF, S-video, RGB, component |
 | P            | power (warm-up, or collapse to a dot)   |
 | G            | degauss                                 |
 | I            | interlaced / progressive scanning        |
@@ -446,6 +475,30 @@ and razor-flat. Hit **M** for subpixel mask mapping, which lands each simulated
 phosphor on an RGB panel subpixel at native resolution, or **B**
 for black-frame insertion, which strobes the tube dark between frames so motion snaps
 like an actual CRT instead of smearing like an LCD (you'll want a 120 Hz panel).
+
+**Choose the connection independently of the tube.** Press **F3** to cycle preset
+default → composite → RF → S-video → RGB → component → default. The window title
+shows the selection. An explicit choice stays selected across preset changes;
+`auto` restores each preset's original default: S-video for Trinitron, composite
+for Panasonic/slotmask/RCA, clean for PVM/arcade/PC/monochrome.
+Use `--input composite` (or `rf`, `s-video`, `rgb`, `component`, `auto`) for live
+viewing, `--shot`, `--clip`, or `--render`. Render scripts accept `connection rf` as a
+starting setting, retained across timeline preset swaps.
+
+Every tube can display every modeled signal path, including composite. Connections
+absent on the original hardware represent an external decoder, tuner, or converter,
+not added physical sockets. These are family presets, not exact rear-panel models:
+consumer TVs can use their antenna RF connection; PVMs offer composite, Y/C,
+and RGB/component ([Sony manual](https://pro.sony/s3/cms-static-content/operation-manual/4089510121.pdf)).
+Arcade/PC/terminal presets need conversion for TV signals. RGB and component currently
+share the clean path. Changing the connection preserves tube focus, geometry,
+phosphor, overscan, and power-supply behavior.
+
+RF is a separate **NES-style modulator/tuner approximation**: the composite decoder
+plus extra voltage-space softness and stronger noise. It represents the antenna
+hookup ([Nintendo instructions](https://www.nintendo.com/de-ch/Support/NES/Installation/Anschl-uuml-sse-Videorecorder/Anschluss-uber-Antennenkabel/Anschluss-uber-Antennenkabel-246268.html)),
+not a circuit-level RF model or an NES PPU waveform emulator. Existing preset defaults
+and their noise levels are unchanged.
 
 **The signal path is period-correct.** RGB and component stay clean (PVM, arcade,
 PC monitors). S-video keeps sharp luma but band-limits color. Composite gets the
