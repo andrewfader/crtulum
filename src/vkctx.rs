@@ -108,6 +108,23 @@ pub struct NegotiationInterface {
     pub create_device2: Option<CreateDevice2Fn>,
 }
 
+// v1 is a shorter C allocation. Copy its prefix without constructing a v2
+// reference (or reading the two optional pointers beyond its allocation).
+pub unsafe fn copy_negotiation(ptr: *const NegotiationInterface) -> Option<NegotiationInterface> {
+    if ptr.is_null() { return None; }
+    let version = std::ptr::addr_of!((*ptr).interface_version).read();
+    if !(1..=2).contains(&version) { return None; }
+    Some(NegotiationInterface {
+        interface_type: std::ptr::addr_of!((*ptr).interface_type).read(),
+        interface_version: version,
+        get_application_info: std::ptr::addr_of!((*ptr).get_application_info).read(),
+        create_device: std::ptr::addr_of!((*ptr).create_device).read(),
+        destroy_device: std::ptr::addr_of!((*ptr).destroy_device).read(),
+        create_instance: if version >= 2 { std::ptr::addr_of!((*ptr).create_instance).read() } else { None },
+        create_device2: if version >= 2 { std::ptr::addr_of!((*ptr).create_device2).read() } else { None },
+    })
+}
+
 type CreateInstanceWrapperFn = unsafe extern "C" fn(
     opaque: *mut c_void,
     create_info: *const vk::InstanceCreateInfo,
@@ -328,7 +345,7 @@ pub struct VkHost {
     queue: vk::Queue,
     queue_family: u32,
     device: ash::Device,
-    /// Set when the core created the device, in which case it destroys it too.
+    /// The core destroys auxiliary resources; the frontend owns VkDevice.
     core_destroy_device: Option<unsafe extern "C" fn()>,
     gpu: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
@@ -337,7 +354,6 @@ pub struct VkHost {
     _wrapper_ctx: Box<WrapperCtx>,
     instance: ash::Instance,
     _entry: ash::Entry,
-    scratch: Vec<u8>,
 }
 
 impl VkHost {
@@ -398,6 +414,7 @@ impl VkHost {
             })
             .filter(|i| *i != vk::Instance::null());
 
+        let mut headless_available = false;
         let instance = match negotiated_instance {
             Some(handle) => unsafe { ash::Instance::load(entry.static_fn(), handle) },
             None => {
@@ -417,6 +434,7 @@ impl VkHost {
                 if has(vk::KhrSurfaceFn::name()) && has(vk::ExtHeadlessSurfaceFn::name()) {
                     names.push(vk::KhrSurfaceFn::name().as_ptr());
                     names.push(vk::ExtHeadlessSurfaceFn::name().as_ptr());
+                    headless_available = true;
                 }
                 unsafe {
                     entry.create_instance(
@@ -450,7 +468,7 @@ impl VkHost {
             std::mem::transmute(entry.get_instance_proc_addr(instance.handle(), name.as_ptr()))
         });
         let mut surface = vk::SurfaceKHR::null();
-        if negotiated_instance.is_none() {
+        if headless_available {
             let info = vk::HeadlessSurfaceCreateInfoEXT::default();
             let r = unsafe {
                 (headless_fns.create_headless_surface_ext)(
@@ -593,10 +611,8 @@ impl VkHost {
             // hardware contract on its result as well as on our offered device.
             unsafe {
                 let _ = device.device_wait_idle();
-                match core_destroy_device {
-                    Some(destroy) => destroy(),
-                    None => device.destroy_device(None),
-                }
+                if let Some(destroy) = core_destroy_device { destroy(); }
+                device.destroy_device(None);
                 if surface != vk::SurfaceKHR::null() {
                     (surface_fns.destroy_surface_khr)(instance.handle(), surface, std::ptr::null());
                 }
@@ -680,7 +696,6 @@ impl VkHost {
             _wrapper_ctx: wrapper_ctx,
             instance,
             _entry: entry,
-            scratch: Vec::new(),
         })
     }
 
@@ -699,10 +714,6 @@ impl VkHost {
             return Ok(());
         }
         unsafe {
-            if self.readback != vk::Buffer::null() {
-                self.device.destroy_buffer(self.readback, None);
-                self.device.free_memory(self.readback_mem, None);
-            }
             let buffer = self.device.create_buffer(
                 &vk::BufferCreateInfo::builder()
                     .size(bytes)
@@ -718,14 +729,25 @@ impl VkHost {
                     req.memory_type_bits & (1 << i) != 0
                         && mem_props.memory_types[*i as usize].property_flags.contains(want)
                 })
-                .ok_or_else(|| anyhow!("no host-visible memory type for readback"))?;
+                .ok_or_else(|| {
+                    self.device.destroy_buffer(buffer, None);
+                    anyhow!("no host-visible memory type for readback")
+                })?;
             let mem = self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::builder()
                     .allocation_size(req.size)
                     .memory_type_index(type_index),
                 None,
-            )?;
-            self.device.bind_buffer_memory(buffer, mem, 0)?;
+            ).map_err(|e| { self.device.destroy_buffer(buffer, None); e })?;
+            if let Err(e) = self.device.bind_buffer_memory(buffer, mem, 0) {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(mem, None);
+                return Err(e.into());
+            }
+            if self.readback != vk::Buffer::null() {
+                self.device.destroy_buffer(self.readback, None);
+                self.device.free_memory(self.readback_mem, None);
+            }
             self.readback = buffer;
             self.readback_mem = mem;
             self.readback_size = bytes;
@@ -736,19 +758,32 @@ impl VkHost {
     /// Submit whatever the core left pending, copy its image out, and return it as
     /// RGBA8. Called once per frame, right after `retro_run`.
     pub fn read_frame(&mut self, width: u32, height: u32, out: &mut Vec<u8>) -> Result<()> {
-        let (image, semaphores, cmd_buffers, signal, layout) = {
+        let (image, mut semaphores, cmd_buffers, signal, layout, source_family) = {
             let mut p = self.shared.pending.lock().unwrap();
             let img = p.image.ok_or_else(|| anyhow!("the core reported a GPU frame but never called set_image"))?;
             let sems = std::mem::take(&mut p.semaphores);
             let cmds = std::mem::take(&mut p.cmd);
             let signal = std::mem::replace(&mut p.signal, vk::Semaphore::null());
-            (img, sems, cmds, signal, img.image_layout)
+            (img, sems, cmds, signal, img.image_layout, p.src_queue_family)
         };
         let vk_image = image.create_info.image;
         if vk_image == vk::Image::null() {
             bail!("the core's image view has no image attached");
         }
 
+        anyhow::ensure!(matches!(image.create_info.format,
+            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB |
+            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB),
+            "unsupported core readback format {:?}; expected RGBA8/BGRA8", image.create_info.format);
+        // set_command_buffers uses in-queue barriers instead of semaphore waits.
+        if !cmd_buffers.is_empty() { semaphores.clear(); }
+        let transfer = !semaphores.is_empty() && source_family != vk::QUEUE_FAMILY_IGNORED
+            && source_family != self.queue_family;
+        let (src_family, dst_family) = if transfer { (source_family, self.queue_family) }
+            else { (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED) };
+        // GENERAL permits concurrent reads and must not be transitioned by the frontend.
+        let copy_layout = if layout == vk::ImageLayout::GENERAL { layout }
+            else { vk::ImageLayout::TRANSFER_SRC_OPTIMAL };
         let (w, h) = (width.max(1), height.max(1));
         let bytes = (w as u64) * (h as u64) * 4;
         self.ensure_readback(bytes)?;
@@ -765,18 +800,28 @@ impl VkHost {
 
             let range = vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
+                base_mip_level: image.create_info.subresource_range.base_mip_level,
                 level_count: 1,
-                base_array_layer: 0,
+                base_array_layer: image.create_info.subresource_range.base_array_layer,
                 layer_count: 1,
             };
+            if transfer {
+                let acquire = vk::ImageMemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                    .old_layout(layout).new_layout(layout)
+                    .src_queue_family_index(src_family).dst_queue_family_index(dst_family)
+                    .image(vk_image).subresource_range(range).build();
+                self.device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[acquire]);
+            }
             // Take the image from whatever layout the core left it in, copy it, and
             // put it back so the core's own tracking stays true.
             let to_src = vk::ImageMemoryBarrier::builder()
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                 .old_layout(layout)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(copy_layout)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(vk_image)
@@ -797,8 +842,8 @@ impl VkHost {
                 .buffer_image_height(0)
                 .image_subresource(vk::ImageSubresourceLayers {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
+                    mip_level: range.base_mip_level,
+                    base_array_layer: range.base_array_layer,
                     layer_count: 1,
                 })
                 .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
@@ -806,7 +851,7 @@ impl VkHost {
             self.device.cmd_copy_image_to_buffer(
                 self.cmd,
                 vk_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                copy_layout,
                 self.readback,
                 &[region.build()],
             );
@@ -814,7 +859,7 @@ impl VkHost {
             let back = vk::ImageMemoryBarrier::builder()
                 .src_access_mask(vk::AccessFlags::TRANSFER_READ)
                 .dst_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .old_layout(copy_layout)
                 .new_layout(layout)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -829,6 +874,22 @@ impl VkHost {
                 &[],
                 &[back.build()],
             );
+            if transfer {
+                let release = vk::ImageMemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .old_layout(layout).new_layout(layout)
+                    .src_queue_family_index(dst_family).dst_queue_family_index(src_family)
+                    .image(vk_image).subresource_range(range).build();
+                self.device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &[release]);
+            }
+            let host_read = vk::BufferMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.readback).offset(0).size(bytes).build();
+            self.device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[], &[host_read], &[]);
             self.device.end_command_buffer(self.cmd)?;
 
             // The core's own command buffers (if it handed us any) go first, then our
@@ -860,28 +921,15 @@ impl VkHost {
                 bytes,
                 vk::MemoryMapFlags::empty(),
             )? as *const u8;
-            self.scratch.resize(bytes as usize, 0);
-            std::ptr::copy_nonoverlapping(ptr, self.scratch.as_mut_ptr(), bytes as usize);
+            out.resize(bytes as usize, 0);
+            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), bytes as usize);
             self.device.unmap_memory(self.readback_mem);
         }
-
-        // Vulkan images are usually B8G8R8A8; the phosphor pipeline wants RGBA8.
-        out.resize(self.scratch.len(), 0);
-        let swap = matches!(
-            image.create_info.format,
-            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_SNORM
-        );
-        for (o, i) in out.chunks_exact_mut(4).zip(self.scratch.chunks_exact(4)) {
-            if swap {
-                o[0] = i[2];
-                o[1] = i[1];
-                o[2] = i[0];
-            } else {
-                o[0] = i[0];
-                o[1] = i[1];
-                o[2] = i[2];
-            }
-            o[3] = 255;
+        let swap = matches!(image.create_info.format,
+            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB);
+        for pixel in out.chunks_exact_mut(4) {
+            if swap { pixel.swap(0, 2); }
+            pixel[3] = 255;
         }
 
         let next = (self.shared.sync_index.load(Ordering::Relaxed) + 1) % SYNC_SLOTS;
@@ -904,11 +952,10 @@ impl Drop for VkHost {
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.cmd_pool, None);
             if trace { eprintln!("[teardown] vk: destroy device"); }
-            match self.core_destroy_device {
-                // The core made the device, so the core takes it down.
-                Some(destroy) => destroy(),
-                None => self.device.destroy_device(None),
-            }
+            // libretro_vulkan.h assigns the device to the frontend even when
+            // negotiated. The callback only releases the core's auxiliary objects.
+            if let Some(destroy) = self.core_destroy_device { destroy(); }
+            self.device.destroy_device(None);
             if self.surface != vk::SurfaceKHR::null() {
                 (self.surface_fns.destroy_surface_khr)(self.instance.handle(), self.surface, std::ptr::null());
             }
@@ -916,5 +963,27 @@ impl Drop for VkHost {
             self.instance.destroy_instance(None);
             if trace { eprintln!("[teardown] vk: done"); }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negotiation_v1_does_not_read_v2_fields() {
+        #[repr(C)]
+        struct V1 {
+            kind: u32,
+            version: u32,
+            app: Option<unsafe extern "C" fn() -> *const vk::ApplicationInfo>,
+            device: Option<CreateDeviceFn>,
+            destroy: Option<unsafe extern "C" fn()>,
+        }
+        let v1 = V1 { kind: 0, version: 1, app: None, device: None, destroy: None };
+        let copied = unsafe { copy_negotiation((&v1 as *const V1).cast()) }.unwrap();
+        assert_eq!(copied.interface_version, 1);
+        assert!(copied.create_instance.is_none() && copied.create_device2.is_none());
+        assert!(unsafe { copy_negotiation(std::ptr::null()) }.is_none());
     }
 }

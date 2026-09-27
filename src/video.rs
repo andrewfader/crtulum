@@ -393,6 +393,10 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
                     Some((k, v)) => (k, Some(v)),
                     None => (tok, None),
                 };
+                if inline.is_some() && matches!(key.to_ascii_lowercase().as_str(),
+                    "to" | "toward" | "ease" | "smooth" | "linear") {
+                    bail!("`{key}` does not take a value");
+                }
                 match key.to_ascii_lowercase().as_str() {
                     "to" | "toward" => {}
                     "yaw" => yaw = Some(a.value_for("yaw", inline)?),
@@ -413,12 +417,19 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
                     Some((k, v)) => (k, Some(v)),
                     None => (tok, None),
                 };
+                if inline.is_some() && matches!(key.to_ascii_lowercase().as_str(),
+                    "to" | "toward" | "ease" | "smooth" | "linear") {
+                    bail!("`{key}` does not take a value");
+                }
                 match key.to_ascii_lowercase().as_str() {
                     "over" | "in" => over = a.value_for("over", inline)?,
                     "turns" => turns = a.value_for("turns", inline)?,
                     "ease" | "smooth" => ease = true,
                     "linear" => ease = false,
-                    v => turns = v.parse().with_context(|| format!("bad spin arg `{v}`"))?,
+                    v => {
+                        if inline.is_some() { bail!("unexpected assignment `{tok}` in spin"); }
+                        turns = v.parse().with_context(|| format!("bad spin arg `{v}`"))?;
+                    }
                 }
             }
             if !turns.is_finite() { bail!("turns must be finite"); }
@@ -431,12 +442,19 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
                     Some((k, v)) => (k, Some(v)),
                     None => (tok, None),
                 };
+                if inline.is_some() && matches!(key.to_ascii_lowercase().as_str(),
+                    "to" | "toward" | "ease" | "smooth" | "linear") {
+                    bail!("`{key}` does not take a value");
+                }
                 match key.to_ascii_lowercase().as_str() {
                     "to" => {}
                     "over" | "in" => over = a.value_for("over", inline)?,
                     "ease" | "smooth" => ease = true,
                     "linear" => ease = false,
-                    v => to = Some(v.parse().with_context(|| format!("bad exposure `{v}`"))?),
+                    v => {
+                        if inline.is_some() { bail!("unexpected assignment `{tok}` in exposure"); }
+                        to = Some(v.parse().with_context(|| format!("bad exposure `{v}`"))?);
+                    }
                 }
             }
             let to: f32 = to.ok_or_else(|| anyhow!("`exposure` needs a value"))?;
@@ -534,7 +552,7 @@ fn parse_action(toks: &[&str]) -> Result<Action> {
                             .parse()
                             .context("bad duration after `for`")?;
                         if !n.is_finite() || n <= 0.0 { bail!("button duration must be positive and finite"); }
-                        if matches!(verb.as_str(), "hold" | "release") { bail!("`{verb}` does not take a duration; use press"); }
+                        if matches!(verb.as_str(), "hold" | "release" | "tap") { bail!("`{verb}` does not take a duration; use press"); }
                         // A bare number is seconds; `frames`/`f` makes it exact.
                         let unit = a.toks.get(a.i).copied().unwrap_or("");
                         dur = Some(match unit.to_ascii_lowercase().as_str() {
@@ -1093,67 +1111,9 @@ fn fetch_url(url: &str, work: &Path, dry: bool) -> Result<PathBuf> {
     Ok(f)
 }
 
-/// Guess a libretro core for a ROM extension, then find its .so.
+// Replays and in-process runs share extension rules, search paths and priorities.
 fn core_for(rom: &Path, explicit: Option<&str>) -> Result<PathBuf> {
-    let candidates: Vec<&str> = match explicit {
-        Some(c) => vec![c],
-        None => {
-            let ext = rom
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            match ext.as_str() {
-                "nes" | "fds" | "unf" => vec!["mesen", "nestopia", "fceumm", "quicknes"],
-                "sfc" | "smc" => vec!["snes9x", "bsnes_mercury_balanced", "bsnes", "mesen-s"],
-                "gb" | "gbc" => vec!["gambatte", "sameboy", "mgba"],
-                "gba" => vec!["mgba", "vbam"],
-                "n64" | "z64" | "v64" => vec!["mupen64plus_next", "parallel_n64"],
-                "md" | "gen" | "smd" | "sms" | "gg" => vec!["genesis_plus_gx", "picodrive"],
-                "pce" | "sgx" => vec!["mednafen_pce", "mednafen_pce_fast"],
-                "cue" | "chd" | "pbp" => vec!["swanstation", "pcsx_rearmed", "beetle_psx"],
-                "a26" | "bin" => vec!["stella"],
-                "ws" | "wsc" => vec!["mednafen_wswan"],
-                _ => vec![],
-            }
-        }
-    };
-    if candidates.is_empty() {
-        bail!(
-            "cannot guess a libretro core for {:?} — pass --core <name> (e.g. --core mesen)",
-            rom
-        );
-    }
-    let dirs = [
-        std::env::var("RETROARCH_CORE_DIR").unwrap_or_default(),
-        format!(
-            "{}/.config/retroarch/cores",
-            std::env::var("HOME").unwrap_or_default()
-        ),
-        "/usr/lib/libretro".into(),
-        "/usr/local/lib/libretro".into(),
-    ];
-    for c in &candidates {
-        // An explicit --core may already be a path.
-        let direct = Path::new(c);
-        if direct.is_file() {
-            return Ok(direct.to_path_buf());
-        }
-        for d in dirs.iter().filter(|d| !d.is_empty()) {
-            for name in [format!("{c}_libretro.so"), format!("{c}.so")] {
-                let p = Path::new(d).join(&name);
-                if p.is_file() {
-                    return Ok(p);
-                }
-            }
-        }
-    }
-    bail!(
-        "no libretro core found for {:?} (tried {}). Install one with RetroArch's \
-         core downloader, or pass --core /path/to/core_libretro.so",
-        rom,
-        candidates.join(", ")
-    )
+    crate::libretro::find_core(Some(rom), explicit)
 }
 
 // Replay cache entries depend on the selected core and file revisions, not just
@@ -2392,6 +2352,21 @@ pub fn render(opts: Opts) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 pub const USAGE: &str = "\
+crtulum --gamescope            nested gamescope; HDR where the desktop supports it
+crtulum --gamescope-hdr-test    HDR client with gamescope SDR tone mapping (SDL backend)
+                              append live options such as --play ROM --preset pvm
+crtulum --verify-frames N      present N frames, log output color space, exit cleanly
+  --require-hdr               fail instead of SDR fallback (live display verification)
+crtulum                       live test pattern
+crtulum --capture             pick a window/screen through the desktop portal
+crtulum --play ROM [--core NAME] [--option K=V]
+crtulum --shot FILE.png [WxH]  headless screenshot (default 1000x800)
+
+Live/shot: --preset NAME, --input MODE. Live controls:
+  drag/scroll orbit/zoom; 1-9,0/Tab presets; F2 pause game; F3 input; F4 webcam;
+  F11 fullscreen; Esc leave fullscreen/quit; P power; G degauss; I interlace;
+  M subpixel mask; B black-frame insertion; L glare; R window reflection; [/] exposure.
+
 crtulum --render [INPUT] [OUTPUT] [options]
 
   INPUT     a video file · a URL (yt-dlp) · a directory of stills
@@ -2640,6 +2615,26 @@ impl Opts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_core_selection_requires_explicit_ambiguous_extensions() {
+        for path in ["game.bin", "game.iso"] {
+            let error = core_for(Path::new(path), None).unwrap_err().to_string();
+            assert!(error.contains("cannot guess"), "{error}");
+        }
+        let executable = std::env::current_exe().unwrap();
+        assert_eq!(core_for(Path::new("game.bin"), executable.to_str()).unwrap(), executable);
+    }
+
+    #[test]
+    fn script_typos_report_the_line_and_taps_stay_one_frame() {
+        for action in ["tap a for 20 frames", "camera yaw=1 linear=typo", "spin 1 ease=typo", "exposure 1 to=typo", "spin 1=typo", "exposure 1=typo"] {
+            let err = parse_script(&format!("preset pvm\nat 0 {action}")).err().expect(action);
+            assert!(format!("{err:#}").contains("script line 2"));
+        }
+        let script = parse_script("frame 10 tap a").unwrap();
+        assert!(matches!(script.events[0].1, Action::Press { dur: Some(Dur::Frames(1)), .. }));
+    }
 
     #[test]
     fn input_override_survives_script_preset_changes() {

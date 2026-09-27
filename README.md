@@ -14,7 +14,25 @@ glass the right way.
 
 ## Build & run
 
-Current Rust toolchain (system rustup, stable). Then:
+Build on Linux with a current stable Rust toolchain, a C compiler, `pkg-config`,
+Clang/libclang, and development packages for PipeWire, D-Bus, Wayland, ALSA,
+and udev. The package list used by CI is in
+[the build workflow](.github/workflows/rust.yml).
+
+Live capture needs a running PipeWire service and a desktop portal backend that
+implements ScreenCast. Additional tools depend on the feature:
+
+| Feature | Runtime tools/assets |
+| --- | --- |
+| Video/PNG export and media checks | `ffmpeg`, `ffprobe` |
+| URL sources | `yt-dlp` plus ffmpeg |
+| Live or scripted games | installed libretro core, ROM, and any BIOS the core requires |
+| Existing `.bsv` replays | `retroarch` plus the matching core and ROM |
+| Fetching Agent characters | `curl` |
+| Character speech | `espeak-ng`, or a command supplied through `CRTULUM_TTS` |
+| Webcam reflections | ffmpeg with V4L2 support and camera-device access |
+
+Then:
 
 ```sh
 cargo run -- --capture
@@ -32,7 +50,9 @@ build executes headless shader and export checks on Mesa lavapipe. Normal builds
 still require physical hardware; CI software results do not certify hardware
 performance or display behavior.
 
-That pops the screencast picker. Point it at something. It lands on the tube.
+`--capture` pops the screencast picker. Point it at something. It lands on the tube.
+Running without a source displays the built-in test pattern. To install the
+`crtulum` command used in the examples below, run `cargo install --path .`.
 
 No window? Take a picture instead — handy when your compositor won't do
 wlr-screencopy and `grim` gives up:
@@ -376,14 +396,18 @@ the screen that drove people nuts and that nobody could explain.
 | left-drag    | orbit the tube                          |
 | scroll       | zoom                                    |
 | 1–9,0 / Tab  | pick / cycle preset                     |
+| F2           | pause/resume a running game              |
 | F3           | cycle input: default, composite, RF, S-video, RGB, component |
+| F4           | start/stop webcam room reflections      |
+| F11          | toggle borderless fullscreen            |
+| L / R        | toggle glass glare / synthetic window reflection |
 | P            | power (warm-up, or collapse to a dot)   |
 | G            | degauss                                 |
 | I            | interlaced / progressive scanning        |
 | M            | subpixel mask (Megatron) / gaussian     |
 | B            | black-frame insertion (needs 100 Hz+)   |
 | `[` / `]`    | exposure trim (for HDR panels)          |
-| Esc          | quit                                    |
+| Esc          | leave fullscreen first; otherwise quit  |
 
 ## What's actually going on in there
 
@@ -485,6 +509,20 @@ Use `--input composite` (or `rf`, `s-video`, `rgb`, `component`, `auto`) for liv
 viewing, `--shot`, `--clip`, or `--render`. Render scripts accept `connection rf` as a
 starting setting, retained across timeline preset swaps.
 
+```sh
+# A PVM fed composite, or a consumer TV through the RF approximation
+cargo run --release -- --play game.nes --preset pvm --input composite
+cargo run --release -- --play game.nes --preset trinitron --input rf
+
+# The same connection controls apply to screenshots and exports
+cargo run --release -- --shot rf.png 1000x800 --preset rca --input rf
+cargo run --release -- --render clip.mp4 out.mp4 --preset pvm --input s-video
+```
+
+Use `connection composite` in a render script; `--input rf` overrides that setup
+line. `source` (also spelled `input` in scripts) names the media file instead.
+The title retains the selected preset and input while webcam status changes.
+
 Every tube can display every modeled signal path, including composite. Connections
 absent on the original hardware represent an external decoder, tuner, or converter,
 not added physical sockets. These are family presets, not exact rear-panel models:
@@ -532,11 +570,60 @@ and glass catch highlights instead of looking like a screensaver from 1999.
 
 ## HDR
 
-If you've got the panel for it, it'll drive true HDR — linear sRGB (scRGB) or BT.2020,
-matching the configured swapchain. The compositor does the transfer, with beam
-cores and speculars above 1.0.
+With an HDR-capable panel and compositor surface, it drives true HDR — linear
+sRGB (scRGB), linear BT.2020, or HDR10 PQ, matching the configured swapchain.
+Linear output preserves beam cores and speculars above 1.0; HDR10 output applies
+the PQ transfer after conversion to BT.2020 (scRGB reference white is 80 nits).
 This is the fussiest part on Linux and it took a vendored wgpu-hal patch to get the
 colorspace mapping right. Use `[` / `]` to trim exposure to taste.
+
+The renderer uses Vulkan and selects an advertised HDR format/colorspace pair.
+The startup log names the selected encoding. If the compositor offers only SDR,
+crtulum automatically tone maps to SDR; `--require-hdr` makes that an error for
+verification. Native HDR remains automatic on desktops that expose it, including
+the previously supported GNOME path. PNG and video exports use SDR output with
+the same floating-point phosphor simulation.
+
+### Gamescope
+
+Install `gamescope` and its Vulkan WSI layer, then run:
+
+```sh
+cargo run --release -- --gamescope
+cargo run --release -- --gamescope-hdr-test --require-hdr
+```
+
+`--gamescope` uses its nested Wayland backend, requesting HDR when the parent
+desktop supports it and falling back to SDR otherwise. `--gamescope-hdr-test`
+uses the SDL backend to expose an HDR surface to crtulum while gamescope tone
+maps to an SDR desktop. This tests the HDR rendering path even on a non-HDR
+compositor; it does not turn the physical display into an HDR output. These
+modes use Xwayland for the client window and Vulkan for rendering. Arguments
+such as `--play`, `--preset`, and `--input` also pass through to the child.
+
+The launcher scopes its WSI settings to the child, including workarounds for
+gamescope 3.16.29 presentation validation issues. It does not change desktop
+settings or force HDR-encoded output onto an SDR display.
+
+## Checking a build
+
+On a machine with a physical Vulkan GPU:
+
+```sh
+cargo test -- --test-threads=1
+cargo test --manifest-path crates/acs/Cargo.toml
+cargo build
+python3 scripts/verify_exports.py --binary target/debug/crtulum
+# Opens three short-lived windows; requires a desktop and gamescope + WSI layer:
+python3 scripts/verify_display.py --binary target/debug/crtulum
+```
+
+The export checks generate temporary test media and inspect the resulting files
+with ffprobe: codecs, frame counts, audio, PNG output, seeking, and cache behavior.
+Optional core and character checks report skips when their assets are unavailable.
+For the headless software-Vulkan checks used in CI, add
+`--features ci-software-vulkan` to the root `cargo test` and `cargo build` commands;
+this does not enable software rendering for the live window.
 
 ## Where things live
 
@@ -553,6 +640,9 @@ colorspace mapping right. Use `[` / `]` to trim exposure to taste.
   a time with a scripted button mask, hands back RGBA frames and PCM.
 - `src/glctx.rs` — the headless EGL/OpenGL context that hardware-rendering cores draw
   into, plus the readback.
+- `src/webcam.rs` — optional V4L2 camera capture, frame delivery, and camera shutdown.
+- `src/gpu.rs` — Vulkan adapter selection and the headless CI software exception.
+- `src/phosphor.wgsl` — the measured-response reservoir coefficients.
 - `src/play.rs` — live play: clock-paced emulation, gamepad and keyboard input, and
   the audio output.
 - `src/vkctx.rs` — the Vulkan equivalent: instance, device, the negotiation handshake,

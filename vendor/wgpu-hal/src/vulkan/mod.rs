@@ -309,6 +309,7 @@ impl SwapchainImageSemaphores {
 
 struct Swapchain {
     color_space: vk::ColorSpaceKHR,
+    gamescope_present_mode: bool,
     raw: vk::SwapchainKHR,
     raw_flags: vk::SwapchainCreateFlagsKHR,
     functor: khr::Swapchain,
@@ -1080,10 +1081,18 @@ impl crate::Queue for Queue {
 
         let swapchains = [ssc.raw];
         let image_indices = [texture.index];
-        let vk_info = vk::PresentInfoKHR::builder()
+        let present_modes = [conv::map_present_mode(ssc.config.present_mode)];
+        let mut mode_info = vk::SwapchainPresentModeInfoEXT::builder().present_modes(&present_modes);
+        let mut vk_info = vk::PresentInfoKHR::builder()
             .swapchains(&swapchains)
             .image_indices(&image_indices)
             .wait_semaphores(swapchain_semaphores.get_present_wait_semaphores());
+        // gamescope 3.16.29's WSI layer enables maintenance1, but its present
+        // chain patcher leaves swapchainCount at zero when the app has no mode
+        // structure. Supply the existing mode/count for that opt-in launcher.
+        if ssc.gamescope_present_mode {
+            vk_info = vk_info.push_next(&mut mode_info);
+        }
 
         let suboptimal = {
             profiling::scope!("vkQueuePresentKHR");

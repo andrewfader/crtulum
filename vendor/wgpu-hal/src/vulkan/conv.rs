@@ -169,9 +169,6 @@ pub fn map_vk_surface_formats(sf: vk::SurfaceFormatKHR) -> Option<wgt::TextureFo
         },
         vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT => match sf.format {
             F::R16G16B16A16_SFLOAT => Tf::Rgba16Float,
-            F::R16G16B16A16_SNORM => Tf::Rgba16Snorm,
-            F::R16G16B16A16_UNORM => Tf::Rgba16Unorm,
-            F::A2B10G10R10_UNORM_PACK32 => Tf::Rgb10a2Unorm,
             _ => return None,
         },
         // crtulum patch: many Wayland compositors (e.g. mutter) advertise their HDR
@@ -179,6 +176,10 @@ pub fn map_vk_surface_formats(sf: vk::SurfaceFormatKHR) -> Option<wgt::TextureFo
         // too — otherwise every float format is filtered out and HDR is unreachable.
         vk::ColorSpaceKHR::BT2020_LINEAR_EXT => match sf.format {
             F::R16G16B16A16_SFLOAT => Tf::Rgba16Float,
+            _ => return None,
+        },
+        vk::ColorSpaceKHR::HDR10_ST2084_EXT => match sf.format {
+            F::A2B10G10R10_UNORM_PACK32 => Tf::Rgb10a2Unorm,
             _ => return None,
         },
         _ => return None,

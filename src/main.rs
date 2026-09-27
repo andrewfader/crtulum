@@ -19,12 +19,14 @@ mod webcam;
 mod font8x8;
 mod glctx;
 mod gpu;
+mod gamescope;
 mod vkctx;
 mod libretro;
 mod play;
 mod video;
 mod rom_cache;
 mod phosphor;
+mod benchmark;
 
 use std::sync::Arc;
 
@@ -1177,19 +1179,10 @@ const AMBER: Preset = Preset {
     mono: [1.0, 0.44, 0.06, 1.0], // P3 amber (CIE ~0.523,0.469) → sRGB, normalized
 };
 
-fn preset_by_name(name: &str) -> Preset {
-    match name {
-        "panasonic" => PANASONIC,
-        "slotmask" => SLOTMASK,
-        "rca" => RCA,
-        "pvm" => PVM,
-        "arcade" => ARCADE,
-        "vga" => VGA,
-        "diamondtron" => DIAMONDTRON,
-        "green" => GREEN,
-        "amber" => AMBER,
-        _ => TRINITRON,
-    }
+fn preset_by_name(name: &str) -> anyhow::Result<Preset> {
+    ALL_PRESETS.iter().find(|p| p.name.eq_ignore_ascii_case(name)).copied()
+        .ok_or_else(|| anyhow::anyhow!("unknown preset `{name}` (have: {})",
+            ALL_PRESETS.iter().map(|p| p.name).collect::<Vec<_>>().join(", ")))
 }
 
 // Cycle order for the Tab key + digit selection (1..9, 0).
@@ -1206,7 +1199,7 @@ struct Resources {
     camera_view: wgpu::TextureView,
     camera: [f32; 4],
     camera_ambient: [f32; 4],
-    hdr_bt2020: bool,
+    hdr_output: u8,
     physical_phosphor: bool,
     shutter_fraction: f32,
     exposure_group: u32,
@@ -1721,7 +1714,7 @@ fn build_resources(
 
     Resources {
         camera_texture, camera_view, camera: [0.0; 4], camera_ambient: [0.0; 4],
-        hdr_bt2020: false,
+        hdr_output: 1,
         physical_phosphor: std::env::var("CRTULUM_PHOSPHOR").as_deref() != Ok("legacy"),
         shutter_fraction: 1.0,
         exposure_group: 0,
@@ -1865,7 +1858,7 @@ fn write_uniforms(
         // luminance at 0.245 against the pre-audit 0.246 — the same picture brightness,
         // arrived at without the two fudges.
         tone: if hdr {
-            [if res.hdr_bt2020 { 2.0 } else { 1.0 }, exposure, 1.43, preset.input.signal(preset.signal) as f32]
+            [res.hdr_output as f32, exposure, 1.43, preset.input.signal(preset.signal) as f32]
         } else {
             [0.0, 1.08 * exposure, 1.30, preset.input.signal(preset.signal) as f32] // ACES exposure (was Reinhard white pt)
         },
@@ -2135,6 +2128,7 @@ fn smoothstep01(x: f32) -> f32 {
 }
 
 struct State {
+    profile: Option<benchmark::LiveProfile>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -2151,6 +2145,7 @@ struct State {
     window: Arc<Window>,
     capture: Option<capture::SharedFrame>,
     webcam: Option<webcam::Webcam>,
+    camera_status: CameraStatus,
     last_seq: u64,
     /// Live play: a libretro core running a game, driven by the clock and a pad.
     player: Option<play::Player>,
@@ -2170,13 +2165,24 @@ struct State {
 
 // Read the color space actually selected by the vendored Vulkan swapchain code.
 // Other backends use the usual linear-sRGB float surface contract.
-fn surface_uses_bt2020(surface: &mut wgpu::Surface<'_>) -> bool {
-    // SAFETY: read-only inspection; no raw handle is retained or destroyed.
+fn surface_output_mode(surface: &mut wgpu::Surface<'_>) -> u8 {
+    // Read the actual configured pair, including after surface reconfiguration.
     unsafe {
         surface.as_hal::<wgpu::hal::api::Vulkan, _, _>(|raw| {
-            raw.and_then(|s| s.configured_color_space())
-                == Some(ash::vk::ColorSpaceKHR::BT2020_LINEAR_EXT)
-        }).unwrap_or(false)
+            match raw.and_then(|s| s.configured_color_space()) {
+                Some(ash::vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT) => 1,
+                Some(ash::vk::ColorSpaceKHR::BT2020_LINEAR_EXT) => 2,
+                Some(ash::vk::ColorSpaceKHR::HDR10_ST2084_EXT) => 3,
+                _ => 0,
+            }
+        }).unwrap_or(0)
+    }
+}
+
+fn output_mode_label(mode: u8) -> &'static str {
+    match mode {
+        1 => "HDR scRGB linear", 2 => "HDR BT.2020 linear", 3 => "HDR10 BT.2020 PQ",
+        _ => "SDR sRGB/BT.709 (compositor exposes no supported HDR surface)",
     }
 }
 
@@ -2197,6 +2203,30 @@ fn detect_refresh_hz(window: &Window) -> f32 {
                 .map(from_mhz)
         })
         .unwrap_or(60.0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CameraStatus {
+    Off,
+    Opening,
+    Live,
+    Unavailable,
+}
+
+fn window_title(preset: &Preset, camera: CameraStatus) -> String {
+    let connection = match preset.input {
+        InputMode::Auto => format!("preset default ({})", match preset.signal {
+            1 => "S-video", 2 => "Composite", _ => "RGB/component",
+        }),
+        input => input.label().to_string(),
+    };
+    let camera = match camera {
+        CameraStatus::Off => "camera off",
+        CameraStatus::Opening => "opening camera (F4 to stop)",
+        CameraStatus::Live => "camera LIVE (F4 to stop)",
+        CameraStatus::Unavailable => "camera unavailable (F4 to retry; see terminal)",
+    };
+    format!("crtulum — {} — {connection} — {camera}", preset.name)
 }
 
 impl State {
@@ -2235,15 +2265,16 @@ impl State {
             .formats
             .iter()
             .copied()
-            .find(|f| *f == wgpu::TextureFormat::Rgba16Float);
+            .find(|f| *f == wgpu::TextureFormat::Rgba16Float)
+            .or_else(|| caps.formats.iter().copied().find(|f| *f == wgpu::TextureFormat::Rgb10a2Unorm));
         let format = hdr_format
             .or_else(|| caps.formats.iter().copied().find(|f| f.is_srgb()))
             .unwrap_or(caps.formats[0]);
-        let hdr = format == wgpu::TextureFormat::Rgba16Float;
+        let hdr = hdr_format.is_some();
         eprintln!(
             "[surface] using {:?} — HDR output {}",
             format,
-            if hdr { "ENABLED (Rgba16Float, linear)" } else { "unavailable → SDR tonemap" }
+            if hdr { "ENABLED" } else { "unavailable → SDR tonemap" }
         );
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -2261,11 +2292,13 @@ impl State {
         surface.configure(&device, &config);
 
         let mut res = build_resources(&device, &queue, format, preset);
-        res.hdr_bt2020 = surface_uses_bt2020(&mut surface);
-        eprintln!("[surface] output primaries: {}", if res.hdr_bt2020 { "BT.2020" } else { "sRGB/BT.709" });
+        res.hdr_output = surface_output_mode(&mut surface);
+        anyhow::ensure!(!hdr || res.hdr_output != 0, "HDR format configured without an HDR color space");
+        eprintln!("[surface] {}", output_mode_label(res.hdr_output));
         let depth_view = create_depth(&device, config.width, config.height);
 
         Ok(State {
+            profile: benchmark::LiveProfile::new(),
             surface,
             device,
             queue,
@@ -2295,6 +2328,7 @@ impl State {
             glare: true,
             window_reflection: true,
             webcam: None,
+            camera_status: CameraStatus::Off,
             // Panel refresh, for the BFI gate: strobing only helps at ≥100 Hz (at 60 Hz
             // it just flickers at 30). Best effort — re-detected on the first BFI toggle
             // once the Wayland surface has entered an output.
@@ -2313,16 +2347,16 @@ impl State {
     fn toggle_webcam(&mut self) {
         if self.webcam.take().is_some() {
             self.res.camera[0] = 0.0;
-            self.window.set_title("crtulum — camera off");
+            self.set_camera_status(CameraStatus::Off);
             eprintln!("[webcam] off; camera released");
         } else {
             match webcam::Webcam::start() {
                 Ok(camera) => {
                     self.webcam = Some(camera);
-                    self.window.set_title("crtulum — opening camera (F4 to stop)");
+                    self.set_camera_status(CameraStatus::Opening);
                 }
                 Err(error) => {
-                    self.window.set_title("crtulum — camera unavailable (see terminal)");
+                    self.set_camera_status(CameraStatus::Unavailable);
                     eprintln!("[webcam] {error:#}");
                 }
             }
@@ -2347,14 +2381,14 @@ impl State {
                 for c in 0..3 { mean[c] /= count; }
                 self.res.camera_ambient = mean;
                 self.res.camera = [1.0, camera.tan_half_fov, webcam::WIDTH as f32 / webcam::HEIGHT as f32, 0.0];
-                self.window.set_title("crtulum — camera LIVE (F4 to stop)");
+                self.set_camera_status(CameraStatus::Live);
             }
             Ok(None) => {}
             Err(error) => {
                 eprintln!("[webcam] {error:#}; restoring synthetic room");
                 self.webcam = None;
                 self.res.camera[0] = 0.0;
-                self.window.set_title("crtulum — camera unavailable (F4 to retry)");
+                self.set_camera_status(CameraStatus::Unavailable);
             }
         }
     }
@@ -2425,7 +2459,9 @@ impl State {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
-        self.res.hdr_bt2020 = surface_uses_bt2020(&mut self.surface);
+        self.res.hdr_output = surface_output_mode(&mut self.surface);
+        self.hdr = self.res.hdr_output != 0;
+        eprintln!("[surface] {}", output_mode_label(self.res.hdr_output));
         self.depth_view = create_depth(&self.device, self.config.width, self.config.height);
     }
 
@@ -2450,9 +2486,15 @@ impl State {
         self.show_input();
     }
 
+    fn set_camera_status(&mut self, status: CameraStatus) {
+        if self.camera_status != status {
+            self.camera_status = status;
+            self.window.set_title(&window_title(&self.preset, status));
+        }
+    }
+
     fn show_input(&self) {
-        let label = format!("crtulum — {} — {}", self.preset.name, self.preset.input.label());
-        self.window.set_title(&label);
+        self.window.set_title(&window_title(&self.preset, self.camera_status));
         eprintln!("[input] {} (signal {})", self.preset.input.label(), self.preset.input.signal(self.preset.signal));
     }
 
@@ -2510,6 +2552,7 @@ impl State {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        let profile_start = self.profile.as_ref().map(|_| std::time::Instant::now());
         self.poll_webcam();
         let time = self.start.elapsed().as_secs_f64();
         // Bootstrap the first field. Thereafter catch-up fields use the source
@@ -2559,7 +2602,9 @@ impl State {
             self.window_reflection,
         );
 
+        let profile_accum = profile_start.map(|_| std::time::Instant::now());
         let frame = self.surface.get_current_texture()?;
+        let profile_acquire = profile_start.map(|_| std::time::Instant::now());
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -2570,11 +2615,16 @@ impl State {
         draw_tube(&mut encoder, &self.res, &view, &self.depth_view);
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+        let profile_present = profile_start.map(|_| std::time::Instant::now());
         // Latch the next source only after drawing the completed fields. In
         // particular, a stall must not retroactively scan the newest game frame
         // into every missed field (which also destroys monochrome motion history).
         self.poll_capture();
         self.poll_player();
+        if let Some(profile) = &mut self.profile {
+            profile.record(profile_start.unwrap(), profile_accum.unwrap(),
+                profile_acquire.unwrap(), profile_present.unwrap());
+        }
         Ok(())
     }
 }
@@ -2783,13 +2833,21 @@ fn main() {
         return;
     }
 
+    match gamescope::launch(&args) {
+        Ok(Some(status)) => std::process::exit(status.code().unwrap_or(1)),
+        Ok(None) => {},
+        Err(error) => { eprintln!("[gamescope] {error:#}"); std::process::exit(2); }
+    }
+
     // `--preset trinitron|panasonic|slotmask` (default trinitron)
-    let mut preset = args
-        .iter()
-        .position(|a| a == "--preset")
-        .and_then(|i| args.get(i + 1))
-        .map(|s| preset_by_name(s))
-        .unwrap_or(TRINITRON);
+    let mut preset = match args.iter().position(|a| a == "--preset") {
+        Some(i) => match args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--preset needs a name"))
+            .and_then(|name| preset_by_name(name)) {
+            Ok(preset) => preset,
+            Err(error) => { eprintln!("{error}"); std::process::exit(2); }
+        },
+        None => TRINITRON,
+    };
     if let Some(i) = args.iter().position(|a| a == "--input") {
         preset.input = match args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--input needs a mode"))
             .and_then(|value| InputMode::parse(value)) {
@@ -2798,6 +2856,14 @@ fn main() {
         };
     }
     eprintln!("[preset] {}", preset.name);
+
+    if args.iter().any(|a| a == "--benchmark") {
+        if let Err(error) = benchmark::run(&args, preset) {
+            eprintln!("[benchmark] {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Headless capture mode: `crtulum --shot out.png [WxH]`
     if let Some(i) = args.iter().position(|a| a == "--shot") {
@@ -2909,8 +2975,16 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if args.iter().any(|a| a == "--require-hdr") && !state.hdr {
+        eprintln!("[surface] --require-hdr: this compositor exposes no supported HDR surface; try --gamescope-hdr-test for HDR rendering with SDR output");
+        std::process::exit(2);
+    }
     state.player = player;
     state.show_input();
+    let verify_frames = args.iter().position(|a| a == "--verify-frames")
+        .map(|i| args.get(i + 1).and_then(|v| v.parse::<u64>().ok()).filter(|n| *n > 0)
+            .unwrap_or_else(|| { eprintln!("--verify-frames needs a positive integer"); std::process::exit(2); }));
+    let mut presented_frames = 0u64;
 
     event_loop
         .run(move |event, elwt| {
@@ -2939,7 +3013,7 @@ fn main() {
                                         }
                                     }
                                     // F11 = borderless fullscreen; Escape leaves it first.
-                                    PhysicalKey::Code(KeyCode::F11) => {
+                                    PhysicalKey::Code(KeyCode::F11) if !event.repeat => {
                                         let fullscreen = state.window.fullscreen().is_none();
                                         state.window.set_fullscreen(if fullscreen {
                                             Some(Fullscreen::Borderless(
@@ -2952,11 +3026,11 @@ fn main() {
                                     }
                                     PhysicalKey::Code(KeyCode::F4) if !event.repeat => state.toggle_webcam(),
                                     // L and R isolate the two strongest photographic glass cues.
-                                    PhysicalKey::Code(KeyCode::KeyL) => {
+                                    PhysicalKey::Code(KeyCode::KeyL) if !event.repeat => {
                                         state.glare = !state.glare;
                                         eprintln!("[glare] {}", if state.glare { "on" } else { "off" });
                                     }
-                                    PhysicalKey::Code(KeyCode::KeyR) => {
+                                    PhysicalKey::Code(KeyCode::KeyR) if !event.repeat => {
                                         state.window_reflection = !state.window_reflection;
                                         eprintln!("[window reflection] {}", if state.window_reflection { "on" } else { "off" });
                                     }
@@ -2976,14 +3050,14 @@ fn main() {
                                     PhysicalKey::Code(KeyCode::Digit9) => state.set_preset(ALL_PRESETS[8]),
                                     PhysicalKey::Code(KeyCode::Digit0) => state.set_preset(ALL_PRESETS[9]),
                                     // P = power (warmup ↔ collapse); G = degauss.
-                                    PhysicalKey::Code(KeyCode::KeyP) => state.toggle_power(),
+                                    PhysicalKey::Code(KeyCode::KeyP) if !event.repeat => state.toggle_power(),
                                     // Pause the game (the tube keeps running).
-                                    PhysicalKey::Code(KeyCode::F2) => {
+                                    PhysicalKey::Code(KeyCode::F2) if !event.repeat => {
                                         if let Some(p) = &mut state.player {
                                             p.toggle_pause();
                                         }
                                     }
-                                    PhysicalKey::Code(KeyCode::KeyG) => {
+                                    PhysicalKey::Code(KeyCode::KeyG) if !event.repeat => {
                                         state.degauss_start = Some(std::time::Instant::now())
                                     }
                                     // [ / ] = trim exposure down/up (tune HDR on the panel).
@@ -2996,20 +3070,20 @@ fn main() {
                                         eprintln!("[exposure] {:.2}", state.exposure);
                                     }
                                     // I = alternate fields vs progressive scanning of the current signal.
-                                    PhysicalKey::Code(KeyCode::KeyI) => {
+                                    PhysicalKey::Code(KeyCode::KeyI) if !event.repeat => {
                                         state.interlace = !state.interlace;
                                         eprintln!("[interlace] {}", if state.interlace { "alternate fields" } else { "progressive" });
                                     }
                                     // M = subpixel-accurate (Megatron) mask vs the resolution-
                                     // independent gaussian mask. Only looks right at native
                                     // resolution on an RGB-stripe panel.
-                                    PhysicalKey::Code(KeyCode::KeyM) => {
+                                    PhysicalKey::Code(KeyCode::KeyM) if !event.repeat => {
                                         state.subpixel = !state.subpixel;
                                         eprintln!("[mask] {}", if state.subpixel { "subpixel (Megatron)" } else { "gaussian" });
                                     }
                                     // B = black-frame insertion (CRT-impulse motion clarity).
                                     // Needs a ≥100 Hz panel to help instead of just flickering.
-                                    PhysicalKey::Code(KeyCode::KeyB) => {
+                                    PhysicalKey::Code(KeyCode::KeyB) if !event.repeat => {
                                         state.bfi = !state.bfi;
                                         // Re-detect: at startup on Wayland current_monitor()
                                         // is usually None, so refresh_hz may still be the
@@ -3021,7 +3095,7 @@ fn main() {
                                             eprintln!("[bfi] {} ({:.0} Hz)", if state.bfi { "on" } else { "off" }, state.refresh_hz);
                                         }
                                     }
-                                    PhysicalKey::Code(KeyCode::Tab) => {
+                                    PhysicalKey::Code(KeyCode::Tab) if !event.repeat => {
                                         let i = ALL_PRESETS
                                             .iter()
                                             .position(|p| p.name == state.preset.name)
@@ -3061,7 +3135,13 @@ fn main() {
                             state.orbit.distance = (state.orbit.distance - d * 0.2).clamp(1.2, 8.0);
                         }
                         WindowEvent::RedrawRequested => match state.render() {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                presented_frames += 1;
+                                if verify_frames.is_some_and(|limit| presented_frames >= limit) {
+                                    eprintln!("[verify] presented {} frames; {}", presented_frames, output_mode_label(state.res.hdr_output));
+                                    elwt.exit();
+                                }
+                            }
                             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                                 state.resize(state.size)
                             }
@@ -3089,10 +3169,21 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// Γ(1+x) as the shader computes it — a cubic fit over x = 1/p, p ∈ [1.2, 5]. It moved
-    /// into the shader when the spot exponent stopped being constant across the picture, so
-    /// this mirrors it here to keep it pinned; a wrong Γ would silently re-expose the whole
-    /// picture by a few percent per preset with nothing to see but "the tubes look a bit off".
+    #[test]
+    fn title_preserves_connection_and_camera_status() {
+        let mut preset = PVM;
+        preset.input = InputMode::Composite;
+        for status in [CameraStatus::Off, CameraStatus::Opening, CameraStatus::Live, CameraStatus::Unavailable] {
+            let title = window_title(&preset, status);
+            assert!(title.contains("pvm") && title.contains("Composite"), "{title}");
+            assert_eq!(title.contains("camera LIVE"), status == CameraStatus::Live);
+        }
+        assert!(window_title(&TRINITRON, CameraStatus::Off).contains("preset default (S-video)"));
+        assert!(window_title(&RCA, CameraStatus::Live).contains("preset default (Composite)"));
+        assert!(preset_by_name("trinitrron").is_err());
+        assert_eq!(preset_by_name("PVM").unwrap().name, "pvm");
+    }
+
     #[test]
     fn input_modes_preserve_defaults_and_cycle_back() {
         for preset in ALL_PRESETS {
@@ -3204,6 +3295,12 @@ mod tests {
             @fragment fn fs_beam_probe(in: FullOut) -> @location(0) vec4<f32> {
                 return vec4<f32>(scan_reconstruct(in.uv, u.params.xy, 1.7, vec2<f32>(0.0)) / u.tone.z, 1.0);
             }
+            @fragment fn fs_hdr_highlight(in: FullOut) -> @location(0) vec4<f32> {
+                return output_color(vec3<f32>(4.0));
+            }
+            @fragment fn fs_hdr_pq(in: FullOut) -> @location(0) vec4<f32> {
+                return output_color(vec3<f32>(1.0));
+            }
             @fragment fn fs_hdr_srgb(in: FullOut) -> @location(0) vec4<f32> {
                 return output_color(vec3<f32>(1.0, 0.0, 0.0));
             }
@@ -3252,6 +3349,7 @@ mod tests {
         let current = (128.0_f32 / 255.0).powf(2.4);
         for (entry, expected) in [("fs_beam_probe", [decoded; 3]), ("fs_mask_near", [0.26317; 3]),
             ("fs_mask_middle", [0.26317; 3]), ("fs_mask_far", [0.26317; 3]),
+            ("fs_hdr_highlight", [4.0; 3]), ("fs_hdr_pq", [0.48586; 3]),
             ("fs_hdr_srgb", [1.0, 0.0, 0.0]), ("fs_hdr_bt2020", [0.6274, 0.0691, 0.0164]),
             ("fs_bounce", [current; 3]), ("fs_bounce_bfi", [0.0; 3]), ("fs_hum", [1.0; 3]),
             ("fs_svm_step", [0.5, 1.0, 0.0]),
@@ -3282,7 +3380,7 @@ mod tests {
                     0.0, 0.0, 1.0, false, 1.0, false, false);
             }
             if entry.starts_with("fs_hdr") || entry.starts_with("fs_bounce") {
-                res.hdr_bt2020 = entry == "fs_hdr_bt2020";
+                res.hdr_output = if entry == "fs_hdr_bt2020" { 2 } else if entry == "fs_hdr_pq" { 3 } else { 1 };
                 write_uniforms(&queue, &res, &Orbit { yaw: 0.0, pitch: 0.0, distance: 3.0 },
                     1.0, 0.0, &PVM, 1.0, true, 0.0, [1.0, 0.0, 0.0, 0.0],
                     0.0, 0.0, 1.0, false, if entry == "fs_bounce_bfi" { 0.0 } else { 1.0 }, false, false);
@@ -3560,6 +3658,10 @@ mod tests {
         }
     }
 
+    /// Γ(1+x) as the shader computes it — a cubic fit over x = 1/p, p ∈ [1.2, 5]. It moved
+    /// into the shader when the spot exponent stopped being constant across the picture, so
+    /// this mirrors it here to keep it pinned; a wrong Γ would silently re-expose the whole
+    /// picture by a few percent per preset with nothing to see but "the tubes look a bit off".
     fn gamma1p(x: f32) -> f32 {
         ((-0.10654 * x + 0.58755) * x - 0.47554) * x + 0.99029
     }
@@ -3716,7 +3818,7 @@ mod tests {
     #[test]
     fn mask_triad_counts_follow_measured_pitch() {
         let triads = |name: &str| -> f32 {
-            let p = preset_by_name(name);
+            let p = preset_by_name(name).unwrap();
             p.screen_mm / p.pitch_mm
         };
         for (name, lo, hi) in [

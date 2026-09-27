@@ -96,6 +96,7 @@ const HW_CONTEXT_OPENGL_CORE: c_uint = 3;
 const HW_CONTEXT_OPENGLES3: c_uint = 4;
 const HW_CONTEXT_OPENGLES_VERSION: c_uint = 5;
 const HW_CONTEXT_VULKAN: c_uint = 6;
+const ENV_GET_PREFERRED_HW_RENDER: c_uint = 56;
 
 // Both of these carry the EXPERIMENTAL bit (0x10000) in libretro.h.
 const ENV_GET_HW_RENDER_INTERFACE: c_uint = 41 | 0x10000;
@@ -456,6 +457,13 @@ unsafe extern "C" fn env_cb(cmd: c_uint, data: *mut c_void) -> bool {
         // Hardware rendering: OpenGL through a headless EGL context (glctx.rs), or
         // Vulkan through an instance/device we create for the core (vkctx.rs). D3D
         // gets a no, and those cores fall back.
+        ENV_GET_PREFERRED_HW_RENDER => {
+            if data.is_null() || std::env::var_os("CRTULUM_NO_HW").is_some() {
+                return false;
+            }
+            *(data as *mut c_uint) = HW_CONTEXT_VULKAN;
+            true
+        }
         ENV_SET_HW_RENDER => {
             if data.is_null() || std::env::var_os("CRTULUM_NO_HW").is_some() {
                 return false;
@@ -909,10 +917,10 @@ impl Core {
                 if ptr == 0 {
                     None
                 } else {
-                    Some(unsafe { &*(ptr as *const crate::vkctx::NegotiationInterface) })
+                    unsafe { crate::vkctx::copy_negotiation(ptr as *const crate::vkctx::NegotiationInterface) }
                 }
             };
-            let host_vk = crate::vkctx::VkHost::new(negotiation).with_context(|| {
+            let host_vk = crate::vkctx::VkHost::new(negotiation.as_ref()).with_context(|| {
                 format!("`{name}` wants Vulkan {}.{} and it could not be set up", cb.version_major, cb.version_minor)
             })?;
             host().lock().unwrap().vk_interface = host_vk.interface_ptr() as usize;

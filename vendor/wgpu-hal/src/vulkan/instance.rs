@@ -295,6 +295,9 @@ impl super::Instance {
         // VK_EXT_swapchain_colorspace
         // Provides wide color gamut
         extensions.push(vk::ExtSwapchainColorspaceFn::name());
+        // Optional WSI dependencies used by gamescope's swapchain maintenance.
+        extensions.push(vk::KhrGetSurfaceCapabilities2Fn::name());
+        extensions.push(vk::ExtSurfaceMaintenance1Fn::name());
 
         // VK_KHR_get_physical_device_properties2
         // Even though the extension was promoted to Vulkan 1.1, we still require the extension

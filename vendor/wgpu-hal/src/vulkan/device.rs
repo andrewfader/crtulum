@@ -552,31 +552,30 @@ impl super::Device {
             None => vk::SwapchainKHR::null(),
         };
 
-        let color_space = if config.format == wgt::TextureFormat::Rgba16Float {
-            // Enable wide color gamut / HDR mode. Prefer whichever HDR linear space
-            // the surface actually advertises: scRGB (EXTENDED_SRGB_LINEAR) where
-            // available, else BT.2020 linear (what mutter/Wayland typically offer).
-            // crtulum patch: query the surface instead of hardcoding scRGB.
+        // A format alone is not a color space. Never invent an HDR pair when
+        // the compositor changes capabilities between enumeration/configure.
+        let color_space_result = (|| {
             let supported = unsafe {
-                surface
-                    .functor
-                    .get_physical_device_surface_formats(self.shared.physical_device, surface.raw)
+                surface.functor.get_physical_device_surface_formats(self.shared.physical_device, surface.raw)
+            }.map_err(crate::DeviceError::from)?;
+            [
+                vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT,
+                vk::ColorSpaceKHR::BT2020_LINEAR_EXT,
+                vk::ColorSpaceKHR::HDR10_ST2084_EXT,
+                vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            ].into_iter().find(|cs| supported.iter().any(|sf| {
+                sf.color_space == *cs && conv::map_vk_surface_formats(*sf) == Some(config.format)
+                    && sf.format == self.shared.private_caps.map_texture_format(config.format)
+            })).ok_or(crate::SurfaceError::Outdated)
+        })();
+        let color_space = match color_space_result {
+            Ok(color_space) => color_space,
+            Err(error) => {
+                if old_swapchain != vk::SwapchainKHR::null() {
+                    unsafe { functor.destroy_swapchain(old_swapchain, None) }
+                }
+                return Err(error);
             }
-            .unwrap_or_default();
-            let has = |cs: vk::ColorSpaceKHR| {
-                supported.iter().any(|sf| {
-                    sf.color_space == cs && sf.format == vk::Format::R16G16B16A16_SFLOAT
-                })
-            };
-            if has(vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT) {
-                vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT
-            } else if has(vk::ColorSpaceKHR::BT2020_LINEAR_EXT) {
-                vk::ColorSpaceKHR::BT2020_LINEAR_EXT
-            } else {
-                vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT
-            }
-        } else {
-            vk::ColorSpaceKHR::SRGB_NONLINEAR
         };
 
         let original_format = self.shared.private_caps.map_texture_format(config.format);
@@ -660,6 +659,7 @@ impl super::Device {
 
         Ok(super::Swapchain {
             color_space,
+            gamescope_present_mode: std::env::var_os("CRTULUM_GAMESCOPE_MAINTENANCE1").is_some(),
             raw,
             raw_flags,
             functor,

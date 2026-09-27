@@ -43,7 +43,9 @@ def main():
     binary = Path(opts.binary).resolve()
     root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
-    with tempfile.TemporaryDirectory(prefix='crtulum-verify-') as tmp:
+    # Firejail-packaged media tools have private /tmp directories. Stage beside
+    # the project so ffmpeg and ffprobe see the same files, as exports do.
+    with tempfile.TemporaryDirectory(prefix='.crtulum-verify-', dir=root) as tmp:
         work = Path(tmp)
         # Startup/collapse used to feed inverse raster coordinates into defocus,
         # producing enormous convolution loops (and a hardware GPU reset).
@@ -59,6 +61,26 @@ def main():
             run([binary, '--preset', preset, '--shot', shot, '120x90'], env)
             assert shot.stat().st_size > 100, shot
         print('PASS all ten presets render', flush=True)
+        # Connections must work on every tube, including monochrome/PC presets.
+        # RF must be a distinct rendered path, not merely a label for composite.
+        for preset in ['trinitron', 'panasonic', 'slotmask', 'rca', 'pvm', 'arcade',
+                       'vga', 'diamondtron', 'green', 'amber']:
+            composite, rf = work / f'{preset}-composite.png', work / f'{preset}-rf.png'
+            for mode, shot in [('composite', composite), ('rf', rf)]:
+                run([binary, '--preset', preset, '--input', mode, '--shot', shot, '120x90'], env)
+            assert composite.read_bytes() != rf.read_bytes(), preset
+        for mode in ['auto', 's-video', 'rgb', 'component']:
+            shot = work / f'input-{mode}.png'
+            run([binary, '--preset', 'pvm', '--input', mode, '--shot', shot, '120x90'], env)
+        assert (work / 'input-auto.png').read_bytes() == (work / 'input-rgb.png').read_bytes()
+        assert (work / 'input-rgb.png').read_bytes() == (work / 'input-component.png').read_bytes()
+        assert (work / 'input-s-video.png').read_bytes() != (work / 'input-rgb.png').read_bytes()
+        print('PASS connections on all presets; RF differs from composite; clean aliases agree', flush=True)
+        for args in [['--preset', 'trinitrron'], ['--preset'], ['--input', 'composit']]:
+            proc = subprocess.run([str(binary), *args], env=env, capture_output=True, text=True, timeout=10)
+            assert proc.returncode == 2, (args, proc.stderr)
+            assert '[gpu]' not in proc.stderr, proc.stderr
+        print('PASS invalid preset/input rejected before GPU/window startup', flush=True)
         source = work / 'source.mp4'
         # A shorter audio stream must not truncate the half-second picture.
         run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=80x60:rate=24:duration=0.5',

@@ -47,14 +47,16 @@ struct Uniforms {
 
 fn history_load(index: u32) -> vec4<f32> {
     let term = index % 33u;
-    let offset = (index / 33u) * 11u + term % 11u;
+    // Store each reservoir as a contiguous image. Neighboring fragment lanes
+    // access the same term, so this avoids a 176-byte stride between pixels.
+    let offset = (term % 11u) * (u32(u.params.x) * u32(u.params.y)) + index / 33u;
     if (term < 11u) { return phos_bank0[offset]; }
     if (term < 22u) { return phos_bank1[offset]; }
     return phos_bank2[offset];
 }
 fn history_store(index: u32, value: vec4<f32>) {
     let term = index % 33u;
-    let offset = (index / 33u) * 11u + term % 11u;
+    let offset = (term % 11u) * (u32(u.params.x) * u32(u.params.y)) + index / 33u;
     if (term < 11u) { phos_bank0[offset] = value; }
     else if (term < 22u) { phos_bank1[offset] = value; }
     else { phos_bank2[offset] = value; }
@@ -244,6 +246,15 @@ fn output_color(col: vec3<f32>) -> vec4<f32> {
         ) * col;
         // tone.y = HDR exposure (scales SDR-white → the compositor's reference
         // white; bump if the picture looks dim, drop if it's blinding).
+        if (u.tone.x > 2.5) {
+            // ST 2084: scRGB reference white is 80 cd/m², PQ is absolute 0–10000.
+            // Encode once, after linear-light shading. The UNORM swapchain must
+            // not apply an sRGB transfer on top of PQ.
+            let n = pow(clamp(bt2020 * u.tone.y * 0.008, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2610.0 / 16384.0));
+            let pq = pow((vec3<f32>(3424.0 / 4096.0) + (2413.0 / 128.0) * n)
+                / (vec3<f32>(1.0) + (2392.0 / 128.0) * n), vec3<f32>(2523.0 / 32.0));
+            return vec4<f32>(pq, 1.0);
+        }
         return vec4<f32>(bt2020 * u.tone.y, 1.0);
     }
     // SDR display: filmic-tonemap HDR highlights back into range (ACES). Target is
