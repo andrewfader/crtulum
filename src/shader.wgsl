@@ -18,7 +18,7 @@ struct Uniforms {
     look: vec4<f32>,    // x=convergence, y=corner_radius, z=grain, w=ghost
     phys: vec4<f32>,    // x=crt_gamma, y=reserved, z=glow_bounce, w=HV sag
     temporal: vec4<f32>,// x=dt(sec), y=persist_mult, z=interlace, w=field_parity
-    raster: vec4<f32>, // measured response, shutter fraction, exposure group, reserved
+    raster: vec4<f32>, // measured response, shutter fraction, exposure group, aspect mode
     ptau: vec4<f32>,    // per-phosphor decay tau: xyz = R,G,B (sec); w = power-law tail exponent
     geom: vec4<f32>,    // raster geometry: x=pincushion, y=trapezoid, z=corner_pin, w=purity
     mono: vec4<f32>,    // monochrome phosphor tint (rgb) + flag (w>0.5 = single-gun)
@@ -1174,18 +1174,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // horizontal line (vertical deflection dies), then to a fading phosphor dot
     // (horizontal dies). Warmup runs the same in reverse.
     let open = min(u.pwr.x, 1.0 - u.pwr.y);
-    // Preserve source aspect ratio on the 4:3 tube face (HALF_W / HALF_H).
-    // Widescreen (e.g. 16:9) is letterboxed top/bottom; portrait (e.g. 9:16) is
-    // pillarboxed left/right, preventing distortion. Standard 4:3 is unchanged.
+    // Place a source that isn't the tube's 4:3 (HALF_W / HALF_H) on the face, per the
+    // aspect mode in raster.w: 0 fit (widescreen letterboxed, portrait pillarboxed),
+    // 1 fill (crop to cover the face), 2 zoom (halfway: shallow bars, shallow crop),
+    // 3 stretch (cover the face, distorted). All but stretch keep the source's shape.
     var fit_uv = in.uv;
     let tube_ar = HALF_W / HALF_H;
     let src_ar = res.x / res.y;
-    if (abs(src_ar - tube_ar) > 0.02) {
-        if (src_ar > tube_ar) {
-            fit_uv.y = (fit_uv.y - 0.5) * (src_ar / tube_ar) + 0.5;
-        } else {
-            fit_uv.x = (fit_uv.x - 0.5) * (tube_ar / src_ar) + 0.5;
+    let aspect_mode = u32(u.raster.w + 0.5);
+    if (abs(src_ar - tube_ar) > 0.02 && aspect_mode != 3u) {
+        let r = src_ar / tube_ar;
+        // Fit scale: the long axis spans the face, the short one shrinks by r (or 1/r).
+        var scale = vec2<f32>(max(1.0, 1.0 / r), max(1.0, r));
+        // Fill divides that by the full mismatch, zoom by its square root.
+        let m = max(r, 1.0 / r);
+        if (aspect_mode == 1u) {
+            scale = scale / m;
+        } else if (aspect_mode == 2u) {
+            scale = scale / sqrt(m);
         }
+        fit_uv = (fit_uv - vec2<f32>(0.5)) * scale + vec2<f32>(0.5);
     }
     var base_uv = vec2<f32>(0.5) + (fit_uv - vec2<f32>(0.5)) * (1.0 - 2.0 * u.focus.y);
     if (u.pwr.z > 0.001) {

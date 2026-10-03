@@ -516,7 +516,7 @@ struct Uniforms {
     look: [f32; 4],   // convergence, corner_radius, grain, ghost
     phys: [f32; 4],   // crt_gamma, reserved, glow_bounce, HV sag
     temporal: [f32; 4], // dt(sec), persist_mult, interlace, field_parity
-    raster: [f32; 4], // measured response, shutter fraction, exposure group, reserved
+    raster: [f32; 4], // measured response, shutter fraction, exposure group, aspect mode
     ptau: [f32; 4],   // per-phosphor decay tau: R, G, B (sec), w=power-law tail exponent
     geom: [f32; 4],   // raster geometry errors: pincushion, trapezoid, corner_pin, purity
     mono: [f32; 4],   // monochrome phosphor tint (rgb) + flag (w>0.5 = single-gun tube)
@@ -619,6 +619,58 @@ impl InputMode {
             Self::SVideo => 1,
             Self::Composite => 2,
             Self::Rf => 3,
+        }
+    }
+}
+
+// How a source whose shape isn't the tube's 4:3 lands on the face. Fit keeps the whole
+// picture (black bars), Fill crops it to cover the face, Zoom splits the difference
+// like a TV's "wide zoom", and Stretch fills the face by distorting the picture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AspectMode {
+    #[default]
+    Fit,
+    Fill,
+    Zoom,
+    Stretch,
+}
+
+impl AspectMode {
+    pub(crate) fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "fit" | "letterbox" | "pillarbox" => Ok(Self::Fit),
+            "fill" | "crop" | "cover" => Ok(Self::Fill),
+            "zoom" => Ok(Self::Zoom),
+            "stretch" | "full" => Ok(Self::Stretch),
+            _ => anyhow::bail!("unknown aspect `{value}` (use fit, fill, zoom, stretch)"),
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Fit => Self::Fill,
+            Self::Fill => Self::Zoom,
+            Self::Zoom => Self::Stretch,
+            Self::Stretch => Self::Fit,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fit => "fit (letterbox/pillarbox)",
+            Self::Fill => "fill (crop to the face)",
+            Self::Zoom => "zoom (half bars, half crop)",
+            Self::Stretch => "stretch (fill, distorted)",
+        }
+    }
+
+    // Shader code in raster.w.
+    fn code(self) -> f32 {
+        match self {
+            Self::Fit => 0.0,
+            Self::Fill => 1.0,
+            Self::Zoom => 2.0,
+            Self::Stretch => 3.0,
         }
     }
 }
@@ -1203,6 +1255,7 @@ struct Resources {
     physical_phosphor: bool,
     shutter_fraction: f32,
     exposure_group: u32,
+    aspect_mode: AspectMode,
     phosphor_state: [wgpu::Buffer; 3],
     pipeline: wgpu::RenderPipeline,
     vbuf: wgpu::Buffer,
@@ -1724,6 +1777,7 @@ fn build_resources(
         physical_phosphor: std::env::var("CRTULUM_PHOSPHOR").as_deref() != Ok("legacy"),
         shutter_fraction: 1.0,
         exposure_group: 0,
+        aspect_mode: AspectMode::Fit,
         phosphor_state,
         pipeline,
         vbuf,
@@ -1922,7 +1976,7 @@ fn write_uniforms(
         // Red carries motion history across fields while green and blue fade first.
         // Mono presets use their own exponential time-to-10% conversion.
         raster: [if res.physical_phosphor { 1.0 } else { 0.0 }, res.shutter_fraction,
-            if res.exposure_group == 0 { time } else { res.exposure_group as f32 }, 0.0],
+            if res.exposure_group == 0 { time } else { res.exposure_group as f32 }, res.aspect_mode.code()],
         ptau: if preset.mono[3] > 0.5 {
             // tau = T10 / ln(10) requires exponential decay. Adding the color
             // tail here would lengthen T10 and make it depend on brightness and dt.
@@ -2862,6 +2916,14 @@ fn main() {
         };
     }
     eprintln!("[preset] {}", preset.name);
+    let aspect = match args.iter().position(|a| a == "--aspect") {
+        Some(i) => match args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--aspect needs a mode"))
+            .and_then(|value| AspectMode::parse(value)) {
+            Ok(aspect) => aspect,
+            Err(error) => { eprintln!("{error}"); std::process::exit(2); }
+        },
+        None => AspectMode::Fit,
+    };
 
     if args.iter().any(|a| a == "--benchmark") {
         if let Err(error) = benchmark::run(&args, preset) {
@@ -2981,6 +3043,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    state.res.aspect_mode = aspect;
     if args.iter().any(|a| a == "--require-hdr") && !state.hdr {
         eprintln!("[surface] --require-hdr: this compositor exposes no supported HDR surface; try --gamescope-hdr-test for HDR rendering with SDR output");
         std::process::exit(2);
@@ -3043,6 +3106,11 @@ fn main() {
                                     PhysicalKey::Code(KeyCode::F3) if !event.repeat => {
                                         state.preset.input = state.preset.input.next();
                                         state.show_input();
+                                    }
+                                    // F5 = how a non-4:3 source (e.g. a shared 16:9 window) fills the face.
+                                    PhysicalKey::Code(KeyCode::F5) if !event.repeat => {
+                                        state.res.aspect_mode = state.res.aspect_mode.next();
+                                        eprintln!("[aspect] {}", state.res.aspect_mode.label());
                                     }
                                     // 1..9,0 pick a preset directly; Tab cycles through all.
                                     PhysicalKey::Code(KeyCode::Digit1) => state.set_preset(ALL_PRESETS[0]),

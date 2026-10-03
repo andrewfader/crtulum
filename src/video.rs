@@ -72,6 +72,7 @@ pub struct Opts {
     pub fps: f64,                        // 0 → inherit the source rate
     pub ssaa: u32,                       // supersampling factor (1 = fast preview)
     pub shutter: f32,                    // open fraction of each field exposure
+    pub aspect: crate::AspectMode,       // how a non-4:3 source fills the tube face
     pub source_size: Option<(u32, u32)>, // signal resolution fed to the tube
     pub start: f64,
     pub duration: Option<f64>,
@@ -2049,6 +2050,7 @@ pub fn render(opts: Opts) -> Result<()> {
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut res = build_resources(&device, &queue, format, timeline.preset0);
     res.shutter_fraction = opts.shutter;
+    res.aspect_mode = opts.aspect;
     let mut cur_preset = timeline.preset0;
 
     let make_target = |w: u32, h: u32, label: &str, extra: wgpu::TextureUsages| {
@@ -2367,8 +2369,9 @@ crtulum --benchmark WxH       deterministic native-resolution HDR GPU pass timin
   --benchmark-output FILE     final raw little-endian RGBA16Float pixels
   CRTULUM_PROFILE=1           log live CPU/wait timing every 240 frames
 
-Live/shot: --preset NAME, --input MODE. Live controls:
+Live/shot: --preset NAME, --input MODE, --aspect MODE. Live controls:
   drag/scroll orbit/zoom; 1-9,0/Tab presets; F2 pause game; F3 input; F4 webcam;
+  F5 aspect (fit/fill/zoom/stretch);
   F11 fullscreen; Esc leave fullscreen/quit; P power; G degauss; I interlace;
   M subpixel mask; B black-frame insertion; L glare; R window reflection; [/] exposure.
 
@@ -2386,6 +2389,8 @@ Options:
                      and (with a rom) the run itself: press/hold/release/tap, placed
                      on an exact frame or a wall-clock time
   --input MODE       auto (default), composite, rf, s-video, rgb, component; F3 cycles live
+  --aspect MODE      non-4:3 sources: fit (default, black bars) · fill (crop to the
+                     face) · zoom (half bars, half crop) · stretch (distort); F5 cycles live
   --preset NAME      starting tube preset
   --size WxH         output size            (default 1280x960)
   --fps N            output frame rate      (default: the source's)
@@ -2472,6 +2477,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
     let (mut script_path, mut rom, mut movie, mut core) = (None, None, None, None);
     let (mut size, mut fps, mut ssaa, mut source_size) = (None, None, None, None);
     let mut shutter = 1.0_f32;
+    let mut aspect = crate::AspectMode::Fit;
     let (mut start, mut duration, mut crf, mut codec) = (None, None, None, None);
     let mut connection_arg = None;
     let (mut audio, mut dry_run, mut preset_arg) = (true, false, None);
@@ -2521,6 +2527,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
             // `--preset` is consumed by main() but appears in the same tail.
             "--preset" => preset_arg = Some(val()?),
             "--input" => connection_arg = Some(crate::InputMode::parse(&val()?)?),
+            "--aspect" => aspect = crate::AspectMode::parse(&val()?)?,
             other if other.starts_with('-') => bail!("unknown --render option `{other}`\n\n{USAGE}"),
             other => positionals.push(other.to_string()),
         }
@@ -2590,6 +2597,7 @@ pub fn opts_from_args(args: &[String], default_preset: Preset) -> Result<Opts> {
         fps: fps.or(script.fps).unwrap_or(0.0),
         ssaa: ssaa.or(script.ssaa).unwrap_or(3),
         shutter,
+        aspect,
         source_size: source_size.or(script.source_size),
         start: start.or(script.start).unwrap_or(0.0),
         duration: duration.or(script.duration),
