@@ -554,6 +554,18 @@ unsafe extern "C" fn env_cb(cmd: c_uint, data: *mut c_void) -> bool {
                     (*var).value = v.as_ptr();
                     true
                 }
+                // parallel_n64 left on "auto" pairs the ParaLLEl RDP (picked because
+                // we prefer Vulkan) with the HLE RSP, which only knows Nintendo's own
+                // microcodes: anything newer (F3DEX3 homebrew) draws as black and junk,
+                // at a few fps. The LLE ParaLLEl RSP runs every microcode, and faster.
+                // The core asks before it negotiates a context; only a GL one (Glide64,
+                // which wants HLE display lists) keeps "auto".
+                None if key == "parallel-n64-rspplugin"
+                    && h.hw.map_or(true, |cb| cb.context_type == HW_CONTEXT_VULKAN) =>
+                {
+                    (*var).value = c"parallel".as_ptr();
+                    true
+                }
                 None => false,
             }
         }
